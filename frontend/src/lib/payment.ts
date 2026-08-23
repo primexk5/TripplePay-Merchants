@@ -7,7 +7,6 @@ import {
   getAddress,
   id,
   parseQuai,
-  toBeHex,
   type Signer,
 } from "quais";
 import paywithquaiAbi from "./paywithquai.abi.json";
@@ -284,6 +283,16 @@ function makeBrowserProvider(eip1193: Eip1193Provider): BrowserProvider {
 /** Extra native QUAI requested on top of the order amount so gas can't kill the send. */
 const BLIP_GAS_CUSHION_WEI = parseQuai("0.1");
 
+/**
+ * Canonical hex quantity for bridge-bound tx fields. quais's forked toBeHex() pads odd-length
+ * values to full bytes ("0x0de0b6b3a7640000" for 1 QUAI) — and go-quai rejects exactly that
+ * with -32602 "hex number with leading zero digits", killing the payment inside Blip before
+ * the approval sheet. Minimal hex ("0xde0b6b3a7640000") is what the node requires.
+ */
+function hexQty(n: bigint): string {
+  return n === 0n ? "0x0" : `0x${n.toString(16)}`;
+}
+
 /** Thrown when the app wallet still can't cover a payment — the UI offers a fund-and-retry. */
 export class BlipNeedsFundsError extends Error {
   readonly needsFunding = true;
@@ -352,7 +361,7 @@ async function ensureBlipNativeFunding(
           type: "native",
           symbol: "QUAI",
           decimals: 18,
-          amountWei: toBeHex(shortfall),
+          amountWei: hexQty(shortfall),
           purpose: "payment",
         },
       ],
@@ -447,7 +456,7 @@ async function blipSend(
   provider: Eip1193Provider,
   tx: { from: string; to: string; value?: string; data?: string },
 ): Promise<string> {
-  const gas = (await estimateGasViaRpc(tx)) ?? toBeHex(tx.data ? 300_000 : 21_000);
+  const gas = (await estimateGasViaRpc(tx)) ?? hexQty(BigInt(tx.data ? 300_000 : 21_000));
   const nonce = await nextNonceViaRpc(tx.from);
   try {
     const hash = (await provider.request({
@@ -764,14 +773,14 @@ async function payOrderViaBlip(
             type: "erc20",
             token,
             decimals: 6,
-            amount: toBeHex(amount - bal),
+            amount: hexQty(amount - bal),
             purpose: "payment",
           },
           {
             type: "native",
             symbol: "QUAI",
             decimals: 18,
-            amountWei: toBeHex(BLIP_GAS_CUSHION_WEI),
+            amountWei: hexQty(BLIP_GAS_CUSHION_WEI),
             purpose: "gas",
           },
         ],
@@ -863,7 +872,7 @@ async function payOrderNativeViaBlip(
   return blipSend(provider, {
     from,
     to: resolvePayAddress(),
-    value: toBeHex(value),
+    value: hexQty(value),
     data: payInterface.encodeFunctionData("payOrderNative", [merchant, orderId]),
   });
 }

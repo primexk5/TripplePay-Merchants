@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { BrowserProvider, Contract, getAddress, parseQuai, toBeHex } from "quais";
+import { BrowserProvider, Contract, getAddress, parseQuai } from "quais";
 import { getActiveWallet, QUAI_MAINNET_CHAIN } from "@/lib/wallets";
 import { getRpcProvider, MUSDQ_ADDRESS } from "@/lib/payment";
 import { requestAppWalletFunding } from "@/lib/blip";
@@ -124,7 +124,9 @@ export function WalletBalances() {
         reason: "manual top-up",
         continueLabel: "Add funds",
         assets: [
-          { type: "native", symbol: "QUAI", decimals: 18, amountWei: toBeHex(amountWei), purpose: "topup" },
+          // Canonical minimal hex — quais's toBeHex() pads odd-length values with a leading
+          // zero, which go-quai rejects (-32602) when Blip forwards the funding request.
+          { type: "native", symbol: "QUAI", decimals: 18, amountWei: amountWei === 0n ? "0x0" : `0x${amountWei.toString(16)}`, purpose: "topup" },
         ],
       });
       await fetchBalances();
