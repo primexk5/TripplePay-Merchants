@@ -1,8 +1,36 @@
 import { type ClassValue, clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
 
-export function cn(...inputs: ClassValue[]) {
+export function cn(...inputs: ClassValue[]): string {
   return twMerge(clsx(inputs));
+}
+
+/** Compact, copy-friendly dump of an unknown thrown value — used by the error UI's
+ *  "details" section, because wallet bridges (Blip included) reject with shapes that
+ *  parseError can't always classify and there are no devtools inside Blip's browser. */
+export function rawErrorText(err: unknown): string {
+  const parts: string[] = [];
+  if (typeof err === "object" && err !== null) {
+    const e = err as Record<string, unknown>;
+    if (e.code !== undefined) parts.push(`code: ${String(e.code)}`);
+    for (const key of ["message", "shortMessage", "reason"] as const) {
+      if (typeof e[key] === "string") parts.push(`${key}: ${e[key]}`);
+    }
+    const nested = (typeof e.data === "object" && e.data !== null ? e.data : {}) as Record<string, unknown>;
+    if (typeof nested.message === "string") parts.push(`data.message: ${nested.message}`);
+    else if (typeof e.data === "string") parts.push(`data: ${e.data.slice(0, 300)}`);
+    if (!parts.length) {
+      try {
+        parts.push(JSON.stringify(err));
+      } catch {
+        parts.push(String(err));
+      }
+    }
+  } else {
+    parts.push(String(err));
+  }
+  const text = parts.join(" | ");
+  return text.length > 600 ? `${text.slice(0, 600)}…` : text;
 }
 
 export function parseError(err: unknown): string {

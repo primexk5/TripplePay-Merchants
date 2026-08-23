@@ -42,7 +42,7 @@ import {
   getActiveWallet,
   storeWalletId,
 } from "@/lib/wallets";
-import { parseError } from "@/lib/utils";
+import { parseError, rawErrorText } from "@/lib/utils";
 
 type Params = Promise<{ merchant: string; orderId: string }>;
 
@@ -88,6 +88,7 @@ export default function CheckoutPage({ params }: { params: Params }) {
   const [payTab, setPayTab] = useState<"blip" | "wallet">("wallet");
   const [connected, setConnected] = useState<string | null>(null);
   const [needsFund, setNeedsFund] = useState(false);
+  const [errorDetail, setErrorDetail] = useState<string | null>(null);
   const [blipConnecting, setBlipConnecting] = useState(false);
   const [insideBlip, setInsideBlip] = useState(false);
   const [checkoutUrl, setCheckoutUrl] = useState("");
@@ -252,6 +253,7 @@ export default function CheckoutPage({ params }: { params: Params }) {
       });
     } catch (err: unknown) {
       setNeedsFund((err as { needsFunding?: boolean })?.needsFunding === true);
+      setErrorDetail(rawErrorText(err));
       setStage({
         name: "error",
         message: parseError(err),
@@ -691,6 +693,26 @@ export default function CheckoutPage({ params }: { params: Params }) {
                 >
                   Fund app wallet &amp; retry
                 </button>
+              )}
+              {errorDetail && (
+                <details className="mt-2">
+                  <summary className="cursor-pointer text-xs text-[#8b93a7]">Error details</summary>
+                  <div className="mt-1 flex items-start gap-2">
+                    <pre className="max-h-32 flex-1 overflow-auto whitespace-pre-wrap break-all rounded bg-white/60 p-2 font-mono text-[10px] leading-4 text-red-500">
+                      {errorDetail}
+                    </pre>
+                    <button
+                      onClick={() =>
+                        void navigator.clipboard
+                          .writeText(errorDetail)
+                          .catch(() => undefined)
+                      }
+                      className="rounded border border-red-200 px-2 py-1 text-[10px] hover:bg-red-100"
+                    >
+                      Copy
+                    </button>
+                  </div>
+                </details>
               )}
               <button
                 onClick={() => {

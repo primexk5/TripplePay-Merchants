@@ -408,7 +408,8 @@ async function blipSend(
     return hash;
   } catch (err) {
     const code = (err as { code?: number })?.code;
-    const message = String((err as Error)?.message ?? "");
+    const rawMessage = String((err as { message?: unknown })?.message ?? "");
+    const message = err instanceof Error ? err.message : rawMessage;
     if (code === 4001) throw new Error("Payment declined in Blip.");
     if (/insufficient/i.test(message) || code === -32010) {
       // Blip's own send-time balance gate — give the UI something actionable.
@@ -416,7 +417,20 @@ async function blipSend(
         "Blip couldn't complete the payment — this site's app wallet doesn't have enough QUAI. Fund it and retry.",
       );
     }
-    throw err instanceof Error ? err : new Error("Payment failed in Blip.");
+    if (err instanceof Error) throw err;
+    // Bridges sometimes reject with plain objects — don't lose their payload.
+    throw new Error(
+      rawMessage ||
+        `Blip rejected the transaction (${safeStringify(err).slice(0, 200)})`,
+    );
+  }
+}
+
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
   }
 }
 
