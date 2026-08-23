@@ -395,13 +395,65 @@ export async function requestBlipAppWalletTopUp(requiredWei: bigint): Promise<vo
   await ensureBlipNativeFunding(wallet.provider, address, requiredWei);
 }
 
-/** Sends a tx through the bridge and maps the common rejection codes to friendly copy. */
+/**
+ * Gas estimate + nonce resolved through OUR OWN RPC. Blip's browser fills these itself when
+ * missing — and its internal prep path is broken: it forwards a non-canonical (leading-zero-
+ * padded) `value` to `quai_createAccessList`, which go-quai rejects with -32602 before any
+ * approval sheet appears. Supplying explicit gas/nonce lets Blip skip straight to signing.
+ */
+async function estimateGasViaRpc(tx: {
+  from?: string;
+  to: string;
+  value?: string;
+  data?: string;
+}): Promise<string | null> {
+  try {
+    const provider = getRpcProvider();
+    const args = [{ from: tx.from, to: tx.to, value: tx.value, data: tx.data }];
+    for (const method of ["quai_estimateGas", "eth_estimateGas"]) {
+      try {
+        const hex = (await provider.send(method, args)) as string;
+        if (typeof hex === "string" && hex.startsWith("0x")) return hex;
+      } catch {
+        /* try next method */
+      }
+    }
+  } catch {
+    /* RPC unavailable */
+  }
+  return null;
+}
+
+async function nextNonceViaRpc(from: string): Promise<string | null> {
+  try {
+    const provider = getRpcProvider();
+    for (const method of ["quai_getTransactionCount", "eth_getTransactionCount"]) {
+      try {
+        const hex = (await provider.send(method, [from, "pending"])) as string;
+        if (typeof hex === "string" && hex.startsWith("0x")) return hex;
+      } catch {
+        /* try next method */
+      }
+    }
+  } catch {
+    /* RPC unavailable */
+  }
+  return null;
+}
+
+/** Sends a tx through the bridge and maps the common rejection codes to friendly copy.
+ *  Always attaches explicit gas/nonce (see estimateGasViaRpc) so Blip signs directly. */
 async function blipSend(
   provider: Eip1193Provider,
   tx: { from: string; to: string; value?: string; data?: string },
 ): Promise<string> {
+  const gas = (await estimateGasViaRpc(tx)) ?? toBeHex(tx.data ? 300_000 : 21_000);
+  const nonce = await nextNonceViaRpc(tx.from);
   try {
-    const hash = await provider.request({ method: "quai_sendTransaction", params: [tx] });
+    const hash = (await provider.request({
+      method: "quai_sendTransaction",
+      params: [{ ...tx, gas, ...(nonce ? { nonce } : {}) }],
+    })) as string;
     if (typeof hash !== "string" || !hash.startsWith("0x")) {
       throw new Error("Blip returned no transaction hash.");
     }
@@ -415,6 +467,11 @@ async function blipSend(
       // Blip's own send-time balance gate — give the UI something actionable.
       throw new BlipNeedsFundsError(
         "Blip couldn't complete the payment — this site's app wallet doesn't have enough QUAI. Fund it and retry.",
+      );
+    }
+    if (/createAccessList|leading zero|-32602/i.test(message)) {
+      throw new Error(
+        "The wallet rejected this payment while preparing it (node refused the transaction arguments). Please try again — if it keeps failing, update the Blip app.",
       );
     }
     if (err instanceof Error) throw err;
