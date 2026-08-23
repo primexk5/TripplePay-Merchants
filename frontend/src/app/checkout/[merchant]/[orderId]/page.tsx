@@ -16,7 +16,7 @@ import { useEffect, useState, useRef } from "react";
 import { toPng } from "html-to-image";
 import { Receipt } from "@/components/ui/receipt";
 import QRCode from "react-qr-code";
-import { formatQuai, formatUnits } from "quais";
+import { formatQuai, formatUnits, getAddress } from "quais";
 import { Logo } from "@/components/logo";
 import { WalletSelector } from "@/components/ui/wallet-selector";
 import {
@@ -231,11 +231,27 @@ export default function CheckoutPage({ params }: { params: Params }) {
       });
       return;
     }
+    // Token orders must carry a well-formed address — a malformed one would otherwise die
+    // deep inside the wallet's own tx-building stack with a cryptic null-target error.
+    if (!isNative(order)) {
+      try {
+        getAddress(order.token);
+      } catch {
+        setStage({
+          name: "error",
+          message: "This order's currency is misconfigured (invalid token address) — please contact the merchant.",
+        });
+        return;
+      }
+    }
+    let phase = "prepare";
     try {
       setStage({ name: "paying", step: "Awaiting wallet approval…" });
+      phase = "send";
       const txHash = isNative(order)
         ? await payOrderNative(order.merchant, orderId, order.amount)
         : await payOrder(order.merchant, orderId, order.token, order.amount);
+      phase = "confirm";
       setStage({ name: "awaiting", status: "Waiting for block confirmation…" });
       const settled = await waitForOnChainConfirmation(
         order.merchant,
@@ -253,7 +269,10 @@ export default function CheckoutPage({ params }: { params: Params }) {
       });
     } catch (err: unknown) {
       setNeedsFund((err as { needsFunding?: boolean })?.needsFunding === true);
-      setErrorDetail(rawErrorText(err));
+      setErrorDetail(
+        `phase: ${phase} | wallet: ${wallet?.brand ?? "?"} | currency: ${isNative(order) ? "native" : "token"} | ` +
+          rawErrorText(err),
+      );
       setStage({
         name: "error",
         message: parseError(err),

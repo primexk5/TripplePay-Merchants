@@ -191,9 +191,12 @@ export default function PayPage({ params }: { params: Params }) {
       return;
     }
 
+    const activeWallet = getActiveWallet();
+    let phase = "prepare";
     try {
       // Ensure the wallet is on the app's network before anything else — a wallet on a
       // different node/shard would sign a tx the chain silently rejects ("missing revert data").
+      phase = "network";
       const wallet = getActiveWallet();
       if (wallet) {
         const chain = QUAI_MAINNET_CHAIN;
@@ -209,6 +212,7 @@ export default function PayPage({ params }: { params: Params }) {
       }
 
       // Step 1: Claim an orderId from the pool
+      phase = "claim";
       setStage({ name: "claiming" });
       const linkProblem = await linkPaymentProblem(link);
       if (linkProblem) throw new Error(linkProblem);
@@ -232,6 +236,7 @@ export default function PayPage({ params }: { params: Params }) {
       if (precheckError) throw new Error(precheckError);
 
       // Step 3: Pay the order — one wallet popup
+      phase = "send";
       setStage({ name: "paying", step: "Awaiting wallet approval…" });
       const hash = isNative(link)
         ? await payOrderNative(merchant, orderId, amount)
@@ -239,6 +244,7 @@ export default function PayPage({ params }: { params: Params }) {
 
 
       // Step 4: Wait for on-chain confirmation (instant — no webhook wait)
+      phase = "confirm";
       setStage({ name: "awaiting", status: "Waiting for block confirmation…" });
       const settled = await waitForOnChainConfirmation(
         merchant,
@@ -256,7 +262,10 @@ export default function PayPage({ params }: { params: Params }) {
       });
     } catch (err: unknown) {
       setNeedsFund((err as { needsFunding?: boolean })?.needsFunding === true);
-      setErrorDetail(rawErrorText(err));
+      setErrorDetail(
+        `phase: ${phase} | wallet: ${activeWallet?.brand ?? "?"} | currency: ${link && isNative(link) ? "native" : "token"} | ` +
+          rawErrorText(err),
+      );
       setStage({ name: "error", message: parseError(err) });
     }
   }, [link, slug, connected]);
