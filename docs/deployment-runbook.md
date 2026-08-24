@@ -76,6 +76,15 @@ What the script deploys, in order (`contracts/scripts/deploy.js`):
    with.**
 4. The owner then allowlists **native QUAI** (`address(0)`) and the mock stablecoin (plus
    `STABLECOIN_ADDR` if set) via `setTokenAccepted`.
+5. On **mainnet**, additionally allowlist the canonical tokens with
+   `npx hardhat run scripts/allowTokens.js --network cyprus1` — it enables
+   **USDT** (`0x0049F7cbCa3556C2DfaE62Aafa7015F99de1b8f5`) and **WQUAI**
+   (`0x006C3e2AaAE5DB1bCd11A1a097cE572312EADdBB`), skips anything already accepted, and
+   verifies each tx. Override the list with `EXTRA_TOKENS=0x…,0x…` or `ONLY_TOKENS=0x…`;
+   set `PAYWITHQUAI_ADDR` if deploying from another machine.
+6. Optionally set **`ACCEPTED_TOKENS`** on the backend (comma-separated ERC-20 addresses) to
+   restrict payment-link creation to the same list — unset means unrestricted; native QUAI is
+   always allowed.
 
 The script writes `deployments/<network>.json` (e.g. `deployments/cyprus1.json`):
 

@@ -39,6 +39,20 @@ Two rules that matter:
 | RPC | `https://orchard.rpc.quai.network` (use `usePathing: true`) |
 | chainId / zone | `15000` / Cyprus-1 |
 
+### Quai mainnet (chain 9, Cyprus-1)
+
+| Asset | Address | Decimals | Notes |
+|---|---|---|---|
+| QUAI (native) | `address(0)` | 18 | Native gas asset — always accepted |
+| USDT (Tether USD) | `0x0049F7cbCa3556C2DfaE62Aafa7015F99de1b8f5` | 6 | Canonical mainnet token |
+| WQUAI (Wrapped Quai) | `0x006C3e2AaAE5DB1bCd11A1a097cE572312EADdBB` | 18 | ERC-20 form of QUAI |
+| mUSDQ (mock) | `0x003fafB5126a5296c6edC7C23De55daf2E84B503` | 6 | Testnet faucet only |
+
+ERC-20 orders revert with `TokenNotAccepted` unless the contract owner has allowlisted the
+token (`npx hardhat run scripts/allowTokens.js --network cyprus1` — USDT and WQUAI are
+already enabled on mainnet). The backend can optionally mirror this list via
+`ACCEPTED_TOKENS` to guard payment-link creation.
+
 Use the **`quais` package** (`npm install quais`) — Quai's ethers fork. It ships
 `usePathing` (zone-aware RPC), `formatQuai`/`parseQuai`, and the wallet types the
 checkout examples below rely on. All examples in this guide import from `quais`.
@@ -50,12 +64,15 @@ checkout examples below rely on. All examples in this guide import from `quais`.
 If you don't want to run any backend code, use the merchant dashboard:
 
 1. **Dashboard → Payment links → Connect payout wallet** (the wallet that will receive the funds).
-2. Pick the asset (**QUAI** or **mUSDQ**), enter the amount, optionally restrict the link to one
-   customer (`expected payer`) and set an expiry.
+2. Pick the asset (**QUAI**, **mUSDQ**, **USDT** or **WQUAI**), enter the amount, optionally
+   restrict the link to one customer (`expected payer`) and set an expiry.
 3. **Create** — your wallet signs the on-chain order registration, and you get a link:
-   `https://<platform>/checkout/<merchant>/<orderId>`.
-4. Share the link. The customer opens it, pays with any Quai wallet or **Blip Pay** (QR scan),
-   and the platform fee (0.3%) is split off at settlement automatically.
+   `https://<platform>/pay/<slug>`.
+4. Share the link. The customer opens it, optionally leaves a display name (shown on your
+   dashboard as **"Paid by …"**, together with whether the payment came from a link or your
+   checkout page), and pays with any Quai wallet or **Blip Pay**. The platform fee (0.3%) is
+   split off at settlement automatically. No website or webhook required — every payment is
+   verified on-chain and lands directly in your wallet.
 
 The link is a real on-chain order — the same contract, fee and webhook flow as the API below,
 just registered through the dashboard UI instead of your backend.

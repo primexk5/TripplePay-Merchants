@@ -20,6 +20,7 @@ export const metadata: Metadata = {
 const sections = [
   { id: "overview", label: "Overview" },
   { id: "before-you-start", label: "Before you start" },
+  { id: "supported-assets", label: "Supported assets" },
   { id: "register-order", label: "Step 1 — Register the order" },
   { id: "customer-pays", label: "Step 2 — Customer pays" },
   { id: "read-order", label: "Read an order on-chain" },
@@ -444,6 +445,89 @@ export default function DocsPage() {
             </div>
           </section>
 
+          {/* Supported assets */}
+          <section className="mt-16">
+            <SectionHeading
+              id="supported-assets"
+              kicker="Currencies"
+              title="Supported assets"
+            />
+
+            <p className="mt-5 text-[15px] leading-7 text-[#8b93a7]">
+              Orders can be registered in native QUAI or any ERC-20 the contract
+              owner has allowlisted. The platform ships with these assets built
+              in — payment links, checkout, Blip and the dashboard balances
+              panel all pick them up automatically:
+            </p>
+
+            <div className="mt-5 overflow-hidden rounded-xl border border-white/7">
+              <table className="w-full text-left text-sm">
+                <thead>
+                  <tr className="border-b border-white/7 bg-white/3">
+                    <th className="px-4 py-3 font-medium text-[#8b93a7]">Asset</th>
+                    <th className="px-4 py-3 font-medium text-[#8b93a7]">Address</th>
+                    <th className="px-4 py-3 font-medium text-[#8b93a7]">Decimals</th>
+                    <th className="px-4 py-3 font-medium text-[#8b93a7]">Notes</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/6">
+                  <tr>
+                    <td className="px-4 py-3 font-medium">QUAI</td>
+                    <td className="px-4 py-3 font-mono text-[12px] text-[#c9d4e0]">address(0)</td>
+                    <td className="px-4 py-3 text-[#8b93a7]">18</td>
+                    <td className="px-4 py-3 text-[#8b93a7]">Native gas asset — always accepted</td>
+                  </tr>
+                  <tr>
+                    <td className="px-4 py-3 font-medium">USDT</td>
+                    <td className="px-4 py-3 break-all font-mono text-[12px] text-[#c9d4e0]">0x0049F7cbCa3556C2DfaE62Aafa7015F99de1b8f5</td>
+                    <td className="px-4 py-3 text-[#8b93a7]">6</td>
+                    <td className="px-4 py-3 text-[#8b93a7]">Tether USD — canonical mainnet token</td>
+                  </tr>
+                  <tr>
+                    <td className="px-4 py-3 font-medium">WQUAI</td>
+                    <td className="px-4 py-3 break-all font-mono text-[12px] text-[#c9d4e0]">0x006C3e2AaAE5DB1bCd11A1a097cE572312EADdBB</td>
+                    <td className="px-4 py-3 text-[#8b93a7]">18</td>
+                    <td className="px-4 py-3 text-[#8b93a7]">Wrapped Quai — ERC-20 form of QUAI</td>
+                  </tr>
+                  <tr>
+                    <td className="px-4 py-3 font-medium">mUSDQ</td>
+                    <td className="px-4 py-3 break-all font-mono text-[12px] text-[#c9d4e0]">0x003fafB5126a5296c6edC7C23De55daf2E84B503</td>
+                    <td className="px-4 py-3 text-[#8b93a7]">6</td>
+                    <td className="px-4 py-3 text-[#8b93a7]">Mock stablecoin — testnet faucet only</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div className="mt-5 space-y-4">
+              <Callout tone="info" title="Registry-driven frontend">
+                Canonical addresses are compiled into{" "}
+                <span className="font-mono text-[13px] text-[#c9d4e0]">frontend/src/lib/currencies.ts</span>{" "}
+                and can be overridden per deployment with{" "}
+                <span className="font-mono text-[13px] text-[#c9d4e0]">NEXT_PUBLIC_USDT_ADDRESS</span> /{" "}
+                <span className="font-mono text-[13px] text-[#c9d4e0]">NEXT_PUBLIC_WQUAI_ADDRESS</span>.
+                Every surface (link builder, pay page, checkout, dashboard, analytics) reads from
+                this one registry.
+              </Callout>
+
+              <Callout tone="warning" title="Tokens must be allowlisted on the contract">
+                Registering an order in a token the contract hasn&apos;t accepted reverts with{" "}
+                <span className="font-mono text-[13px] text-[#c9d4e0]">TokenNotAccepted</span>. The
+                owner enables assets once with{" "}
+                <span className="font-mono text-[13px] text-[#c9d4e0]">npx hardhat run scripts/allowTokens.js --network cyprus1</span>{" "}
+                (USDT + WQUAI are already enabled on mainnet). Optionally set{" "}
+                <span className="font-mono text-[13px] text-[#c9d4e0]">ACCEPTED_TOKENS</span> on the
+                backend to mirror the same list for payment-link creation.
+              </Callout>
+
+              <Callout tone="success" title="Blip pays every listed asset">
+                The &quot;Pay with Blip&quot; flow works for native QUAI and all supported
+                tokens alike — balance check, top-up and approve/transferFrom are handled by the
+                app.
+              </Callout>
+            </div>
+          </section>
+
           {/* Step 1 */}
           <section className="mt-16">
             <SectionHeading
@@ -616,6 +700,15 @@ export default function DocsPage() {
               You don&apos;t need to build a custom checkout flow. Once an order is registered, you can simply direct customers to the hosted checkout page using a <strong className="text-white">Payment Link</strong>.
             </p>
 
+            <p className="mt-3 text-[15px] leading-7 text-[#8b93a7]">
+              Even simpler: build links in the dashboard (<span className="font-mono text-[13px]">Links → New link</span>) — pick any{" "}
+              <Link className="text-[#38bdf8] hover:underline" href="#supported-assets">supported asset</Link>, set a fixed or
+              customer-entered amount, and share the short URL. Customers who pay a link can
+              leave their name, so your payment history shows{" "}
+              <span className="font-medium text-white">who paid and for what</span> — expand any
+              row for full details.
+            </p>
+
             <div className="mt-5">
               <CodeBlock
                 label="payment-link.ts"
@@ -693,6 +786,14 @@ const blipLink = \`https://blippay.me/browser?url=\${encodeURIComponent(checkout
             <p className="mt-5 text-[15px] leading-7 text-[#8b93a7]">
               When the payment is final, we POST one webhook to your endpoint:
             </p>
+
+            <Callout tone="info" title="Webhooks are optional">
+              Only merchants that need automated fulfillment configure a receiver URL.
+              Payment-link sellers without a website don&apos;t need one — every payment is
+              verified on-chain and lands directly in the payout wallet, and the dashboard
+              shows it as <span className="font-medium text-white">Confirmed</span> regardless.
+              The webhook is a convenience channel, never the source of truth for settlement.
+            </Callout>
 
             <div className="mt-5">
               <CodeBlock label="POST payload" code={webhookJson} />
