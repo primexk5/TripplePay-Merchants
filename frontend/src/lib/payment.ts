@@ -1069,6 +1069,30 @@ export async function fetchMerchants(): Promise<PublicMerchant[]> {
   return body.merchants ?? [];
 }
 
+/** Fire-and-forget payer context for the merchant dashboard: who paid (optional display
+ *  name) and where the payment came from (payment link vs merchant checkout page). Never
+ *  blocks or fails the payment — settlement is on-chain; this is dashboard sugar only. */
+export async function submitPaymentMeta(params: {
+  merchant: string;
+  orderId: string;
+  customerName?: string;
+  slug?: string;
+}): Promise<void> {
+  try {
+    await backendFetch(`/v1/orders/${params.merchant}/${params.orderId}/meta`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        customerName: params.customerName?.trim() || undefined,
+        slug: params.slug,
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch {
+    // intentionally swallowed — the payment itself already settled on-chain
+  }
+}
+
 /**
  * Validate a payment link's currency BEFORE any wallet popup or order claim. Native QUAI links
  * pass instantly; token links must carry a well-formed address AND be accepted by the contract.

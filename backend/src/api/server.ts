@@ -5,7 +5,7 @@ import { z } from 'zod';
 import type { Store } from '../store/index.js';
 import type { QuaiClient } from '../chain/client.js';
 import type { Config } from '../config.js';
-import type { Merchant, Session, PaymentLink } from '../types.js';
+import type { Merchant, Session, PaymentLink, WebhookDelivery } from '../types.js';
 import { newMerchantId, newWebhookSecret, newSlug } from '../util/ids.js';
 import { assertSafeWebhookUrl, UnsafeWebhookUrlError } from '../webhooks/urlGuard.js';
 import { rateLimit } from './rateLimit.js';
@@ -110,6 +110,48 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config): Exp
       webhook: delivery ? { status: delivery.status, attempts: delivery.attempts } : null,
     });
   }));
+
+  // --- order metadata (payer-supplied context, best-effort) ---
+  // Payment pages POST this right after on-chain confirmation so the merchant's dashboard can
+  // show WHO paid (optional display name) and WHERE the payment came from (payment link vs
+  // merchant checkout/API page). Purely informational — settlement is on-chain only.
+  const OrderMetaSchema = z.object({
+    customerName: z.string().trim().min(1).max(60).optional(),
+    slug: z.string().trim().length(8).regex(/^[0-9A-Za-z]+$/).optional(),
+  });
+  app.post('/v1/orders/:merchant/:orderId/meta', ordersLimiter, asyncHandler(async (req, res) => {
+    let merchant: string;
+    try {
+      merchant = getAddress(req.params.merchant ?? '');
+    } catch {
+      return res.status(400).json({ error: 'invalid merchant address' });
+    }
+    const orderId = (req.params.orderId ?? '').toLowerCase();
+    if (!/^0x[0-9a-f]{64}$/.test(orderId)) {
+      return res.status(400).json({ error: 'orderId must be a 32-byte hex string' });
+    }
+
+    const parsed = OrderMetaSchema.safeParse(req.body ?? {});
+    if (!parsed.success) return res.status(400).json({ error: 'invalid metadata' });
+
+    // A slug only counts as a "link" source if it actually belongs to this merchant.
+    let slug: string | undefined;
+    if (parsed.data.slug) {
+      const link = await store.getLink(parsed.data.slug);
+      if (link && link.merchantAddress === merchant.toLowerCase()) slug = link.slug;
+    }
+
+    await store.saveOrderMeta({
+      orderId,
+      merchantAddress: merchant.toLowerCase(),
+      customerName: parsed.data.customerName,
+      source: slug ? 'link' : 'checkout',
+      slug,
+      createdAt: Date.now(),
+    });
+    res.json({ ok: true });
+  }));
+
 
   // --- merchant auth (wallet-signature login) ---
   // Two-step login: the client first asks for a challenge (POST /v1/auth/challenge), which issues
@@ -282,11 +324,33 @@ await store.upsertMerchant(updated);
     res.json(publicMerchant(updated));
   }));
 
+  // Attaches optional payer context (who paid / link vs checkout) to each delivery for the
+  // dashboard. Missing meta (older payments, or the page never reported) → null.
+  const decorateDeliveries = async (deliveries: WebhookDelivery[]) =>
+    Promise.all(
+      deliveries.map(async (d) => {
+        const meta = await store.getOrderMeta(d.payload.data.orderId);
+        if (!meta) return { ...d, meta: null };
+        const link = meta.slug ? await store.getLink(meta.slug) : undefined;
+        return {
+          ...d,
+          meta: {
+            payerName: meta.customerName ?? null,
+            source: meta.source,
+            slug: meta.slug ?? null,
+            shopName: link?.shopName ?? null,
+          },
+        };
+      }),
+    );
+
   app.get('/v1/me/deliveries', auth, asyncHandler(async (_req, res) => {
     const session = res.locals.session as Session;
     const deliveries = await store.listDeliveries(100);
     res.json({
-      deliveries: deliveries.filter((d) => d.merchantId === session.merchantId),
+      deliveries: await decorateDeliveries(
+        deliveries.filter((d) => d.merchantId === session.merchantId),
+      ),
     });
   }));
 
@@ -571,7 +635,7 @@ await store.upsertMerchant(updated);
   }));
 
   admin.get('/deliveries', asyncHandler(async (_req, res) => {
-    res.json({ deliveries: await store.listDeliveries(100) });
+    res.json({ deliveries: await decorateDeliveries(await store.listDeliveries(100)) });
   }));
 
   admin.post('/deliveries/:id/retry', asyncHandler(async (req, res) => {

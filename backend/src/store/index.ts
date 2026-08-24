@@ -1,4 +1,4 @@
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta } from '../types.js';
 
 /**
  * Persistence boundary for the relayer. The default local implementation ({@link JsonStore}) is a
@@ -70,4 +70,8 @@ export interface Store {
   upsertClaim(claim: LinkClaim): Promise<void>;
   /** Returns the most recent claim for this (slug, payerAddress), or undefined. */
   getLatestClaim(slug: string, payerAddress: string): Promise<LinkClaim | undefined>;
+
+  // --- order metadata (optional payer-supplied context: who paid + link/checkout source) ---
+  saveOrderMeta(meta: OrderMeta): Promise<void>;
+  getOrderMeta(orderId: string): Promise<OrderMeta | undefined>;
 }

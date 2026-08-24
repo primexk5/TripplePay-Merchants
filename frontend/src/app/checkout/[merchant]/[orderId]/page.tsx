@@ -27,6 +27,7 @@ import {
   payOrderNative,
   requestBlipAppWalletTopUp,
   waitForOnChainConfirmation,
+  submitPaymentMeta,
   type OnChainOrder,
 } from "@/lib/payment";
 import { currencyDecimals, currencySymbol } from "@/lib/currencies";
@@ -267,6 +268,12 @@ export default function CheckoutPage({ params }: { params: Params }) {
         txHash,
         net: formatAmount(order, netAmount(order)),
         symbol: symbol(order),
+      });
+      // Best-effort dashboard context (payer name + "came from checkout" source).
+      void submitPaymentMeta({
+        merchant: order.merchant,
+        orderId,
+        customerName: customerName || undefined,
       });
     } catch (err: unknown) {
       setNeedsFund((err as { needsFunding?: boolean })?.needsFunding === true);

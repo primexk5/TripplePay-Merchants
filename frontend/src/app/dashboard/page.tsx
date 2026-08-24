@@ -156,7 +156,19 @@ export default function DashboardPage() {
                         {formatDeliveryAmount(d.payload.data.net, d.payload.data.token)}
                       </p>
                       <p className="mt-0.5 truncate font-mono text-xs text-[#8b93a7]">
-                        {d.payload.data.orderId.slice(0, 18)}…
+                        {d.meta?.payerName
+                          ? <span className="font-sans not-italic">Paid by {d.meta.payerName}</span>
+                          : <>{d.payload.data.orderId.slice(0, 18)}…</>}
+                        {d.meta?.source === "link" && (
+                          <span className="ml-2 rounded-md border border-emerald-400/25 bg-emerald-400/10 px-1.5 py-0.5 font-sans text-[10px] font-medium not-italic text-emerald-300">
+                            Link{d.meta.shopName ? ` · ${d.meta.shopName}` : ""}
+                          </span>
+                        )}
+                        {d.meta?.source === "checkout" && (
+                          <span className="ml-2 rounded-md border border-sky-400/25 bg-sky-400/10 px-1.5 py-0.5 font-sans text-[10px] font-medium not-italic text-sky-300">
+                            Checkout
+                          </span>
+                        )}
                       </p>
                     </div>
 

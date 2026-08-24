@@ -22,6 +22,14 @@ export interface DeliveryData {
   timestamp: number;
 }
 
+/** Optional payer context the payment pages report to the backend (absent → null). */
+export interface DeliveryMeta {
+  payerName: string | null;
+  source: "link" | "checkout";
+  slug: string | null;
+  shopName: string | null;
+}
+
 export interface Delivery {
   id: string;
   merchantId: string;
@@ -32,6 +40,7 @@ export interface Delivery {
   lastError: string | null;
   createdAt: number;
   updatedAt: number;
+  meta?: DeliveryMeta | null;
 }
 
 export interface Merchant {

@@ -31,6 +31,7 @@ import {
   fetchLink,
   claimOrderFromLink,
   linkPaymentProblem,
+  submitPaymentMeta,
   type LinkInfo,
 } from "@/lib/payment";
 import { currencyDecimals } from "@/lib/currencies";
@@ -261,6 +262,15 @@ export default function PayPage({ params }: { params: Params }) {
         net: formatAmount(link, amount),
         symbol: symbol(link),
       });
+      // Best-effort dashboard context (payer name + "paid a link" source) — never blocks.
+      if (merchant && orderId) {
+        void submitPaymentMeta({
+          merchant,
+          orderId,
+          customerName: customerName || undefined,
+          slug,
+        });
+      }
     } catch (err: unknown) {
       setNeedsFund((err as { needsFunding?: boolean })?.needsFunding === true);
       setErrorDetail(
@@ -269,6 +279,7 @@ export default function PayPage({ params }: { params: Params }) {
       );
       setStage({ name: "error", message: parseError(err) });
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [link, slug, connected]);
 
   // Blip app wallets are often empty — when a payment fails for lack of funds, let the user

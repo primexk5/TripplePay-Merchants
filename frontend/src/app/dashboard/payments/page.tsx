@@ -1,7 +1,7 @@
 "use client";
 
-import { ArrowUpRight, Search } from "lucide-react";
-import { useState } from "react";
+import { ArrowUpRight, ChevronDown, Search } from "lucide-react";
+import { Fragment, useState } from "react";
 import { DashboardShell } from "@/components/layout/dashboard-shell";
 import { StatusBadge } from "@/components/ui/status-badge";
 import {
@@ -18,6 +18,7 @@ export default function PaymentsPage() {
   const { deliveries, merchants, loading, error } = useRelayerData();
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<StatusFilter>("all");
+  const [expandedId, setExpandedId] = useState<string | null>(null);
   // Webhook delivery info is only meaningful for merchants with a receiver URL; link-only
   // sellers (no website) see pure on-chain confirmation instead.
   const usesWebhook = merchants.some((m) => m.webhookUrl);
@@ -118,24 +119,42 @@ export default function PaymentsPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/6">
-                  {filtered.map((d) => (
-                    <tr key={d.id} className="hover:bg-white/5">
-                      <td className="px-5 py-3.5 font-medium">
-                        {formatDeliveryAmount(
-                          d.payload.data.net,
-                          d.payload.data.token,
-                        )}
-                      </td>
-                      <td className="px-5 py-3.5 font-mono text-xs text-[#8b93a7]">
-                        {d.payload.data.orderId.slice(0, 14)}…
-                      </td>
-                      <td className="px-5 py-3.5 font-mono text-xs text-[#8b93a7]">
-                        {d.payload.data.payer.slice(0, 10)}…
-                      </td>
-                      <td className="px-5 py-3.5 text-xs text-[#8b93a7]">
-                        {formatTimestamp(d.createdAt)}
-                      </td>
-                      <td className="px-5 py-3.5">
+                  {filtered.map((d) => {
+                    const meta = d.meta ?? null;
+                    const expanded = expandedId === d.id;
+                    return (
+                      <Fragment key={d.id}>
+                        <tr
+                          onClick={() => setExpandedId(expanded ? null : d.id)}
+                          className={`cursor-pointer transition hover:bg-white/5 ${expanded ? "bg-white/5" : ""}`}
+                        >
+                          <td className="px-5 py-3.5 font-medium">
+                            {formatDeliveryAmount(
+                              d.payload.data.net,
+                              d.payload.data.token,
+                            )}
+                          </td>
+                          <td className="px-5 py-3.5 font-mono text-xs text-[#8b93a7]">
+                            {meta?.payerName ? (
+                              <span className="font-sans text-sm text-white">
+                                {meta.payerName}
+                                {meta.shopName ? (
+                                  <span className="ml-1.5 text-[11px] text-[#8b93a7]">
+                                    · for {meta.shopName}
+                                  </span>
+                                ) : null}
+                              </span>
+                            ) : (
+                              `${d.payload.data.orderId.slice(0, 14)}…`
+                            )}
+                          </td>
+                          <td className="px-5 py-3.5 font-mono text-xs text-[#8b93a7]">
+                            {d.payload.data.payer.slice(0, 10)}…
+                          </td>
+                          <td className="px-5 py-3.5 text-xs text-[#8b93a7]">
+                            {formatTimestamp(d.createdAt)}
+                          </td>
+                          <td className="px-5 py-3.5">
                         <div className="flex flex-col items-start gap-1">
                           <StatusBadge status="confirmed" />
                           {usesWebhook && (
@@ -155,18 +174,101 @@ export default function PaymentsPage() {
                         </div>
                       </td>
                       <td className="px-5 py-3.5 text-right">
-                        <a
-                          href={`${QUAI_SCAN}${d.payload.data.txHash}`}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="inline-flex items-center gap-1 text-xs text-[#38bdf8] hover:text-[#67d8ff]"
-                        >
-                          View
-                          <ArrowUpRight size={12} />
-                        </a>
+                        <div className="flex items-center justify-end gap-3">
+                          <a
+                            href={`${QUAI_SCAN}${d.payload.data.txHash}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            className="inline-flex items-center gap-1 text-xs text-[#38bdf8] hover:text-[#67d8ff]"
+                          >
+                            View
+                            <ArrowUpRight size={12} />
+                          </a>
+                          <ChevronDown
+                            size={15}
+                            className={`text-[#8b93a7] transition-transform ${expanded ? "rotate-180" : ""}`}
+                          />
+                        </div>
                       </td>
                     </tr>
-                  ))}
+                    {expanded && (
+                      <tr className="bg-[#101010]">
+                        <td colSpan={6} className="px-5 py-4">
+                          <div className="grid grid-cols-2 gap-x-6 gap-y-3 text-xs sm:grid-cols-4">
+                            <div>
+                              <p className="text-[#8b93a7]">Paid by</p>
+                              <p className="mt-0.5 text-sm text-white">
+                                {meta?.payerName ?? "Anonymous"}
+                              </p>
+                            </div>
+                            <div>
+                              <p className="text-[#8b93a7]">Source</p>
+                              <p className="mt-0.5">
+                                {meta?.source === "link" ? (
+                                  <span className="rounded-md border border-emerald-400/25 bg-emerald-400/10 px-1.5 py-0.5 font-medium text-emerald-300">
+                                    Payment link{meta?.shopName ? ` · ${meta.shopName}` : ""}
+                                  </span>
+                                ) : meta?.source === "checkout" ? (
+                                  <span className="rounded-md border border-sky-400/25 bg-sky-400/10 px-1.5 py-0.5 font-medium text-sky-300">
+                                    Checkout / API
+                                  </span>
+                                ) : (
+                                  <span className="rounded-md border border-white/10 px-1.5 py-0.5 font-medium text-[#8b93a7]">
+                                    On-chain only
+                                  </span>
+                                )}
+                              </p>
+                            </div>
+                            <div>
+                              <p className="text-[#8b93a7]">Payer wallet</p>
+                              <p className="mt-0.5 break-all font-mono text-[11px] text-white">
+                                {d.payload.data.payer}
+                              </p>
+                            </div>
+                            <div>
+                              <p className="text-[#8b93a7]">Order ID</p>
+                              <p className="mt-0.5 break-all font-mono text-[11px] text-white">
+                                {d.payload.data.orderId}
+                              </p>
+                            </div>
+                            <div>
+                              <p className="text-[#8b93a7]">Gross amount</p>
+                              <p className="mt-0.5 font-mono text-white">
+                                {formatDeliveryAmount(d.payload.data.amount, d.payload.data.token)}
+                              </p>
+                            </div>
+                            <div>
+                              <p className="text-[#8b93a7]">Platform fee ({(d.payload.data.feeBps / 100).toFixed(2)}%)</p>
+                              <p className="mt-0.5 font-mono text-white">
+                                {formatDeliveryAmount(d.payload.data.fee, d.payload.data.token)}
+                              </p>
+                            </div>
+                            <div>
+                              <p className="text-[#8b93a7]">You received</p>
+                              <p className="mt-0.5 font-mono font-medium text-emerald-300">
+                                {formatDeliveryAmount(d.payload.data.net, d.payload.data.token)}
+                              </p>
+                            </div>
+                            <div>
+                              <p className="text-[#8b93a7]">Tx hash</p>
+                              <a
+                                href={`${QUAI_SCAN}${d.payload.data.txHash}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                className="mt-0.5 block truncate font-mono text-[11px] text-[#38bdf8] hover:text-[#67d8ff]"
+                              >
+                                {d.payload.data.txHash}
+                              </a>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                      </Fragment>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

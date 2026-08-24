@@ -98,6 +98,21 @@ export interface LinkClaim {
   settled: boolean;           // set true after on-chain confirmation
 }
 
+/** Optional payer-supplied context attached to a payment (who paid + where they came from).
+ *  Written by the payment pages right after on-chain confirmation — purely informational,
+ *  never used for settlement logic. Keyed by orderId. */
+export type OrderSource = 'link' | 'checkout';
+
+export interface OrderMeta {
+  orderId: string;            // bytes32 hex, lowercased
+  merchantAddress: string;    // lowercased
+  customerName?: string;      // optional display name the payer typed
+  source: OrderSource;        // 'link' = paid a payment-link page, 'checkout' = merchant checkout/API order page
+  slug?: string;              // set when source === 'link'
+  createdAt: number;
+}
+
+
 export interface WebhookDelivery {
   id: string; // == paymentId
   merchantId: string;

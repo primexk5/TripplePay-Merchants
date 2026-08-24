@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSync, closeSync, fsyncSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Store } from './index.js';
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta } from '../types.js';
 import { log } from '../logger.js';
 
 const logger = log('store');
@@ -14,6 +14,7 @@ interface FileShape {
   nonces: Record<string, { address: string; expiresAt: number }>;
   links: Record<string, PaymentLink>;   // key: slug
   claims: Record<string, LinkClaim[]>;  // key: slug — array of all claims for that link
+  orderMeta: Record<string, OrderMeta>; // key: lowercased orderId
 }
 
 /** Case-insensitive lookup key binding a delivery to its (merchant, orderId). */
@@ -67,7 +68,7 @@ export class JsonStore implements Store {
   }
 
   private read(): FileShape {
-    if (!existsSync(this.path)) return { cursors: {}, merchants: {}, deliveries: {}, sessions: {}, nonces: {}, links: {}, claims: {} };
+    if (!existsSync(this.path)) return { cursors: {}, merchants: {}, deliveries: {}, sessions: {}, nonces: {}, links: {}, claims: {}, orderMeta: {} };
     try {
       const parsed = JSON.parse(readFileSync(this.path, 'utf8')) as {
         cursor?: number | null;
@@ -92,6 +93,7 @@ export class JsonStore implements Store {
         nonces: parsed.nonces ?? {},
         links: (parsed as Partial<FileShape>).links ?? {},
         claims: (parsed as Partial<FileShape>).claims ?? {},
+        orderMeta: (parsed as Partial<FileShape>).orderMeta ?? {},
       };
     } catch (err) {
       throw new Error(`Failed to read store at ${this.path}: ${(err as Error).message}`);
@@ -391,5 +393,16 @@ export class JsonStore implements Store {
     return claims
       .filter((c) => c.payerAddress === addr)
       .sort((a, b) => b.claimedAt - a.claimedAt)[0];
+  }
+
+  // --- order metadata ---
+
+  async saveOrderMeta(meta: OrderMeta): Promise<void> {
+    this.data.orderMeta[meta.orderId] = meta;
+    this.flush();
+  }
+
+  async getOrderMeta(orderId: string): Promise<OrderMeta | undefined> {
+    return this.data.orderMeta[orderId.toLowerCase()];
   }
 }

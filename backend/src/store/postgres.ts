@@ -1,6 +1,6 @@
 import { Pool, type PoolClient } from 'pg';
 import type { Store } from './index.js';
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta } from '../types.js';
 import { log } from '../logger.js';
 
 const logger = log('store:postgres');
@@ -115,6 +115,16 @@ export class PostgresStore implements Store {
         PRIMARY KEY (slug, order_id)
       );
       CREATE INDEX IF NOT EXISTS claims_payer ON claims (slug, payer_address, claimed_at DESC);
+
+      CREATE TABLE IF NOT EXISTS order_meta (
+        order_id         TEXT PRIMARY KEY,
+        merchant_address TEXT NOT NULL,
+        customer_name    TEXT,
+        source           TEXT NOT NULL,
+        slug             TEXT,
+        created_at       BIGINT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS order_meta_merchant ON order_meta (merchant_address, created_at DESC);
     `);
   }
 
@@ -526,6 +536,37 @@ export class PostgresStore implements Store {
       [slug, payerAddress.toLowerCase()],
     );
     return rows.length ? mapClaim(rows[0]!) : undefined;
+  }
+
+  // --- order metadata ---
+
+  async saveOrderMeta(meta: OrderMeta): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO order_meta (order_id, merchant_address, customer_name, source, slug, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (order_id) DO UPDATE SET
+         customer_name = COALESCE(EXCLUDED.customer_name, order_meta.customer_name),
+         source        = EXCLUDED.source,
+         slug          = EXCLUDED.slug`,
+      [meta.orderId.toLowerCase(), meta.merchantAddress.toLowerCase(), meta.customerName ?? null, meta.source, meta.slug ?? null, meta.createdAt],
+    );
+  }
+
+  async getOrderMeta(orderId: string): Promise<OrderMeta | undefined> {
+    const { rows } = await this.pool.query(
+      `SELECT * FROM order_meta WHERE order_id = $1 LIMIT 1`,
+      [orderId.toLowerCase()],
+    );
+    if (!rows.length) return undefined;
+    const r = rows[0]!;
+    return {
+      orderId: r.order_id as string,
+      merchantAddress: r.merchant_address as string,
+      customerName: (r.customer_name as string | null) ?? undefined,
+      source: r.source as OrderMeta['source'],
+      slug: (r.slug as string | null) ?? undefined,
+      createdAt: Number(r.created_at),
+    };
   }
 
   async close(): Promise<void> {
