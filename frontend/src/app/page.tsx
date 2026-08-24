@@ -5,6 +5,7 @@ import Image from "next/image";
 import { useState } from "react";
 import { motion } from "framer-motion";
 import { Logo } from "@/components/logo";
+import { MerchantShowcase } from "@/components/landing/merchant-showcase";
 import {
   ArrowRight,
   Check,
@@ -224,6 +225,9 @@ export default function Home() {
           })}
         </div>
       </section>
+
+      {/* Merchant showcase */}
+      <MerchantShowcase />
 
       {/* Blip Wallet Integration Spotlight */}
       <section className="mx-auto max-w-7xl px-6 py-20 lg:px-8">

@@ -1034,6 +1034,21 @@ export async function fetchLink(slug: string): Promise<LinkInfo | null> {
   return (await res.json()) as LinkInfo;
 }
 
+/** A merchant as shown in the public landing-page showcase (safe fields only). */
+export interface PublicMerchant {
+  merchantId: string;
+  name: string;
+  createdAt: number;
+}
+
+/** Public merchant directory for the landing page (no auth needed). */
+export async function fetchMerchants(): Promise<PublicMerchant[]> {
+  const res = await backendFetch("/v1/merchants/public", { signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) throw new Error(`backend error ${res.status}`);
+  const body = (await res.json()) as { merchants?: PublicMerchant[] };
+  return body.merchants ?? [];
+}
+
 /**
  * Validate a payment link's currency BEFORE any wallet popup or order claim. Native QUAI links
  * pass instantly; token links must carry a well-formed address AND be accepted by the contract.

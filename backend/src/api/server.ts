@@ -373,6 +373,18 @@ await store.upsertMerchant(updated);
     res.json(publicLink(link));
   }));
 
+  // Public merchant directory (landing-page showcase). Safe fields only — never expose
+  // payout addresses, webhook URLs or secrets here. Lives under /public so it can't shadow
+  // the admin-only GET /v1/merchants listing below.
+  app.get('/v1/merchants/public', linkLimiter, asyncHandler(async (_req, res) => {
+    const merchants = (await store.listMerchants())
+      .filter((m) => m.active)
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .slice(0, 50)
+      .map((m) => ({ merchantId: m.merchantId, name: m.name, createdAt: m.createdAt }));
+    res.json({ merchants });
+  }));
+
   const ClaimSchema = z.object({
     payerAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/, 'payerAddress must be a 20-byte hex address'),
   });

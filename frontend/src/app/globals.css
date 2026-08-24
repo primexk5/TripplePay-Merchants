@@ -77,3 +77,22 @@ a {
 .float {
   animation: float 5s ease-in-out infinite;
 }
+
+/* Infinite marquee for the merchant showcase — the track holds the card list twice,
+   so translating exactly -50% loops seamlessly. */
+@keyframes marquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+.animate-marquee {
+  animation: marquee 45s linear infinite;
+}
+
+.marquee-paused:hover .animate-marquee {
+  animation-play-state: paused;
+}

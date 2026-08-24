@@ -108,6 +108,27 @@ function createLinkBody(tokenAddress: string, orderId: string) {
   };
 }
 
+describe('GET /v1/merchants/public', () => {
+  it('lists active merchants with safe fields only, no auth needed', async () => {
+    const base = await startApp(makeCfg());
+    await onboard(base);
+
+    const res = await req(base, '/v1/merchants/public');
+    expect(res.status).toBe(200);
+    const list = res.body.merchants as Array<Record<string, unknown>>;
+    expect(list).toHaveLength(1);
+    const first = list[0]!;
+    expect(first).toMatchObject({ name: 'Acme' });
+    // Safe projection: no payout address, webhook URL or secret may leak.
+    expect(Object.keys(first).sort()).toEqual(['createdAt', 'merchantId', 'name']);
+  });
+
+  it('does not shadow the admin-only listing', async () => {
+    const base = await startApp(makeCfg());
+    expect((await req(base, '/v1/merchants')).status).toBe(401);
+  });
+});
+
 describe('POST /v1/links ACCEPTED_TOKENS allowlist', () => {
   it('accepts an allowlisted token and native QUAI', async () => {
     const base = await startApp(makeCfg(`${USDT},${ROGUE}`));
