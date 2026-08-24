@@ -15,9 +15,12 @@ const STATUSES = ["all", "delivered", "pending", "failed"] as const;
 type StatusFilter = (typeof STATUSES)[number];
 
 export default function PaymentsPage() {
-  const { deliveries, loading, error } = useRelayerData();
+  const { deliveries, merchants, loading, error } = useRelayerData();
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<StatusFilter>("all");
+  // Webhook delivery info is only meaningful for merchants with a receiver URL; link-only
+  // sellers (no website) see pure on-chain confirmation instead.
+  const usesWebhook = merchants.some((m) => m.webhookUrl);
 
   const filtered = deliveries.filter((d) => {
     if (status !== "all" && d.status !== status) return false;
@@ -39,8 +42,9 @@ export default function PaymentsPage() {
             Payment history
           </h1>
           <p className="mt-2 text-sm text-[#8b93a7]">
-            Every row is a confirmed on-chain settlement. The status filter
-            tracks webhook delivery to your endpoint.
+            {usesWebhook
+              ? "Every row is a confirmed on-chain settlement. The status filter tracks webhook delivery to your endpoint."
+              : "Every row is a settlement confirmed on Quai — funds are already in your wallet."}
           </p>
         </div>
 
@@ -64,21 +68,23 @@ export default function PaymentsPage() {
             />
           </div>
 
-          <div className="flex items-center gap-2">
-            {STATUSES.map((s) => (
-              <button
-                key={s}
-                onClick={() => setStatus(s)}
-                className={`rounded-lg px-3 py-1.5 text-xs font-medium capitalize transition ${
-                  status === s
-                    ? "bg-[#38bdf8] text-[#061018]"
-                    : "border border-white/7 text-[#8b93a7] hover:bg-white/5"
-                }`}
-              >
-                {s}
-              </button>
-            ))}
-          </div>
+          {usesWebhook && (
+            <div className="flex items-center gap-2">
+              {STATUSES.map((s) => (
+                <button
+                  key={s}
+                  onClick={() => setStatus(s)}
+                  className={`rounded-lg px-3 py-1.5 text-xs font-medium capitalize transition ${
+                    status === s
+                      ? "bg-[#38bdf8] text-[#061018]"
+                      : "border border-white/7 text-[#8b93a7] hover:bg-white/5"
+                  }`}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
         {loading ? (
@@ -132,18 +138,20 @@ export default function PaymentsPage() {
                       <td className="px-5 py-3.5">
                         <div className="flex flex-col items-start gap-1">
                           <StatusBadge status="confirmed" />
-                          <span
-                            className={`text-[11px] ${
-                              d.status === "delivered"
-                                ? "text-[#4f5868]"
-                                : d.status === "failed"
-                                  ? "text-red-400"
-                                  : "text-amber-400"
-                            }`}
-                          >
-                            webhook {d.status}
-                            {d.status === "failed" ? ` · ${d.attempts} attempts` : ""}
-                          </span>
+                          {usesWebhook && (
+                            <span
+                              className={`text-[11px] ${
+                                d.status === "delivered"
+                                  ? "text-[#4f5868]"
+                                  : d.status === "failed"
+                                    ? "text-red-400"
+                                    : "text-amber-400"
+                              }`}
+                            >
+                              webhook {d.status}
+                              {d.status === "failed" ? ` · ${d.attempts} attempts` : ""}
+                            </span>
+                          )}
                         </div>
                       </td>
                       <td className="px-5 py-3.5 text-right">

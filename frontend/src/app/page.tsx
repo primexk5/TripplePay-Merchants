@@ -6,6 +6,7 @@ import { useState } from "react";
 import { motion } from "framer-motion";
 import { Logo } from "@/components/logo";
 import { MerchantShowcase } from "@/components/landing/merchant-showcase";
+import { SocialLinks } from "@/components/landing/social-links";
 import {
   ArrowRight,
   Check,
@@ -170,6 +171,18 @@ export default function Home() {
                 <Check className="h-4 w-4 text-emerald-400" />
                 Quai native
               </span>
+            </motion.div>
+
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ type: "spring", stiffness: 80, damping: 20, delay: 0.5 }}
+              className="mt-8 flex flex-col items-center gap-2.5"
+            >
+              <SocialLinks />
+              <p className="text-xs text-slate-600">
+                Join the community on WhatsApp, X and GitHub
+              </p>
             </motion.div>
           </div>
 
@@ -965,18 +978,21 @@ function Footer() {
           </span>
         </div>
 
-        <div className="flex items-center gap-5 text-xs text-slate-600">
-          <Link href="/docs" className="transition hover:text-slate-400">
-            Docs
-          </Link>
-          <span>•</span>
-          <Link href="/terms" className="transition hover:text-slate-400">
-            Terms of Service
-          </Link>
-          <span>•</span>
-          <span>Built on Quai Network</span>
-          <span>•</span>
-          <span>MVP Demo</span>
+        <div className="flex flex-col items-start gap-4 sm:items-end">
+          <SocialLinks size="sm" />
+          <div className="flex flex-wrap items-center gap-3 text-xs text-slate-600 sm:justify-end">
+            <Link href="/docs" className="transition hover:text-slate-400">
+              Docs
+            </Link>
+            <span>•</span>
+            <Link href="/terms" className="transition hover:text-slate-400">
+              Terms of Service
+            </Link>
+            <span>•</span>
+            <span>Built on Quai Network</span>
+            <span>•</span>
+            <span>MVP Demo</span>
+          </div>
         </div>
       </div>
     </footer>

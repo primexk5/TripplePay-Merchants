@@ -24,6 +24,10 @@ export default function DashboardPage() {
 
   const delivered = deliveries.filter((d) => d.status === "delivered");
   const ZERO = 0n;
+  // Webhook state is a notification detail, not payment status — every row here already
+  // represents a CONFIRMED on-chain settlement (the indexer only records settled payments).
+  // Only merchants that actually configured a receiver URL see webhook delivery info.
+  const usesWebhook = merchants.some((m) => m.webhookUrl);
   // Every delivery record corresponds to a payment settled on-chain (payment.confirmed), so the
   // totals count all of them regardless of webhook delivery outcome.
   const totalQuaiWei = deliveries.reduce(
@@ -159,17 +163,19 @@ export default function DashboardPage() {
                     <div className="flex shrink-0 items-center gap-3">
                       <div className="flex flex-col items-end gap-1">
                         <StatusBadge status="confirmed" />
-                        <span
-                          className={`text-[11px] ${
-                            d.status === "delivered"
-                              ? "text-[#4f5868]"
-                              : d.status === "failed"
-                                ? "text-red-400"
-                                : "text-amber-400"
-                          }`}
-                        >
-                          webhook {d.status}
-                        </span>
+                        {usesWebhook && (
+                          <span
+                            className={`text-[11px] ${
+                              d.status === "delivered"
+                                ? "text-[#4f5868]"
+                                : d.status === "failed"
+                                  ? "text-red-400"
+                                  : "text-amber-400"
+                            }`}
+                          >
+                            webhook {d.status}
+                          </span>
+                        )}
                       </div>
                       <a
                         href={`${QUAI_SCAN}${d.payload.data.txHash}`}
@@ -187,11 +193,15 @@ export default function DashboardPage() {
             )}
           </section>
 
-          <section className="rounded-2xl border border-white/7 bg-[#171717] p-5">
-            <h2 className="font-semibold">Status breakdown</h2>
-            <p className="mt-1 text-xs text-[#8b93a7]">All time</p>
+          {usesWebhook ? (
+            <section className="rounded-2xl border border-white/7 bg-[#171717] p-5">
+              <h2 className="font-semibold">Webhook delivery</h2>
+              <p className="mt-1 text-xs text-[#8b93a7]">
+                Notification status to your endpoint — payments themselves are
+                already confirmed on-chain.
+              </p>
 
-            <div className="mt-6 space-y-4">
+              <div className="mt-6 space-y-4">
               {(
                 [
                   ["delivered", delivered.length, "text-emerald-300"],
@@ -226,6 +236,16 @@ export default function DashboardPage() {
               ))}
             </div>
           </section>
+          ) : (
+            <section className="rounded-2xl border border-white/7 bg-[#171717] p-5">
+              <h2 className="font-semibold">Direct settlement</h2>
+              <p className="mt-1 text-xs leading-5 text-[#8b93a7]">
+                Payments settle straight to your wallet on Quai — verified
+                on-chain, no website or receiver URL needed. Add a webhook in
+                Settings only if you want automated notifications.
+              </p>
+            </section>
+          )}
         </div>
       </div>
     </DashboardShell>

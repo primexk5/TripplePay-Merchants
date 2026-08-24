@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { BrowserProvider, Contract, getAddress, parseQuai } from "quais";
+import { BrowserProvider, Contract, formatUnits, parseQuai } from "quais";
 import { getActiveWallet, QUAI_MAINNET_CHAIN } from "@/lib/wallets";
-import { getRpcProvider, MUSDQ_ADDRESS } from "@/lib/payment";
-import { currencySymbol } from "@/lib/currencies";
+import { getRpcProvider } from "@/lib/payment";
+import { listCurrencies } from "@/lib/currencies";
 import { requestAppWalletFunding } from "@/lib/blip";
 import { RefreshCw, Wallet as WalletIcon, PlusCircle } from "lucide-react";
 
@@ -17,20 +17,16 @@ function chainLabel(): string {
   return "Quai mainnet holdings";
 }
 
-/** Resolves the configured stablecoin address once — null when unset or malformed, in which
- *  case the token row is shown as "not configured" instead of failing the whole widget. */
-const tokenAddress: string | null = (() => {
-  if (!MUSDQ_ADDRESS) return null;
-  try {
-    return getAddress(MUSDQ_ADDRESS);
-  } catch {
-    return null;
-  }
-})();
+/** Truncates a formatted unit string to 2 decimals WITHOUT float math. */
+function shortUnits(value: bigint, decimals: number): string {
+  const [whole, frac = ""] = formatUnits(value, decimals).split(".");
+  return frac ? `${whole}.${frac.slice(0, 2)}` : whole;
+}
 
 export function WalletBalances() {
-  const [quaiBalance, setQuaiBalance] = useState<string | null>(null);
-  const [musdqBalance, setMusdqBalance] = useState<string | null>(null);
+  const currencies = listCurrencies();
+  // Balances keyed by lowercase currency address ("native" for QUAI); null = read failed.
+  const [balances, setBalances] = useState<Record<string, string | null>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const isBlip = getActiveWallet()?.brand === "blip";
@@ -64,29 +60,25 @@ export function WalletBalances() {
 
       const provider = getRpcProvider();
 
-      // Fetch Native QUAI — keep it independent so a failing token read doesn't hide it.
-      try {
-        const balance = await provider.getBalance(address);
-        setQuaiBalance((Number(balance) / 1e18).toFixed(2));
-      } catch (err) {
-        console.error("Error fetching QUAI balance:", err);
-        setQuaiBalance(null);
-      }
-
-      // Fetch the stablecoin (6 decimals) only when its address is actually configured —
-      // a missing/bad address must never take down the QUAI row with it.
-      if (!tokenAddress) {
-        setMusdqBalance(null);
-        return;
-      }
-      try {
-        const tokenContract = new Contract(tokenAddress, ERC20_ABI, provider);
-        const tokenBalance = await tokenContract.balanceOf(address);
-        setMusdqBalance((Number(tokenBalance) / 1e6).toFixed(2));
-      } catch (err) {
-        console.error("Error fetching token balance:", err);
-        setMusdqBalance(null);
-      }
+      // Native QUAI + every configured ERC-20 (mUSDQ/USDT/WQUAI registry), read in parallel;
+      // one failing token read must never hide the others.
+      const entries: Array<[string, Promise<string | null>]> = [
+        ["native", provider.getBalance(address).then((b) => shortUnits(b, 18)).catch(() => null)],
+        ...currencies
+          .filter((c) => c.address !== "0x0000000000000000000000000000000000000000")
+          .map(
+            (c) =>
+              [
+                c.address.toLowerCase(),
+                new Contract(c.address, ERC20_ABI, provider)
+                  .balanceOf(address)
+                  .then((b) => shortUnits(b as bigint, c.decimals))
+                  .catch(() => null),
+              ] as [string, Promise<string | null>],
+          ),
+      ];
+      const results = await Promise.all(entries.map(async ([key, p]) => [key, await p] as const));
+      setBalances(Object.fromEntries(results));
     } catch (err) {
       console.error("Error fetching balances:", err);
       setError("Failed to load balances");
@@ -98,6 +90,7 @@ export function WalletBalances() {
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void fetchBalances();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /** Moves funds from the Blip main vault into this site's app wallet via Blip's funding
@@ -168,25 +161,21 @@ export function WalletBalances() {
       {error ? (
         <p className="text-sm text-red-400">{error}</p>
       ) : (
-        <div className={`grid gap-4 ${tokenAddress ? "sm:grid-cols-2" : ""}`}>
-          <div className="rounded-xl border border-white/4 bg-[#0a0a0a] p-4">
-            <p className="text-xs text-[#8b93a7]">
-              {isBlip ? "Native QUAI · app wallet" : "Native QUAI"}
-            </p>
-            <p className="mt-1 font-mono text-xl text-white">
-              {loading ? "..." : quaiBalance ?? "—"}
-            </p>
-          </div>
-          {tokenAddress && (
-            <div className="rounded-xl border border-white/4 bg-[#0a0a0a] p-4">
-              <p className="text-xs text-[#8b93a7]">
-                {currencySymbol(tokenAddress)} (Stablecoin)
-              </p>
-              <p className="mt-1 font-mono text-xl text-[#34d399]">
-                {loading ? "..." : musdqBalance ?? "—"}
-              </p>
-            </div>
-          )}
+        <div className="grid gap-4 sm:grid-cols-2">
+          {currencies.map((c) => {
+            const key = c.address === "0x0000000000000000000000000000000000000000" ? "native" : c.address.toLowerCase();
+            const value = balances[key];
+            return (
+              <div key={key} className="rounded-xl border border-white/4 bg-[#0a0a0a] p-4">
+                <p className="text-xs text-[#8b93a7]">
+                  {key === "native" && isBlip ? "Native QUAI · app wallet" : c.symbol}
+                </p>
+                <p className={`mt-1 font-mono text-xl ${key === "native" ? "text-white" : "text-[#34d399]"}`}>
+                  {loading ? "..." : value ?? "—"}
+                </p>
+              </div>
+            );
+          })}
         </div>
       )}
 
