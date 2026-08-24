@@ -51,6 +51,17 @@ const EnvSchema = z.object({
   // Only relevant in local dev — the dashboard runs on a different port than the backend.
   CORS_ORIGINS: z.string().default('*'),
   ADMIN_API_KEY: z.string().min(16, 'ADMIN_API_KEY should be at least 16 chars'),
+  // Optional ERC-20 allowlist for payment links (comma-separated addresses). Native QUAI is
+  // always allowed. When unset/empty, any 20-byte token address may be used.
+  ACCEPTED_TOKENS: z
+    .string()
+    .optional()
+    .transform((v) =>
+      (v ?? '')
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter((s) => /^0x[0-9a-f]{40}$/.test(s)),
+    ),
   // Rate limit for the single unauthenticated, RPC-backed route (GET /v1/orders/...): max requests
   // per IP per window. Protects the upstream Quai RPC from being used as an amplification target.
   PUBLIC_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),

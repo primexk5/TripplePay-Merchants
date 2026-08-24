@@ -33,6 +33,7 @@ import {
   linkPaymentProblem,
   type LinkInfo,
 } from "@/lib/payment";
+import { currencyDecimals } from "@/lib/currencies";
 import {
   blipBrowserLink,
   blipDeepLink,
@@ -63,7 +64,7 @@ type Stage =
 
 function formatAmount(link: LinkInfo, amount: bigint): string {
   const isNative = link.tokenAddress.toLowerCase() === ZERO_ADDRESS.toLowerCase();
-  return isNative ? formatQuai(amount) : formatUnits(amount, 6);
+  return isNative ? formatQuai(amount) : formatUnits(amount, currencyDecimals(link.tokenAddress));
 }
 
 /** Returns the current page URL (empty string during SSR). */

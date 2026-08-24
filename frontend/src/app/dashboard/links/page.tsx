@@ -29,9 +29,9 @@ import {
   registerOrderBatch,
   createPaymentLink,
   fetchMyLinks,
-  resolveTokenAddress,
   type LinkInfo,
 } from "@/lib/payment";
+import { listCurrencies, findCurrency, NATIVE_CURRENCY } from "@/lib/currencies";
 import { blipDeepLink } from "@/lib/blip";
 
 /** Exact decimal-string → smallest-unit conversion (no float math). */
@@ -74,7 +74,10 @@ const WALLET_OPTIONS: {
 
 export default function LinksPage() {
   const [address, setAddress] = useState<string | null>(null);
-  const [token, setToken] = useState<"quai" | "musdq">("quai");
+  const [token, setToken] = useState<string>(NATIVE_CURRENCY.address); // registry currency address
+  const CURRENCIES = listCurrencies();
+  const selected = findCurrency(token) ?? NATIVE_CURRENCY;
+  const symbol = selected.symbol;
   const [amount, setAmount] = useState("");
   const [shopName, setShopName] = useState("");
   const [expiryHours, setExpiryHours] = useState("");
@@ -87,8 +90,6 @@ export default function LinksPage() {
   const [links, setLinks] = useState<LinkInfo[]>([]);
   const [copied, setCopied] = useState<string | null>(null);
   const [loadingLinks, setLoadingLinks] = useState(false);
-
-  const symbol = token === "quai" ? "QUAI" : "mUSDQ";
 
   // Load existing links from backend when merchant connects
   const selectAddress = async (addr: string) => {
@@ -147,7 +148,10 @@ export default function LinksPage() {
     }
     let units: bigint;
     try {
-      units = token === "quai" ? parseQuai(amount) : toUnits(amount, 6);
+      units =
+        selected.address === ZERO_ADDRESS
+          ? parseQuai(amount)
+          : toUnits(amount, selected.decimals);
     } catch {
       setError("Enter a valid amount, e.g. 25.0");
       return;
@@ -163,16 +167,8 @@ export default function LinksPage() {
     setError(null);
     setLink(null);
 
-    // Resolve the contract addresses for the connected wallet's chain (Blip → mainnet).
-    let onChainToken: string;
-    try {
-      onChainToken = token === "quai" ? ZERO_ADDRESS : resolveTokenAddress();
-    } catch (err) {
-      setError(parseError(err) || "Failed to resolve token for this wallet's network.");
-      setBusy(false);
-      setRegistering(false);
-      return;
-    }
+    // Registry currencies carry their canonical mainnet address; native uses ZERO_ADDRESS.
+    const onChainToken: string = selected.address;
 
     let expiry = 0n;
     if (expiryHours.trim() !== "") {
@@ -284,18 +280,18 @@ export default function LinksPage() {
                   {/* Asset */}
                   <div className="sm:col-span-2">
                     <p className="mb-2 text-sm text-[#8b93a7]">Asset</p>
-                    <div className="flex overflow-hidden rounded-xl border border-white/7">
-                      {(["quai", "musdq"] as const).map((t) => (
+                    <div className="flex flex-wrap overflow-hidden rounded-xl border border-white/7">
+                      {CURRENCIES.map((c) => (
                         <button
-                          key={t}
-                          onClick={() => setToken(t)}
+                          key={c.address}
+                          onClick={() => setToken(c.address)}
                           className={`flex-1 px-4 py-2.5 text-sm font-medium transition ${
-                            token === t
+                            token === c.address
                               ? "bg-[#38bdf8] text-[#061018]"
                               : "bg-[#171717] text-[#8b93a7] hover:text-white"
                           }`}
                         >
-                          {t === "quai" ? "QUAI" : "mUSDQ"}
+                          {c.symbol}
                         </button>
                       ))}
                     </div>

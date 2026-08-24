@@ -20,6 +20,7 @@ import {
   getWalletQuaiBalance,
   requestAppWalletFunding,
 } from "./blip";
+import { currencyDecimals, currencySymbol } from "./currencies";
 
 export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 export const PAYWITHQUAI_ADDRESS = process.env.NEXT_PUBLIC_PAYWITHQUAI_ADDRESS!;
@@ -772,7 +773,8 @@ async function payOrderViaBlip(
           {
             type: "erc20",
             token,
-            decimals: 6,
+            symbol: currencySymbol(token),
+            decimals: currencyDecimals(token),
             amount: hexQty(amount - bal),
             purpose: "payment",
           },

@@ -15,6 +15,7 @@ import { StatusBadge } from "@/components/ui/status-badge";
 import { StatCard } from "@/components/ui/stat-card";
 import { WalletBalances } from "@/components/ui/wallet-balances";
 import { formatDeliveryAmount, useRelayerData } from "@/lib/relayer";
+import { MUSDQ_ADDRESS, currencyDecimals, currencySymbol } from "@/lib/currencies";
 
 const QUAI_SCAN = "https://quaiscan.io/tx/";
 
@@ -41,7 +42,9 @@ export default function DashboardPage() {
 
   // Exact-decimal sums: formatQuai/formatUnits do the 10^n scaling without Number() precision loss.
   const totalDisplay = `${formatQuai(totalQuaiWei)} QUAI${
-    totalTokenUnits > ZERO ? ` + ${formatUnits(totalTokenUnits, 6)} mUSDQ` : ""
+    totalTokenUnits > ZERO
+      ? ` + ${formatUnits(totalTokenUnits, currencyDecimals(MUSDQ_ADDRESS ?? ""))} ${currencySymbol(MUSDQ_ADDRESS ?? "")}`
+      : ""
   }`;
 
   return (

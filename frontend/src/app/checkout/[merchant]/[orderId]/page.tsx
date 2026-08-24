@@ -29,6 +29,7 @@ import {
   waitForOnChainConfirmation,
   type OnChainOrder,
 } from "@/lib/payment";
+import { currencyDecimals, currencySymbol } from "@/lib/currencies";
 import {
   blipBrowserLink,
   blipDeepLink,
@@ -197,10 +198,10 @@ export default function CheckoutPage({ params }: { params: Params }) {
   const isNative = (o: OnChainOrder) =>
     o.token.toLowerCase() === ZERO_ADDRESS.toLowerCase();
 
-  const symbol = (o: OnChainOrder) => (isNative(o) ? "QUAI" : "mUSDQ");
+  const symbol = (o: OnChainOrder) => (isNative(o) ? "QUAI" : currencySymbol(o.token));
 
   const formatAmount = (o: OnChainOrder, amount: bigint) =>
-    isNative(o) ? formatQuai(amount) : formatUnits(amount, 6);
+    isNative(o) ? formatQuai(amount) : formatUnits(amount, currencyDecimals(o.token));
 
   const netAmount = (o: OnChainOrder) =>
     o.amount - (o.amount * BigInt(o.feeBps)) / 10000n;

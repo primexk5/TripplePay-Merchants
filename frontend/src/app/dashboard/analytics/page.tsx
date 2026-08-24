@@ -12,6 +12,7 @@ import {
 import { formatQuai, formatUnits } from "quais";
 import { DashboardShell } from "@/components/layout/dashboard-shell";
 import { useRelayerData, type Delivery } from "@/lib/relayer";
+import { MUSDQ_ADDRESS, currencyDecimals, currencySymbol } from "@/lib/currencies";
 
 interface DailyPoint {
   day: string;
@@ -157,7 +158,7 @@ export default function AnalyticsPage() {
             icon={<Wallet2 size={18} />}
             label="Total volume"
             value={`${formatQuai(stats.totalQuai)} QUAI`}
-            detail={`${stats.totalToken > 0n ? `+ ${formatUnits(stats.totalToken, 6)} mUSDQ · ` : ""}confirmed volume`}
+            detail={`${stats.totalToken > 0n ? `+ ${formatUnits(stats.totalToken, currencyDecimals(MUSDQ_ADDRESS ?? ""))} ${currencySymbol(MUSDQ_ADDRESS ?? "")} · ` : ""}confirmed volume`}
           />
           <MetricCard
             icon={<BarChart3 size={18} />}

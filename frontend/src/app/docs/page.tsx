@@ -134,6 +134,8 @@ NEXT_PUBLIC_RPC_URL=https://rpc.quai.network
 NEXT_PUBLIC_CHAIN_ID=9
 NEXT_PUBLIC_PAYWITHQUAI_ADDRESS=0x…   # from contracts/deployments/cyprus1.json
 NEXT_PUBLIC_MUSDQ_ADDRESS=0x…         # mainnet stablecoin (6 decimals)
+NEXT_PUBLIC_USDT_ADDRESS=0x…          # optional override — canonical USDT is built in
+NEXT_PUBLIC_WQUAI_ADDRESS=0x…         # optional override — canonical WQUAI is built in
 NEXT_PUBLIC_BACKEND_URL=https://tripplepay-three.vercel.app
 
 # Server-only — NEVER prefix with NEXT_PUBLIC_ (ships to the browser bundle)

@@ -15,6 +15,21 @@ import { log } from '../logger.js';
 
 const logger = log('api');
 
+/** Native QUAI marker — always allowed regardless of the ACCEPTED_TOKENS allowlist. */
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+/** Normalize ACCEPTED_TOKENS into a clean lowercase set. Handles both the parsed array
+ *  (loadConfig) and a raw comma-separated string, so the route never trusts its input shape.
+ *  Malformed entries are dropped rather than failing startup. */
+function parseAcceptedTokens(value: unknown): Set<string> {
+  const raw = Array.isArray(value) ? value : String(value ?? '').split(',');
+  return new Set(
+    raw
+      .map((s) => String(s).trim().toLowerCase())
+      .filter((s) => /^0x[0-9a-f]{40}$/.test(s)),
+  );
+}
+
 /**
  * Builds the HTTP API:
  *   GET  /health                          liveness + indexer cursor
@@ -307,6 +322,13 @@ await store.upsertMerchant(updated);
     // Multi-pay links need at least one pre-registered order to be useful.
     if (d.multiPay && d.orderPool.length === 0) {
       return res.status(400).json({ error: 'multi-pay link requires at least one pre-registered orderId' });
+    }
+
+    // Optional ERC-20 allowlist (ACCEPTED_TOKENS). Native QUAI is always permitted.
+    const tokenLower = d.tokenAddress.toLowerCase();
+    const accepted = parseAcceptedTokens(cfg.ACCEPTED_TOKENS);
+    if (tokenLower !== ZERO_ADDRESS && accepted.size > 0 && !accepted.has(tokenLower)) {
+      return res.status(400).json({ error: `token ${d.tokenAddress} is not in ACCEPTED_TOKENS` });
     }
 
     const slug = newSlug();

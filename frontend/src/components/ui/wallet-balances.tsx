@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { BrowserProvider, Contract, getAddress, parseQuai } from "quais";
 import { getActiveWallet, QUAI_MAINNET_CHAIN } from "@/lib/wallets";
 import { getRpcProvider, MUSDQ_ADDRESS } from "@/lib/payment";
+import { currencySymbol } from "@/lib/currencies";
 import { requestAppWalletFunding } from "@/lib/blip";
 import { RefreshCw, Wallet as WalletIcon, PlusCircle } from "lucide-react";
 
@@ -178,7 +179,9 @@ export function WalletBalances() {
           </div>
           {tokenAddress && (
             <div className="rounded-xl border border-white/4 bg-[#0a0a0a] p-4">
-              <p className="text-xs text-[#8b93a7]">mUSDQ (Stablecoin)</p>
+              <p className="text-xs text-[#8b93a7]">
+                {currencySymbol(tokenAddress)} (Stablecoin)
+              </p>
               <p className="mt-1 font-mono text-xl text-[#34d399]">
                 {loading ? "..." : musdqBalance ?? "—"}
               </p>

@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { parseError } from "@/lib/utils";
 import { formatQuai, formatUnits } from "quais";
 import { backendFetch } from "@/lib/payment";
+import { currencyDecimals, currencySymbol } from "@/lib/currencies";
 import { getSessionToken, isLoggedIn, logout } from "@/lib/auth";
 
 export interface DeliveryData {
@@ -155,7 +156,7 @@ export function formatDeliveryAmount(net: string, token: string): string {
   if (token === "0x0000000000000000000000000000000000000000") {
     return `${formatQuai(net)} QUAI`;
   }
-  return `${formatUnits(net, 6)} mUSDQ`;
+  return `${formatUnits(net, currencyDecimals(token))} ${currencySymbol(token)}`;
 }
 
 export function formatTimestamp(msOrSec: number): string {
