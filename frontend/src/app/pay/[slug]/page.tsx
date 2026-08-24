@@ -573,23 +573,21 @@ export default function PayPage({ params }: { params: Params }) {
                         {/* Wallet tabs */}
                         <div className="mt-6 overflow-hidden rounded-2xl border border-white/7 bg-[#171717]">
                           <div className="flex border-b border-white/7">
-                            {isNative(link) && (
-                              <button
-                                onClick={() => setPayTab("blip")}
-                                className={`flex flex-1 items-center justify-center gap-2 py-3 text-sm font-medium transition ${
-                                  payTab === "blip"
-                                    ? "border-b-2 border-[#C1ED00] text-white"
-                                    : "text-[#8b93a7] hover:text-white"
-                                }`}
-                              >
-                                <Smartphone size={15} />
-                                Pay with Blip
-                              </button>
-                            )}
+                            <button
+                              onClick={() => setPayTab("blip")}
+                              className={`flex flex-1 items-center justify-center gap-2 py-3 text-sm font-medium transition ${
+                                payTab === "blip"
+                                  ? "border-b-2 border-[#C1ED00] text-white"
+                                  : "text-[#8b93a7] hover:text-white"
+                              }`}
+                            >
+                              <Smartphone size={15} />
+                              Pay with Blip
+                            </button>
                             <button
                               onClick={() => setPayTab("wallet")}
                               className={`flex flex-1 items-center justify-center gap-2 py-3 text-sm font-medium transition ${
-                                payTab === "wallet" || !isNative(link)
+                                payTab === "wallet"
                                   ? "border-b-2 border-[#38bdf8] text-white"
                                   : "text-[#8b93a7] hover:text-white"
                               }`}
@@ -600,7 +598,6 @@ export default function PayPage({ params }: { params: Params }) {
                           </div>
 
                           {payTab === "blip" &&
-                            isNative(link) &&
                             pageUrl && (
                               <div className="flex flex-col items-center p-6">
                                 <p className="mb-5 text-center text-xs leading-5 text-[#8b93a7]">
@@ -650,7 +647,7 @@ export default function PayPage({ params }: { params: Params }) {
                               </div>
                             )}
 
-                          {(payTab === "wallet" || !isNative(link)) && (
+                          {payTab === "wallet" && (
                             <div className="p-6">
                               <div className="space-y-3">
                                 {/* Customer name — captured before paying so it
