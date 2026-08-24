@@ -657,10 +657,7 @@ export async function registerOrder(
   amount: bigint,
   expiry = 0n,
 ): Promise<string> {
-  const signer = await getSignerOnNetwork();
-  await assertMerchantSigner(signer, merchant);
-  const tx = await getContract(signer).registerOrder(orderId, token, amount, expiry);
-  return waitForTxReceipt(tx.hash);
+  return registerOnChain(merchant, "registerOrder", [orderId, token, amount, expiry]);
 }
 
 export async function registerOrderBatch(
@@ -670,10 +667,7 @@ export async function registerOrderBatch(
   amount: bigint,
   expiry = 0n,
 ): Promise<string> {
-  const signer = await getSignerOnNetwork();
-  await assertMerchantSigner(signer, merchant);
-  const tx = await getContract(signer).registerOrderBatch(orderIds, token, amount, expiry);
-  return waitForTxReceipt(tx.hash);
+  return registerOnChain(merchant, "registerOrderBatch", [orderIds, token, amount, expiry]);
 }
 
 /** Merchant registers an order that only `expectedPayer` may settle (anti-front-running for
@@ -686,15 +680,41 @@ export async function registerOrderWithPayer(
   expiry: bigint,
   expectedPayer: string,
 ): Promise<string> {
-  const signer = await getSignerOnNetwork();
-  await assertMerchantSigner(signer, merchant);
-  const tx = await getContract(signer).registerOrderWithPayer(
+  return registerOnChain(merchant, "registerOrderWithPayer", [
     orderId,
     token,
     amount,
     expiry,
     expectedPayer,
-  );
+  ]);
+}
+
+/**
+ * Shared contract-write path for order registration. Gas and nonce are resolved through OUR
+ * OWN RPC and passed as explicit overrides so the wallet's node is never asked to estimate:
+ * Pelagus/Blip estimation calls can wedge indefinitely (the same alpha.56/provider hang we
+ * bypass for payments), which left link creation spinning forever with no error.
+ */
+async function registerOnChain(
+  merchant: string,
+  method: "registerOrder" | "registerOrderBatch" | "registerOrderWithPayer",
+  args: unknown[],
+): Promise<string> {
+  const signer = await getSignerOnNetwork();
+  await assertMerchantSigner(signer, merchant);
+  const contract = getContract(signer);
+  const from = await signer.getAddress();
+  const data = contract.interface.encodeFunctionData(method, args as never);
+
+  const [gas, nonce] = await Promise.all([
+    estimateGasViaRpc({ from, to: resolvePayAddress(), data }),
+    nextNonceViaRpc(from),
+  ]);
+
+  const tx = await contract[method](...(args as never[]), {
+    ...(gas ? { gasLimit: BigInt(gas) } : {}),
+    ...(nonce ? { nonce: BigInt(nonce) } : {}),
+  });
   return waitForTxReceipt(tx.hash);
 }
 
