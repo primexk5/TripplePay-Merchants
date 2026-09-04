@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { BrowserProvider, Contract, formatUnits, parseQuai } from "quais";
 import { getActiveWallet, QUAI_MAINNET_CHAIN } from "@/lib/wallets";
 import { getRpcProvider } from "@/lib/payment";
@@ -35,9 +35,17 @@ export function WalletBalances() {
   const [topUpError, setTopUpError] = useState<string | null>(null);
 
   // loading starts true so the skeleton shows on first render without a setState
-  const fetchBalances = async () => {
+  const fetchBalances = useCallback(async (opts?: { silent?: boolean }) => {
+    // Manual refresh (button click / post-top-up) always re-enters the loading state so the
+    // button shows a spinner and disables while in flight. The mount-time auto-load passes
+    // silent so it never re-flashes the skeleton the page already shows.
+    if (!opts?.silent) setLoading(true);
+    setError(null);
+    // Forget any previously-shown balances so a failed refresh can't masquerade as success.
+    setBalances({});
+
     // Yield to the event loop so state updates inside this function happen asynchronously
-    // relative to the useEffect that calls it. This fixes the cascading render lint error.
+    // relative to the useEffect that calls it (react-hooks compiler lint requires it).
     await Promise.resolve();
 
     const wallet = getActiveWallet();
@@ -47,7 +55,6 @@ export function WalletBalances() {
       return;
     }
 
-    setError(null);
     try {
       // Resolve the account from the wallet (no network read), then read balances through the
       // app's canonical RPC — the network the relayer + contracts actually run on. The wallet's
@@ -64,7 +71,7 @@ export function WalletBalances() {
       // one failing token read must never hide the others.
       const entries: Array<[string, Promise<string | null>]> = [
         ["native", provider.getBalance(address).then((b) => shortUnits(b, 18)).catch(() => null)],
-        ...currencies
+        ...listCurrencies()
           .filter((c) => c.address !== "0x0000000000000000000000000000000000000000")
           .map(
             (c) =>
@@ -85,13 +92,16 @@ export function WalletBalances() {
     } finally {
       setLoading(false);
     }
-  };
-
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void fetchBalances();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Auto-load once on mount (silent — the skeleton is already showing while loading=true);
+  // all later refreshes go through the button or the Blip top-up flow.
+  useEffect(() => {
+    // fetchBalances only touches state after its `await Promise.resolve()` yield, but the
+    // compiler lint still flags the call itself — same guard the previous implementation used.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void fetchBalances({ silent: true });
+  }, [fetchBalances]);
 
   /** Moves funds from the Blip main vault into this site's app wallet via Blip's funding
    *  sheet — the only way added QUAI becomes usable here, since Blip never exposes the main
@@ -149,10 +159,10 @@ export function WalletBalances() {
           </div>
         </div>
         <button
-          onClick={fetchBalances}
+          onClick={() => void fetchBalances()}
           disabled={loading}
-          className="rounded-lg border border-white/7 p-2 text-[#8b93a7] transition hover:bg-white/4 hover:text-white disabled:opacity-50"
-          title="Refresh balances"
+          className="rounded-lg border border-white/7 p-2 text-[#8b93a7] transition hover:bg-white/4 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+          title={loading ? "Refreshing…" : "Refresh balances"}
         >
           <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
         </button>

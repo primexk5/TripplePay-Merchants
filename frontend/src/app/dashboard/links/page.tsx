@@ -9,20 +9,16 @@ import {
   Loader2,
   Plus,
   Users,
+  Wallet,
   Zap,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { parseError } from "@/lib/utils";
 import { parseQuai } from "quais";
 import { DashboardShell } from "@/components/layout/dashboard-shell";
-import {
-  connectWallet,
-  detectWallets,
-  ensureQuaiNetwork,
-  storeWalletId,
-  QUAI_MAINNET_CHAIN,
-  type WalletBrand,
-} from "@/lib/wallets";
+import { WalletSelector } from "@/components/ui/wallet-selector";
+import { checkSession } from "@/lib/auth";
+import { getActiveWallet } from "@/lib/wallets";
 import {
   ZERO_ADDRESS,
   newOrderId,
@@ -32,7 +28,6 @@ import {
   type LinkInfo,
 } from "@/lib/payment";
 import { listCurrencies, findCurrency, NATIVE_CURRENCY } from "@/lib/currencies";
-import { blipDeepLink } from "@/lib/blip";
 
 /** Exact decimal-string → smallest-unit conversion (no float math). */
 function toUnits(decimal: string, decimals: number): bigint {
@@ -51,29 +46,26 @@ function shortUrl(slug: string): string {
 
 const POOL_SIZE_OPTIONS = [5, 10, 20, 50];
 
-/** Wallet + network the merchant chooses when creating links. */
-const WALLET_OPTIONS: {
-  brand: WalletBrand;
-  name: string;
-  network: string;
-  hint: string;
-}[] = [
-  {
-    brand: "blip",
-    name: "Blip Pay",
-    network: "Quai mainnet (chain 9)",
-    hint: "Real QUAI — best for live stores. Orders register on mainnet.",
-  },
-  {
-    brand: "pelagus",
-    name: "Pelagus",
-    network: "Quai mainnet (chain 9)",
-    hint: "Connect the Pelagus extension to register orders on mainnet.",
-  },
-];
+/** Read the connected account from the stored active wallet WITHOUT prompting. */
+async function silentWalletAddress(): Promise<string | null> {
+  const wallet = getActiveWallet();
+  if (!wallet) return null;
+  for (const method of ["quai_accounts", "eth_accounts"]) {
+    try {
+      const accounts = (await wallet.provider.request({ method })) as string[];
+      if (accounts?.length) return accounts[0];
+    } catch {
+      /* try the next method */
+    }
+  }
+  return null;
+}
 
 export default function LinksPage() {
-  const [address, setAddress] = useState<string | null>(null);
+  // The wallet the merchant signed in with — the ONLY payout destination.
+  const [merchantAddress, setMerchantAddress] = useState<string | null>(null);
+  // The account currently exposed by the connected wallet (must equal merchantAddress).
+  const [connectedAddress, setConnectedAddress] = useState<string | null>(null);
   const [token, setToken] = useState<string>(NATIVE_CURRENCY.address); // registry currency address
   const CURRENCIES = listCurrencies();
   const selected = findCurrency(token) ?? NATIVE_CURRENCY;
@@ -91,59 +83,55 @@ export default function LinksPage() {
   const [copied, setCopied] = useState<string | null>(null);
   const [loadingLinks, setLoadingLinks] = useState(false);
 
-  // Load existing links from backend when merchant connects
-  const selectAddress = async (addr: string) => {
-    setAddress(addr);
-    setLoadingLinks(true);
-    try {
-      const myLinks = await fetchMyLinks();
-      setLinks(myLinks);
-    } catch {
-      // Not critical — just show empty
-    } finally {
-      setLoadingLinks(false);
-    }
-  };
-
-  /** Connect a specific wallet brand — every wallet operates on Quai mainnet. */
-  const connectChoice = async (brand: WalletBrand) => {
-    setError(null);
-    const wallet = detectWallets().find((w) => w.brand === brand);
-    if (!wallet) {
-      if (brand === "blip") {
-        setError(
-          "Blip isn't open on this device. Tap “Open in Blip” to create the link inside the Blip app.",
-        );
+  // Restore the payout wallet from the session and the connected wallet from the extension.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      setLoadingLinks(true);
+      const session = await checkSession();
+      if (cancelled) return;
+      if (session.status === "ok") {
+        setMerchantAddress(session.merchant.address);
+        try {
+          const myLinks = await fetchMyLinks();
+          if (!cancelled) setLinks(myLinks);
+        } catch {
+          // Not critical — just show empty
+        }
+      } else if (session.status === "expired") {
+        setError("Session expired — sign in with your wallet again.");
       } else {
-        setError(
-          "Pelagus isn't detected. Install the Pelagus extension and refresh this page.",
-        );
+        setError("Payment service unreachable — reload in a moment.");
       }
-      return;
-    }
-    try {
-      const chain = QUAI_MAINNET_CHAIN;
-      // Only Pelagus skips network checks (its EIP-3326 requests hang). Blip goes through
-      // the full verify → switch → add path — its documented provider supports both methods.
-      const quaiNative = brand === "pelagus";
-      const net = await ensureQuaiNetwork(wallet.provider, chain, { quaiNative });
-      if (net === "unsupported") {
-        setError(
-          `${wallet.name} couldn't switch to ${chain.chainName} (chain ${parseInt(chain.chainId, 16)}) — switch networks in your wallet and retry.`,
-        );
-        return;
-      }
-      const addr = await connectWallet(wallet);
-      storeWalletId(wallet.id);
-      await selectAddress(addr);
-    } catch (err) {
-      setError(parseError(err) || `Couldn't connect ${wallet.name}.`);
-    }
-  };
+      if (!cancelled) setLoadingLinks(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Read the already-connected account silently; connect only if none is available.
+  useEffect(() => {
+    void (async () => {
+      const addr = await silentWalletAddress().catch(() => null);
+      if (addr) setConnectedAddress(addr);
+    })();
+  }, []);
 
   const create = async () => {
-    if (!address) {
-      setError("Connect your payout wallet first.");
+    const payout = merchantAddress;
+    if (!payout) {
+      setError("Sign in with your wallet to create payment links.");
+      return;
+    }
+    if (!connectedAddress) {
+      setError("Connect your wallet to sign order registrations — it also receives the payments.");
+      return;
+    }
+    if (connectedAddress.toLowerCase() !== payout.toLowerCase()) {
+      setError(
+        "The connected wallet doesn't match your registered payout wallet — connect the wallet you signed in with.",
+      );
       return;
     }
     let units: bigint;
@@ -186,8 +174,9 @@ export default function LinksPage() {
     try {
       for (let i = 0; i < poolSize; i++) orderIds.push(newOrderId());
 
-      // Register all orders on-chain in one atomic transaction
-      await registerOrderBatch(address, orderIds, onChainToken, units, expiry);
+      // Register all orders on-chain in one atomic transaction — signed by the connected
+      // wallet, which is the payout wallet (assertMerchantSigner enforces the match).
+      await registerOrderBatch(payout, orderIds, onChainToken, units, expiry);
       setRegistering(false);
 
       // Create the short link in the backend
@@ -247,34 +236,44 @@ export default function LinksPage() {
 
         <div className="space-y-5">
           <section className="rounded-2xl border border-white/7 bg-[#171717] p-6">
-            {address ? (
+            {merchantAddress ? (
               <div className="space-y-5">
-                {/* Wallet display */}
-                <div>
-                  <div className="mb-2 flex items-center justify-between">
-                    <p className="text-sm text-[#8b93a7]">Order from wallet</p>
-                    <button
-                      onClick={() => setAddress(null)}
-                      className="text-xs font-medium text-[#8b93a7] transition hover:text-white"
-                    >
-                      Change wallet
-                    </button>
+                {/* Payout wallet — the wallet connected at sign-in, no separate choice */}
+                <div className="rounded-xl border border-white/7 bg-[#171717] px-4 py-3">
+                  <div className="flex items-center justify-between">
+                    <p className="text-sm text-[#8b93a7]">Payout wallet</p>
+                    <Wallet size={14} className="text-[#38bdf8]" />
                   </div>
-                  <div className="rounded-xl border border-white/7 bg-[#171717] px-4 py-3">
-                    <div className="flex items-center gap-2">
-                      <span className="inline-flex items-center rounded-full bg-[#C1ED00]/10 px-2 py-0.5 text-[10px] font-semibold text-[#C1ED00]">
-                        Quai mainnet (chain 9)
-                      </span>
-                    </div>
-                    <p className="mt-2 break-all font-mono text-xs text-white">
-                      {address}
+                  <p className="mt-1.5 break-all font-mono text-xs text-white">
+                    {merchantAddress}
+                  </p>
+                  <p className="mt-1 text-xs leading-5 text-[#8b93a7]">
+                    Payments settle straight to your connected wallet on Quai
+                    mainnet — a platform fee of 0.3% is deducted at settlement.
+                  </p>
+                  {connectedAddress &&
+                  connectedAddress.toLowerCase() !== merchantAddress.toLowerCase() ? (
+                    <p className="mt-3 rounded-lg border border-amber-400/20 bg-amber-400/6 px-3 py-2.5 text-xs leading-5 text-amber-300">
+                      The wallet connected in this browser (
+                      {connectedAddress.slice(0, 8)}…) is not your registered
+                      payout wallet. Connect the wallet you signed in with — it
+                      signs order registrations and receives every payment.
                     </p>
-                    <p className="mt-1 text-xs text-[#8b93a7]">
-                      Payments go to this wallet on Quai mainnet. A platform fee
-                      of 0.3% is deducted at settlement.
-                    </p>
-                  </div>
+                  ) : null}
                 </div>
+
+                {!connectedAddress && (
+                  <div>
+                    <p className="mb-2 text-sm text-[#8b93a7]">
+                      Connect your wallet to sign order registrations
+                    </p>
+                    <WalletSelector
+                      connectedAddress={null}
+                      onConnected={(addr) => setConnectedAddress(addr)}
+                      label="Connect wallet"
+                    />
+                  </div>
+                )}
 
                 <div className="grid gap-4 sm:grid-cols-2">
                   {/* Asset */}
@@ -472,97 +471,16 @@ export default function LinksPage() {
                 )}
               </div>
             ) : (
-              <div>
-                <p className="mb-4 text-sm text-[#8b93a7]">
-                  Choose the wallet that will receive the payment — it signs the
-                  order registrations. Each wallet runs on its own network.
-                </p>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  {WALLET_OPTIONS.map((opt) => {
-                    const detected = detectWallets().some(
-                      (w) => w.brand === opt.brand,
-                    );
-                    return (
-                      <div
-                        key={opt.brand}
-                        className={`rounded-xl border p-4 transition ${
-                          detected
-                            ? "border-white/7 hover:border-[#38bdf8]/50"
-                            : "border-white/7 opacity-70"
-                        }`}
-                      >
-                        <div className="flex items-center justify-between">
-                          <p className="text-sm font-semibold text-white">
-                            {opt.name}
-                          </p>
-                          <span
-                            className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ${
-                              opt.brand === "blip"
-                                ? "bg-[#C1ED00]/10 text-[#C1ED00]"
-                                : "bg-[#38bdf8]/10 text-[#38bdf8]"
-                            }`}
-                          >
-                            <span
-                              className={`h-1.5 w-1.5 rounded-full ${
-                                detected
-                                  ? opt.brand === "blip"
-                                    ? "bg-[#C1ED00]"
-                                    : "bg-[#38bdf8]"
-                                  : "bg-[#4f5868]"
-                              }`}
-                            />
-                            {detected ? "Detected" : "Not detected"}
-                          </span>
-                        </div>
-                        <p className="mt-1.5 text-xs text-[#8b93a7]">
-                          {opt.network}
-                        </p>
-                        <p className="mt-1 text-xs text-[#4f5868]">
-                          {opt.hint}
-                        </p>
-                        <div className="mt-3">
-                          {detected ? (
-                            <button
-                              onClick={() => void connectChoice(opt.brand)}
-                              className="inline-flex w-full items-center justify-center rounded-lg bg-[#38bdf8] px-4 py-2.5 text-sm font-semibold text-[#061018] transition hover:bg-[#67d8ff]"
-                            >
-                              Use {opt.name}
-                            </button>
-                          ) : opt.brand === "blip" ? (
-                            <a
-                              href={blipDeepLink(
-                                typeof window !== "undefined"
-                                  ? window.location.href
-                                  : "https://tripplepay.app",
-                              )}
-                              className="inline-flex w-full items-center justify-center rounded-lg border border-white/7 px-4 py-2.5 text-sm font-medium text-[#c9d4e0] transition hover:bg-white/6"
-                            >
-                              Open in Blip
-                            </a>
-                          ) : (
-                            <button
-                              onClick={() => void connectChoice(opt.brand)}
-                              className="inline-flex w-full items-center justify-center rounded-lg border border-white/7 px-4 py-2.5 text-sm font-medium text-[#c9d4e0] transition hover:bg-white/6"
-                            >
-                              Install Pelagus
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-                {error && (
-                  <p className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-600">
-                    {error}
-                  </p>
-                )}
+              <div className="py-8 text-center text-sm text-[#8b93a7]">
+                {loadingLinks
+                  ? "Loading your payout wallet…"
+                  : error ?? "Sign in with your wallet to create payment links."}
               </div>
             )}
           </section>
 
           {/* Existing links */}
-          {address && (
+          {merchantAddress && (
             <section className="rounded-2xl border border-white/7 bg-[#171717] p-6">
               <div className="flex items-center justify-between">
                 <div>
