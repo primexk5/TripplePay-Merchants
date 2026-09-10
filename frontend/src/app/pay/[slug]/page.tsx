@@ -629,16 +629,14 @@ export default function PayPage({ params }: { params: Params }) {
                                 </p>
                               )}
                               <button
-                                onClick={() => void reserveQi()}
-                                disabled={qiBusy}
-                                className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#ddff56] py-3 text-sm font-semibold text-[#061018] transition hover:bg-[#ddff56]/90 disabled:opacity-60"
+                                disabled
+                                className="flex w-full items-center justify-center gap-2 rounded-xl bg-white/5 py-3 text-sm font-semibold text-[#4f5868] opacity-50 cursor-not-allowed select-none"
                               >
-                                {qiBusy ? (
-                                  <Loader2 size={15} className="animate-spin" />
-                                ) : (
-                                  <Coins size={15} />
-                                )}
-                                {qiBusy ? "Reserving address…" : "Get Qi address"}
+                                <Coins size={15} />
+                                Get Qi address
+                                <span className="ml-1 text-[10px] uppercase tracking-wider text-[#8b93a7]">
+                                  Coming soon
+                                </span>
                               </button>
                             </div>
                           )}
