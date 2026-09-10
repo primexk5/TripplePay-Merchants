@@ -669,10 +669,10 @@ export default function PayPage({ params }: { params: Params }) {
 
                         {/* Wallet tabs */}
                         <div className="mt-6 overflow-hidden rounded-2xl border border-white/7 bg-[#171717]">
-                          <div className="flex border-b border-white/7">
+                          <div className="flex overflow-x-auto hide-scrollbar border-b border-white/7">
                             <button
                               onClick={() => setPayTab("blip")}
-                              className={`flex flex-1 items-center justify-center gap-2 py-3 text-sm font-medium transition ${
+                              className={`flex min-w-[140px] flex-1 shrink-0 whitespace-nowrap items-center justify-center gap-2 px-4 py-3 text-sm font-medium transition ${
                                 payTab === "blip"
                                   ? "border-b-2 border-[#C1ED00] text-white"
                                   : "text-[#8b93a7] hover:text-white"
@@ -683,7 +683,7 @@ export default function PayPage({ params }: { params: Params }) {
                             </button>
                             <button
                               onClick={() => setPayTab("wallet")}
-                              className={`flex flex-1 items-center justify-center gap-2 py-3 text-sm font-medium transition ${
+                              className={`flex min-w-[140px] flex-1 shrink-0 whitespace-nowrap items-center justify-center gap-2 px-4 py-3 text-sm font-medium transition ${
                                 payTab === "wallet"
                                   ? "border-b-2 border-[#38bdf8] text-white"
                                   : "text-[#8b93a7] hover:text-white"
@@ -694,7 +694,7 @@ export default function PayPage({ params }: { params: Params }) {
                             </button>
                             <button
                               disabled
-                              className="flex flex-1 items-center justify-center gap-2 py-3 text-sm font-medium text-[#4f5868] opacity-50 cursor-not-allowed select-none"
+                              className="flex min-w-[140px] flex-1 shrink-0 whitespace-nowrap items-center justify-center gap-2 px-4 py-3 text-sm font-medium text-[#4f5868] opacity-50 cursor-not-allowed select-none"
                             >
                               <Coins size={15} />
                               Pay with Qi
