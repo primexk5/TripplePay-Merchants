@@ -1023,7 +1023,7 @@ const blipLink = \`https://blippay.me/browser?url=\${encodeURIComponent(checkout
             <div className="flex items-center gap-2.5">
               <Logo className="h-6 w-6" />
               <span className="text-sm font-medium text-[#8b93a7]">
-                TripplePay || Marchants
+                TripplePay || Merchants
               </span>
             </div>
             <div className="flex items-center gap-4 text-xs text-[#4f5868]">

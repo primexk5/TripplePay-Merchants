@@ -907,6 +907,17 @@ export function newOrderId(): string {
   return id(`ord_web_${[...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")}`);
 }
 
+export interface QiOrder {
+  /** One-time Cyprus-1 Qi receive address derived for this order — the pay-to target. */
+  address: string;
+  /** Required amount in qits (1000 qits = 1 Qi), decimal string. */
+  qits: string;
+  /** Total value of unspent outpoints seen on the address so far, in qits. */
+  receivedQits: string;
+  settled: boolean;
+  txHashes: string[];
+}
+
 export interface OrderStatus {
   merchant: string;
   orderId: string;
@@ -915,6 +926,8 @@ export interface OrderStatus {
   feeBps: number;
   expiry: string;
   settled: boolean;
+  /** Per-order Qi receive info. Present only when the deployment has Qi enabled. */
+  qi?: QiOrder | null;
   webhook: { status: string; attempts: number } | null;
 }
 
@@ -931,6 +944,33 @@ export async function fetchOrderStatus(
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`backend error ${res.status}`);
   return (await res.json()) as OrderStatus;
+}
+
+export interface QiLinkClaim {
+  orderId: string;
+  merchant: string;
+  amount: string;
+  poolRemaining: number;
+  qi: QiOrder;
+}
+
+/** Reserve an orderId off a payment-link pool and get its one-time Qi receive address. The Qi
+ *  path can't claim per-wallet like the on-chain one (there's no sender binding before payment),
+ *  so the backend reserves the order and returns the address; the payer then sends qits to it.
+ *  Returns null when the link is unknown; throws on transient backend errors. */
+export async function reserveQiOnLink(
+  slug: string,
+  timeoutMs = 10_000,
+): Promise<QiLinkClaim | null> {
+  const res = await backendFetch(`/v1/links/${slug}/qi-claim`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Qi claim failed (${res.status})`);
+  return (await res.json()) as QiLinkClaim;
 }
 
 /** On-chain fallback when the backend is unreachable. */

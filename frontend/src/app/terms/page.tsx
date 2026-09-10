@@ -3,7 +3,7 @@ import { ArrowLeft } from "lucide-react";
 import { Logo } from "@/components/logo";
 
 export const metadata = {
-  title: "Terms of Service - TripplePay || Marchants",
+  title: "Terms of Service - TripplePay || Merchants",
 };
 
 export default function TermsPage() {
@@ -31,7 +31,7 @@ export default function TermsPage() {
           </p>
           
           <p>
-            Welcome to TripplePay || Marchants. These Terms of Service (&quot;Terms&quot;) govern your use of the TripplePay || Marchants application, website, and related services (collectively, the &quot;Service&quot;). By using the Service, you agree to these Terms. If you do not agree to these Terms, do not use the Service.
+            Welcome to TripplePay || Merchants. These Terms of Service (&quot;Terms&quot;) govern your use of the TripplePay || Merchants application, website, and related services (collectively, the &quot;Service&quot;). By using the Service, you agree to these Terms. If you do not agree to these Terms, do not use the Service.
           </p>
 
           <h2>1. Description of Service</h2>
@@ -44,10 +44,10 @@ export default function TermsPage() {
 
           <h2>2. Non-Custodial Nature</h2>
           <p>
-            You acknowledge and agree that TripplePay || Marchants is entirely non-custodial. You maintain full control over your cryptocurrency at all times. TripplePay || Marchants does not take possession, custody, or control over any digital assets, nor do we act as an intermediary, custodian, or exchange.
+            You acknowledge and agree that TripplePay || Merchants is entirely non-custodial. You maintain full control over your cryptocurrency at all times. TripplePay || Merchants does not take possession, custody, or control over any digital assets, nor do we act as an intermediary, custodian, or exchange.
           </p>
           <p>
-            You are solely responsible for securely storing your private keys and seed phrases. If you lose access to your wallet, TripplePay || Marchants cannot recover your funds.
+            You are solely responsible for securely storing your private keys and seed phrases. If you lose access to your wallet, TripplePay || Merchants cannot recover your funds.
           </p>
 
           <h2>3. User Responsibilities</h2>
@@ -64,7 +64,7 @@ export default function TermsPage() {
 
           <h2>5. Limitation of Liability</h2>
           <p>
-            To the maximum extent permitted by law, TripplePay || Marchants and its developers, contributors, and affiliates shall not be liable for any indirect, incidental, special, consequential, or punitive damages, or any loss of profits or revenues, whether incurred directly or indirectly, or any loss of data, use, goodwill, or other intangible losses, resulting from:
+            To the maximum extent permitted by law, TripplePay || Merchants and its developers, contributors, and affiliates shall not be liable for any indirect, incidental, special, consequential, or punitive damages, or any loss of profits or revenues, whether incurred directly or indirectly, or any loss of data, use, goodwill, or other intangible losses, resulting from:
           </p>
           <ul className="list-disc pl-5">
             <li>Your access to or use of or inability to access or use the Service.</li>
@@ -85,12 +85,12 @@ export default function TermsPage() {
 
           <h2>8. Contact</h2>
           <p>
-            If you have any questions about these Terms, please contact the TripplePay || Marchants team through the official repository or community channels.
+            If you have any questions about these Terms, please contact the TripplePay || Merchants team through the official repository or community channels.
           </p>
         </div>
         
         <footer className="mt-16 border-t border-white/7 pt-8 text-center text-xs text-[#4f5868]">
-          &copy; {new Date().getFullYear()} TripplePay || Marchants. All rights reserved.
+          &copy; {new Date().getFullYear()} TripplePay || Merchants. All rights reserved.
         </footer>
       </div>
     </main>

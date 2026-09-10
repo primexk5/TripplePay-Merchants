@@ -101,12 +101,22 @@ export function DashboardShell({
         }`}
       >
         <div className="flex h-20 items-center justify-between border-b border-white/7 px-6">
-          <Link href="/" className="flex items-center gap-3">
-            <Logo className="h-9 w-9" />
+          <Link href="/" className="flex items-center gap-3 group">
+            <div className="rounded-xl ring-1 ring-white/10 overflow-hidden shadow-lg shrink-0">
+              <Logo className="h-9 w-9" />
+            </div>
 
-            <div>
-              <p className="text-sm font-bold tracking-tight">Tripple</p>
-              <p className="-mt-1 text-sm font-bold text-[#38bdf8]">Pay</p>
+            {/* Wordmark */}
+            <div className="flex flex-col leading-none">
+              <span className="text-[13px] font-extrabold tracking-widest text-white/90 uppercase">
+                Tripple
+                <span className="bg-linear-to-r from-sky-400 to-cyan-300 bg-clip-text text-transparent">
+                  Pay
+                </span>
+              </span>
+              <span className="mt-0.75 text-[9px] font-semibold tracking-[0.22em] uppercase text-white/35">
+                Merchant Portal
+              </span>
             </div>
           </Link>
           <button
@@ -206,9 +216,12 @@ export function DashboardShell({
             <Menu size={22} />
           </button>
 
-          <div className="hidden lg:block">
-            <p className="text-sm text-[#667085]">Merchant portal</p>
-            <p className="text-sm font-medium text-white">TripplePay || Merchants</p>
+          <div className="hidden lg:flex items-center gap-3">
+            <div className="flex flex-col leading-none">
+              <span className="mt-0.5 text-[8px] font-semibold tracking-[0.24em] uppercase text-white/30">
+                Admin Portal
+              </span>
+            </div>
           </div>
 
           <div className="ml-auto flex items-center gap-4">

@@ -4,8 +4,9 @@ import { getAddress, verifyMessage } from 'quais';
 import { z } from 'zod';
 import type { Store } from '../store/index.js';
 import type { QuaiClient } from '../chain/client.js';
+import type { QiService } from '../chain/qi.js';
 import type { Config } from '../config.js';
-import type { Merchant, Session, PaymentLink, WebhookDelivery } from '../types.js';
+import type { Merchant, Session, PaymentLink, WebhookDelivery, QiOrder } from '../types.js';
 import { newMerchantId, newWebhookSecret, newSlug } from '../util/ids.js';
 import { assertSafeWebhookUrl, UnsafeWebhookUrlError } from '../webhooks/urlGuard.js';
 import { rateLimit } from './rateLimit.js';
@@ -15,8 +16,30 @@ import { log } from '../logger.js';
 
 const logger = log('api');
 
+/** Public Qi shape for an order — what the checkout needs: the one-time receive address, the
+ *  required amount (qits), how much has arrived, and whether settlement has been detected. */
+function qiView(order: QiOrder) {
+  return {
+    address: order.address,
+    qits: order.qits.toString(),
+    receivedQits: order.receivedQits === undefined ? undefined : order.receivedQits.toString(),
+    settled: order.settled,
+    txHashes: order.txHashes,
+  };
+}
+
 /** Native QUAI marker — always allowed regardless of the ACCEPTED_TOKENS allowlist. */
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+/**
+ * Amount (wei) fabricated for a dev-demo order served under QI_DEV_DEMO_MERCHANT when
+ * QI_DEV_SIMULATE is on — 25 QUAI, mirroring the `/checkout/demo` page. Only reachable in
+ * non-production configs (loadConfig refuses QI_DEV_SIMULATE with NODE_ENV=production).
+ */
+const DEV_DEMO_ORDER_AMOUNT = 25_000_000_000_000_000_000n;
+
+/** Fake outpoint tx hash for dev-simulated Qi settlements (zero mainnet funds required). */
+const DEV_FAKE_TX_HASH = '0x' + 'de'.repeat(32);
 
 /** Normalize ACCEPTED_TOKENS into a clean lowercase set. Handles both the parsed array
  *  (loadConfig) and a raw comma-separated string, so the route never trusts its input shape.
@@ -47,7 +70,7 @@ function parseAcceptedTokens(value: unknown): Set<string> {
  * Admin routes require `Authorization: Bearer <ADMIN_API_KEY>`. Self-service routes require a
  * session token issued by POST /v1/auth/login.
  */
-export function createServer(store: Store, client: QuaiClient, cfg: Config): Express {
+export function createServer(store: Store, client: QuaiClient, cfg: Config, qiService?: QiService): Express {
   const app = express();
   app.disable('x-powered-by');
   // `req.ip` (rate-limiter keys, login logging) is only the real client address when the hop
@@ -72,6 +95,7 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config): Exp
       contract: client.address,
       chainId: cfg.CHAIN_ID,
       cursor: (await store.getCursor(scope)) ?? null,
+      qi: qiService?.enabled ? { enabled: true, rpc: qiService.rpcUrl } : { enabled: false },
     });
   }));
 
@@ -95,10 +119,43 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config): Exp
       return res.status(400).json({ error: 'orderId must be a 32-byte hex string' });
     }
 
-    const order = await client.getOrder(merchant, orderId);
+    // DEV ONLY: for the demo merchant under QI_DEV_SIMULATE, synthesize the order rather than
+    // calling the chain — an unregistered merchant's getOrder may throw OR return a zeroed
+    // `exists:true` struct (observed on Orchard), which would incorrectly yield amount 0.
+    const isDevDemo =
+      cfg.QI_DEV_SIMULATE && cfg.QI_DEV_DEMO_MERCHANT?.toLowerCase() === merchant.toLowerCase();
+    let order: Awaited<ReturnType<QuaiClient['getOrder']>>;
+    if (isDevDemo) {
+      logger.warn({ merchant, orderId }, 'dev demo order synthesized (QI_DEV_SIMULATE)');
+      order = {
+        exists: true,
+        settled: false,
+        merchant,
+        amount: DEV_DEMO_ORDER_AMOUNT,
+        feeBps: 50,
+        token: ZERO_ADDRESS,
+        feeRecipient: merchant,
+        expiry: 0n,
+        settledAt: 0n,
+        expectedPayer: ZERO_ADDRESS,
+        nonce: 0n,
+      };
+    } else {
+      order = await client.getOrder(merchant, orderId);
+    }
     if (!order.exists) return res.status(404).json({ error: 'order not found' });
 
     const delivery = await store.getDeliveryByOrder(merchant, orderId);
+    // Qi surface: derive (or load) the order's one-time receive address. When Qi is disabled this
+    // stays null and the checkout shows only the on-chain payment path. Derivation is lazily
+    // triggered by the checkout reading the order — no background job, no wasted addresses.
+    let qi: ReturnType<typeof qiView> | null = null;
+    if (qiService?.enabled) {
+      const qits = qiService.orderQits(order.amount);
+      let rec = await store.getQiOrder(orderId);
+      if (!rec) rec = await qiService.ensureQiOrder(orderId, merchant, qits);
+      if (rec) qi = qiView(rec);
+    }
     res.json({
       merchant,
       orderId,
@@ -107,6 +164,7 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config): Exp
       feeBps: order.feeBps,
       expiry: order.expiry.toString(),
       settled: order.settled,
+      qi,
       webhook: delivery ? { status: delivery.status, attempts: delivery.attempts } : null,
     });
   }));
@@ -518,9 +576,72 @@ await store.upsertMerchant(updated);
     });
   }));
 
+  // Qi variant of the claim: the payer isn't known until the customer opens their Qi wallet, so
+  // this route reserves an orderId up front and returns its freshly-derived receive address. The
+  // checkout then shows the address as a QR/copy target and polls /v1/orders/... for settlement.
+  // Returns 404 for a missing link, 503 when Qi is disabled or the pool is empty.
+  app.post('/v1/links/:slug/qi-claim', linkLimiter, asyncHandler(async (req, res) => {
+    const slug = req.params.slug ?? '';
+    const link = await store.getLink(slug);
+    if (!link) return res.status(404).json({ error: 'link not found' });
+
+    if (!qiService?.enabled) {
+      return res.status(503).json({ error: 'Qi payments are not enabled on this deployment' });
+    }
+
+    // Recycle abandoned Qi reservations too: an earlier qi-claim that never received funds leaves
+    // its order bound to the sentinel payer; handing the order back keeps the pool from draining.
+    const recycled = await store.reclaimStaleClaim(slug, 'qi', CLAIM_STALE_MS);
+    const orderId = recycled ?? (await store.reserveQiLinkOrder(slug));
+    if (!orderId) {
+      return res.status(503).json({ error: 'no orders available — pool exhausted; ask the merchant to add more' });
+    }
+
+    const qits = qiService.orderQits(BigInt(link.amount));
+    const rec = await qiService.ensureQiOrder(orderId, link.merchantAddress, qits);
+    if (!rec) {
+      return res.status(500).json({ error: 'could not allocate a Qi receive address — try again' });
+    }
+    if (!recycled) {
+      logger.info({ slug, orderId }, 'order reserved for Qi payment');
+    } else {
+      logger.info({ slug, orderId }, 'stale Qi reservation recycled');
+    }
+    res.json({
+      orderId,
+      merchant: getAddress(link.merchantAddress),
+      amount: link.amount,
+      poolRemaining: link.orderPool.length,
+      qi: qiView(rec),
+    });
+  }));
+
   // --- admin ---
   const admin = express.Router();
   admin.use(requireAdmin(cfg));
+
+  // DEV ONLY: simulate a Qi settlement reaching the required total so the full lifecycle
+  // (checkout panel → settled → paid) can be demoed without sending real Cyprus-1 Qi. Refuses to
+  // even load in production (config guard), and still requires the admin bearer token here.
+  admin.post('/dev/qi-settle/:orderId', asyncHandler(async (req, res) => {
+    if (!cfg.QI_DEV_SIMULATE) {
+      return res.status(404).json({ error: 'not found' });
+    }
+    const orderId = (req.params.orderId ?? '').toLowerCase();
+    if (!/^0x[0-9a-f]{64}$/.test(orderId)) {
+      return res.status(400).json({ error: 'orderId must be a 32-byte hex string' });
+    }
+    const rec = await store.getQiOrder(orderId);
+    if (!rec) return res.status(404).json({ error: 'no Qi order for this orderId' });
+    if (rec.settled) return res.json({ qi: qiView(rec), alreadySettled: true });
+    const settled = await store.markQiOrderSettled(
+      orderId,
+      rec.qits.toString(),
+      [...(rec.txHashes ?? []), DEV_FAKE_TX_HASH],
+    );
+    logger.info({ orderId, qits: rec.qits.toString() }, 'dev-simulated Qi settlement (QI_DEV_SIMULATE)');
+    res.json({ qi: settled ? qiView(settled) : null, alreadySettled: false });
+  }));
 
   admin.get('/merchants', asyncHandler(async (_req, res) => {
     res.json({ merchants: (await store.listMerchants()).map(publicMerchant) });

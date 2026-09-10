@@ -277,7 +277,7 @@ export default function Home() {
               </h2>
 
               <p className="mt-4 max-w-lg leading-7 text-slate-500">
-                TripplePay || Marchants integrates natively with <strong className="text-slate-300">Blip</strong> — the premier self-custody mobile wallet for Quai (iOS & Android). Customers scan a QR code or tap a link, and the Blip app opens with the payment pre-filled. One tap to confirm.
+                TripplePay || Merchants integrates natively with <strong className="text-slate-300">Blip</strong> — the premier self-custody mobile wallet for Quai (iOS & Android). Customers scan a QR code or tap a link, and the Blip app opens with the payment pre-filled. One tap to confirm.
               </p>
 
               <ul className="mt-6 space-y-3">
@@ -612,7 +612,7 @@ export default function Home() {
               transition={{ duration: 0.5, delay: 0.1 }}
               className="rounded-2xl border border-sky-400/15 bg-sky-400/3 p-8"
             >
-              <p className="text-xs font-semibold uppercase tracking-widest text-sky-400 mb-6">After — TripplePay || Marchants</p>
+              <p className="text-xs font-semibold uppercase tracking-widest text-sky-400 mb-6">After — TripplePay || Merchants</p>
               <div className="space-y-4">
                 {[
                   { label: "Lightning-fast settlement — seconds, not days", highlight: false },
@@ -800,7 +800,7 @@ export default function Home() {
             <p className="text-sm font-medium text-sky-400 mb-4">WHAT&apos;S COMING</p>
             <h2 className="text-4xl font-semibold tracking-tight text-white sm:text-5xl">
               The future of{" "}
-              <span className="text-slate-400">TripplePay || Marchants.</span>
+              <span className="text-slate-400">TripplePay || Merchants.</span>
             </h2>
             <p className="mt-5 max-w-2xl text-lg leading-8 text-slate-400">
               We&apos;re just getting started. Here&apos;s where we&apos;re taking this — from social commerce to global infrastructure.
@@ -824,7 +824,7 @@ export default function Home() {
               {
                 icon: Smartphone,
                 title: "Mobile SDK",
-                desc: "Native iOS and Android SDKs so developers can embed TripplePay || Marchants checkout into any mobile app with a few lines of code.",
+                desc: "Native iOS and Android SDKs so developers can embed TripplePay || Merchants checkout into any mobile app with a few lines of code.",
                 status: "Planned",
               },
               {
@@ -914,11 +914,22 @@ function Navbar() {
   return (
     <header className="sticky top-0 z-50 border-b border-white/5 bg-[#0a0a0a]/80 backdrop-blur-xl">
       <nav className="mx-auto flex h-18 max-w-7xl items-center justify-between px-6 lg:px-8">
-        <Link href="/" className="flex items-center gap-2.5">
-          <Logo />
-          <span className="text-sm font-semibold tracking-tight text-white">
-            TRIPPLEPAY ||<span className="text-sky-400">MERCHANTS</span>
-          </span>
+        <Link href="/" className="group flex items-center gap-3">
+          <div className="rounded-xl ring-1 ring-white/10 overflow-hidden shadow-lg shrink-0">
+            <Logo />
+          </div>
+          {/* Wordmark */}
+          <div className="flex flex-col leading-none">
+            <span className="text-[13px] font-extrabold tracking-widest text-white/90 uppercase">
+              Tripple
+              <span className="bg-linear-to-r from-sky-400 to-cyan-300 bg-clip-text text-transparent">
+                Pay
+              </span>
+            </span>
+            <span className="mt-0.75 text-[9px] font-semibold tracking-[0.22em] uppercase text-white/35">
+              Merchant
+            </span>
+          </div>
         </Link>
 
         <div className="hidden items-center gap-8 md:flex">
@@ -970,11 +981,13 @@ function Footer() {
   return (
     <footer className="border-t border-white/6">
       <div className="mx-auto flex max-w-7xl flex-col gap-5 px-6 py-8 sm:flex-row sm:items-center sm:justify-between lg:px-8">
-        <div className="flex items-center gap-2.5">
-          <Logo />
+        <div className="flex items-center gap-3">
+          <div className="rounded-xl ring-1 ring-white/10 overflow-hidden shrink-0">
+            <Logo />
+          </div>
 
           <span className="text-sm font-medium text-slate-400">
-            TripplePay || Marchants
+            TripplePay || Merchants
           </span>
         </div>
 

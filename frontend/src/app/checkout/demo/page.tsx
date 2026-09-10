@@ -152,7 +152,7 @@ export default function CheckoutDemoPage() {
               className="inline-flex w-full items-center justify-center gap-2 text-sm text-[#8b93a7] py-2 transition hover:text-white"
             >
               <ArrowLeft size={15} />
-              Return to TripplePay || Marchants
+              Return to TripplePay || Merchants
             </Link>
           </div>
           <div className="absolute left-[-9999px] top-0 opacity-0 pointer-events-none">
@@ -179,7 +179,7 @@ export default function CheckoutDemoPage() {
           className="inline-flex items-center gap-2 text-sm text-[#8b93a7] hover:text-[#061018]"
         >
           <ArrowLeft size={15} />
-          TripplePay || Marchants
+          TripplePay || Merchants
         </Link>
 
         <div className="mt-10 rounded-3xl border border-white/7 bg-[#171717] p-6 sm:p-8">
@@ -231,7 +231,7 @@ export default function CheckoutDemoPage() {
                 onClick={() => setStage({ name: "connect" })}
                 className="flex w-full items-center justify-center rounded-xl bg-[#C1ED00] py-3.5 text-sm font-semibold text-[#0F1116] transition hover:bg-[#d4ff00]"
               >
-                Check out your order with TripplePay || Marchants
+                Check out your order with TripplePay || Merchants
               </button>
             </div>
           )}

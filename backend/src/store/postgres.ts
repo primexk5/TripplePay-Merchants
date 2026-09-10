@@ -1,6 +1,6 @@
 import { Pool, type PoolClient } from 'pg';
 import type { Store } from './index.js';
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder } from '../types.js';
 import { log } from '../logger.js';
 
 const logger = log('store:postgres');
@@ -125,6 +125,20 @@ export class PostgresStore implements Store {
         created_at       BIGINT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS order_meta_merchant ON order_meta (merchant_address, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS qi_orders (
+        order_id         TEXT PRIMARY KEY,
+        merchant_address TEXT NOT NULL,
+        address          TEXT NOT NULL UNIQUE,
+        qits             TEXT NOT NULL,
+        received_qits    TEXT NOT NULL DEFAULT '0',
+        settled          BOOLEAN NOT NULL DEFAULT false,
+        tx_hashes        JSONB NOT NULL DEFAULT '[]',
+        created_at       BIGINT NOT NULL,
+        settled_at       BIGINT
+      );
+      -- For the Qi indexer sweep: pending (unsettled) orders, oldest first.
+      CREATE INDEX IF NOT EXISTS qi_orders_pending ON qi_orders (settled, created_at);
     `);
   }
 
@@ -569,6 +583,81 @@ export class PostgresStore implements Store {
     };
   }
 
+  // --- Qi per-order receive addresses ---
+
+  /** The address UNIQUE index is the enforcement point for Qi address reuse (an address handed to
+   *  two orders would misattribute payments). A conflicting address raises a unique_violation,
+   *  which the caller treats as "derive again"; an existing orderId is a no-op via ON CONFLICT. */
+  async insertQiOrder(order: QiOrder): Promise<boolean> {
+    const { rowCount } = await this.pool.query(
+      `INSERT INTO qi_orders (order_id, merchant_address, address, qits, received_qits, settled, tx_hashes, created_at, settled_at)
+       VALUES ($1, $2, $3, $4, '0', false, '[]'::jsonb, $5, NULL)
+       ON CONFLICT (order_id) DO NOTHING`,
+      [order.orderId.toLowerCase(), order.merchantAddress.toLowerCase(), order.address, order.qits, order.createdAt],
+    );
+    return (rowCount ?? 0) === 1;
+  }
+
+  async getQiOrder(orderId: string): Promise<QiOrder | undefined> {
+    const { rows } = await this.pool.query('SELECT * FROM qi_orders WHERE order_id = $1', [
+      orderId.toLowerCase(),
+    ]);
+    return rows.length ? mapQiOrder(rows[0]!) : undefined;
+  }
+
+  async listQiOrders(): Promise<QiOrder[]> {
+    const { rows } = await this.pool.query('SELECT * FROM qi_orders');
+    return rows.map(mapQiOrder);
+  }
+
+  async markQiOrderSettled(orderId: string, receivedQits: string, txHashes: string[]): Promise<QiOrder | undefined> {
+    const { rows } = await this.pool.query(
+      `UPDATE qi_orders
+       SET received_qits = $2, tx_hashes = $3::jsonb, settled = true, settled_at = $4
+       WHERE order_id = $1
+       RETURNING *`,
+      [orderId.toLowerCase(), receivedQits, JSON.stringify(txHashes), Date.now()],
+    );
+    return rows.length ? mapQiOrder(rows[0]!) : undefined;
+  }
+
+  /** Pop an orderId off the pool without binding a payer, reusing the same locked transaction as
+   *  {@link claimOrderFromPool} minus the claim-row insert with a real payer. */
+  async reserveQiLinkOrder(slug: string): Promise<string | undefined> {
+    const client: PoolClient = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query('SELECT order_pool FROM links WHERE slug = $1 FOR UPDATE', [slug]);
+      if (!rows.length) {
+        await client.query('ROLLBACK');
+        return undefined;
+      }
+      const pool: string[] = (rows[0]!.order_pool as string[]) ?? [];
+      const orderId = pool.shift();
+      if (!orderId) {
+        await client.query('ROLLBACK');
+        return undefined;
+      }
+      await client.query('UPDATE links SET order_pool = $1 WHERE slug = $2', [
+        JSON.stringify(pool),
+        slug,
+      ]);
+      await client.query(
+        `INSERT INTO claims (slug, order_id, payer_address, claimed_at, settled)
+         VALUES ($1, $2, $3, $4, false)
+         ON CONFLICT (slug, order_id) DO NOTHING`,
+        [slug, orderId, 'qi', Date.now()],
+      );
+      await client.query('COMMIT');
+      return orderId;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   async close(): Promise<void> {
     await this.pool.end();
   }
@@ -640,5 +729,19 @@ function mapClaim(row: Record<string, unknown>): LinkClaim {
     payerAddress: row.payer_address as string,
     claimedAt: toNum(row.claimed_at),
     settled: row.settled as boolean,
+  };
+}
+
+function mapQiOrder(row: Record<string, unknown>): QiOrder {
+  return {
+    orderId: row.order_id as string,
+    merchantAddress: row.merchant_address as string,
+    address: row.address as string,
+    qits: row.qits as string,
+    receivedQits: row.received_qits as string,
+    settled: row.settled as boolean,
+    txHashes: (row.tx_hashes as string[] | null) ?? [],
+    createdAt: toNum(row.created_at),
+    settledAt: row.settled_at === null ? null : toNum(row.settled_at),
   };
 }

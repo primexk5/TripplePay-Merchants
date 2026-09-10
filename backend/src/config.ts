@@ -67,6 +67,35 @@ const EnvSchema = z.object({
   PUBLIC_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
   PUBLIC_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(60),
 
+  // --- Qi payments (UTXO-ledger checkout) ---------------------------------------------
+  // The entire Qi surface is feature-gated: unless BOTH QI_MNEMONIC and QI_RPC_URL are set, the
+  // backend never derives Qi addresses, order APIs return `qi: null`, and the Qi indexer is idle.
+  //   QI_MNEMONIC: the merchant's Qi HD wallet seed phrase (BIP44, m/44'/969'/0'/0/<n>).
+  //   QI_RPC_URL:  a Quai Qi-chain JSON-RPC endpoint, e.g. https://qi-cyprus1.quai.network.
+  QI_MNEMONIC: z.string().min(1).optional(),
+  QI_RPC_URL: z.string().url().optional(),
+  // Qi price per 1 QUAI of an order, in qits. 1000 qits = 1 Qi, but the whole rate is tunable so a
+  // merchant can discount Qi payments. The checkout amounts are QUAI-denominated; the frontend
+  // shows the derived qits amount exactly, and settlement succeeds only once unspent outpoints on
+  // the order's receive address sum to >= this value.
+  QI_QITS_PER_QUAI: z.coerce.number().int().nonnegative().default(1000),
+  // How often the Qi indexer polls pending orders' receive addresses for incoming UTXOs
+  // (quai_getOutpointsByAddress). Qi has no contract events to subscribe to.
+  QI_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(8000),
+  // --- LOCAL-DEV ONLY: demo/test affordances for Qi ------------------------------------------
+  // QI_DEV_SIMULATE turns on two DO-NOT-USE-IN-PRODUCTION behaviors:
+  //   1. GET /v1/orders/<QI_DEV_DEMO_MERCHANT>/<orderId> synthesizes a not-found on-chain order
+  //      (so the checkout page renders without a real PayWithQuai registration), and
+  //   2. POST /v1/dev/qi-settle/:orderId forcibly marks a Qi order settled (so the full
+  //      settle → paid → webhook-queue lifecycle can be exercised with zero mainnet funds).
+  // Both are additionally guarded by ADMIN_API_KEY; loading with NODE_ENV=production is fatal.
+  QI_DEV_SIMULATE: boolish(false),
+  // Merchant address GET /v1/orders will fabricate orders for when QI_DEV_SIMULATE is on.
+  QI_DEV_DEMO_MERCHANT: z
+    .string()
+    .regex(/^0x[0-9a-fA-F]{40}$/, 'QI_DEV_DEMO_MERCHANT must be a 20-byte hex address')
+    .optional(),
+
   DATABASE_PATH: z.string().default('./data/relayer.db'),
   // When set, the relayer uses PostgreSQL instead of the JSON file (DATABASE_PATH is ignored).
   // Railway exposes this automatically as DATABASE_URL when a Postgres service is attached.
@@ -95,6 +124,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(
       'WEBHOOK_ALLOW_INSECURE_URLS=true is not allowed with NODE_ENV=production — ' +
         'it disables the SSRF guard (https requirement + private-address blocking).',
+    );
+  }
+  if (parsed.data.QI_DEV_SIMULATE && env.NODE_ENV === 'production') {
+    throw new Error(
+      'QI_DEV_SIMULATE=true is not allowed with NODE_ENV=production — it fabricates checkout ' +
+        'orders and lets anyone with the admin key mark Qi orders settled without payment.',
     );
   }
   cached = parsed.data;

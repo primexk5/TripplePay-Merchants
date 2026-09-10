@@ -1,4 +1,4 @@
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder } from '../types.js';
 
 /**
  * Persistence boundary for the relayer. The default local implementation ({@link JsonStore}) is a
@@ -74,4 +74,19 @@ export interface Store {
   // --- order metadata (optional payer-supplied context: who paid + link/checkout source) ---
   saveOrderMeta(meta: OrderMeta): Promise<void>;
   getOrderMeta(orderId: string): Promise<OrderMeta | undefined>;
+
+  // --- Qi per-order receive addresses (UTXO-ledger payments) ---
+  /** Insert a per-order Qi address, or return false when the orderId already has one or the
+   *  address collides with another order. The store's unique constraints are the source of truth
+   *  for address uniqueness; the caller retries with a freshly derived address on false. */
+  insertQiOrder(order: QiOrder): Promise<boolean>;
+  getQiOrder(orderId: string): Promise<QiOrder | undefined>;
+  listQiOrders(): Promise<QiOrder[]>;
+  /** Record that the order's receive address has accumulated at least its required qits. Returns
+   *  the updated order, or undefined if the orderId doesn't exist. */
+  markQiOrderSettled(orderId: string, receivedQits: string, txHashes: string[]): Promise<QiOrder | undefined>;
+  /** Pop the next orderId off a link pool WITHOUT binding a payer (the Qi path reserves an order
+   *  and shows its address before the payer's wallet is known), or undefined when the pool is
+   *  empty. Mirrors {@link claimOrderFromPool} minus the payer binding. */
+  reserveQiLinkOrder(slug: string): Promise<string | undefined>;
 }

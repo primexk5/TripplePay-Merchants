@@ -98,6 +98,27 @@ export interface LinkClaim {
   settled: boolean;           // set true after on-chain confirmation
 }
 
+/**
+ * A per-order Qi receive address and its settlement state.
+ *
+ * Qi is a UTXO ledger with no memo/data field, so to attribute a payment to an order the order
+ * MUST have its own receive address. The backend derives it from the merchant's Qi HD wallet
+ * (BIP44 path m/44'/969'/0'/0/<n>, Cyprus-1), persists it here, and the Qi indexer watches the
+ * address's outpoints for incoming value. Amounts are in qits (1000 qits = 1 Qi), stored as
+ * decimal strings to stay JSON-native; Qi UTXOs have fixed denominations (1/5/10/50/... qits).
+ */
+export interface QiOrder {
+  orderId: string; // bytes32 hex, lowercased
+  merchantAddress: string; // lowercased payout address
+  address: string; // qi:... Cyprus-1 receive address derived for this order
+  qits: string; // required amount, decimal qits
+  receivedQits: string; // total value of unspent outpoints seen on `address`, decimal qits
+  settled: boolean;
+  txHashes: string[]; // outpoint tx hashes counted toward settlement (informational)
+  createdAt: number; // unix ms
+  settledAt: number | null; // unix ms
+}
+
 /** Optional payer-supplied context attached to a payment (who paid + where they came from).
  *  Written by the payment pages right after on-chain confirmation — purely informational,
  *  never used for settlement logic. Keyed by orderId. */

@@ -1,4 +1,4 @@
-# TripplePay || Marchants — Non-custodial crypto payments for Quai
+# TripplePay || Merchants — Non-custodial crypto payments for Quai
 
 Accept payments on the Quai network with a plain wallet — no accounts, no KYC, no custody. Customers can pay using any Quai-compatible browser extension (like Pelagus) or via mobile using **Blip**, the premier self-custody wallet for Quai (available on iOS & Android). 
 
@@ -95,7 +95,7 @@ The frontend builds the checkout, wraps order registration/payment in `src/lib/p
 
 ## Blip Pay Integration
 
-TripplePay || Marchants features native integration with **Blip Pay** across the entire merchant and customer lifecycle.
+TripplePay || Merchants features native integration with **Blip Pay** across the entire merchant and customer lifecycle.
 
 **For Customers (Mobile Payments):**
 For physical or mobile-first commerce, the checkout can display a deep-link QR code.
@@ -147,16 +147,23 @@ Verify the signature over the **raw body** (constant-time), tolerate a few secon
 - **SSRF guard**: webhook URLs are re-checked before every delivery (no private/loopback, no redirects, HTTPS required in production).
 - **Session auth**: message signing with a 5-minute replay window; secrets never leave the wallet.
 
-## Testnet deployment (Cyprus-1)
+## Mainnet deployment (Cyprus-1)
 
 ```json
 {
-  "payWithQuai": "0x0078cd401e3CF4bE9Bc3b104783c611e35F11816",
-  "mockStablecoin": "0x0068f42D5Bd511363f52a1ade1ecD41B4bdD8F8e"
+  "network": "cyprus1",
+  "chainId": 9,
+  "payWithQuai": "0x0072174EF6d0C2EB605449b0014169D104c42BbC",
+  "payWithQuaiImpl": "0x002dB0fBCA5a3DC1336e5D00ABCbCd9daac9cFF6",
+  "timelock": "0x005271b466765176a8a79b3f9A621c40abA1bffC",
+  "mockStablecoin": null,
+  "feeRecipient": "0x000E25274329cCa64Cf76b87Edd6A1f158952582",
+  "feeBps": "30",
+  "deployer": "0x000E25274329cCa64Cf76b87Edd6A1f158952582"
 }
 ```
 
-Chain ID `15000` · RPC `https://orchard.rpc.quai.network`.
+Chain ID `9` · RPC `https://rpc.quai.network/cyprus1`.
 
 ## Documentation
 

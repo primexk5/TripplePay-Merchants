@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSync, closeSync, fsyncSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Store } from './index.js';
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder } from '../types.js';
 import { log } from '../logger.js';
 
 const logger = log('store');
@@ -15,6 +15,7 @@ interface FileShape {
   links: Record<string, PaymentLink>;   // key: slug
   claims: Record<string, LinkClaim[]>;  // key: slug — array of all claims for that link
   orderMeta: Record<string, OrderMeta>; // key: lowercased orderId
+  qiOrders: Record<string, QiOrder>;    // key: lowercased orderId
 }
 
 /** Case-insensitive lookup key binding a delivery to its (merchant, orderId). */
@@ -68,7 +69,7 @@ export class JsonStore implements Store {
   }
 
   private read(): FileShape {
-    if (!existsSync(this.path)) return { cursors: {}, merchants: {}, deliveries: {}, sessions: {}, nonces: {}, links: {}, claims: {}, orderMeta: {} };
+    if (!existsSync(this.path)) return { cursors: {}, merchants: {}, deliveries: {}, sessions: {}, nonces: {}, links: {}, claims: {}, orderMeta: {}, qiOrders: {} };
     try {
       const parsed = JSON.parse(readFileSync(this.path, 'utf8')) as {
         cursor?: number | null;
@@ -94,6 +95,7 @@ export class JsonStore implements Store {
         links: (parsed as Partial<FileShape>).links ?? {},
         claims: (parsed as Partial<FileShape>).claims ?? {},
         orderMeta: (parsed as Partial<FileShape>).orderMeta ?? {},
+        qiOrders: (parsed as Partial<FileShape>).qiOrders ?? {},
       };
     } catch (err) {
       throw new Error(`Failed to read store at ${this.path}: ${(err as Error).message}`);
@@ -404,5 +406,40 @@ export class JsonStore implements Store {
 
   async getOrderMeta(orderId: string): Promise<OrderMeta | undefined> {
     return this.data.orderMeta[orderId.toLowerCase()];
+  }
+
+  // --- Qi per-order receive addresses ---
+
+  async insertQiOrder(order: QiOrder): Promise<boolean> {
+    const key = order.orderId.toLowerCase();
+    // The address is the second uniqueness axis (a payer could reuse an address across orders,
+    // which would misattribute payments) — reject that exactly like the Postgres unique index.
+    const collision = Object.values(this.data.qiOrders).some((o) => o.address === order.address);
+    if (this.data.qiOrders[key] || collision) return false;
+    this.data.qiOrders[key] = { ...order, orderId: key };
+    this.flush();
+    return true;
+  }
+
+  async getQiOrder(orderId: string): Promise<QiOrder | undefined> {
+    return this.data.qiOrders[orderId.toLowerCase()];
+  }
+
+  async listQiOrders(): Promise<QiOrder[]> {
+    return Object.values(this.data.qiOrders);
+  }
+
+  async markQiOrderSettled(orderId: string, receivedQits: string, txHashes: string[]): Promise<QiOrder | undefined> {
+    const key = orderId.toLowerCase();
+    const current = this.data.qiOrders[key];
+    if (!current) return undefined;
+    const updated: QiOrder = { ...current, receivedQits, txHashes, settled: true, settledAt: Date.now() };
+    this.data.qiOrders[key] = updated;
+    this.flush();
+    return updated;
+  }
+
+  async reserveQiLinkOrder(slug: string): Promise<string | undefined> {
+    return this.claimOrderFromPool(slug, 'qi'); // binds to the sentinel payer 'qi'
   }
 }
