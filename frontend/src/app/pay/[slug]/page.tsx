@@ -15,6 +15,7 @@ import {
   Wallet,
 } from "lucide-react";
 import { useEffect, useState, useRef, useCallback } from "react";
+import { PaymentMethodSelector } from "@/components/checkout/payment-method-selector";
 import { toPng } from "html-to-image";
 import { Receipt } from "@/components/ui/receipt";
 import QRCode from "react-qr-code";
@@ -667,40 +668,7 @@ export default function PayPage({ params }: { params: Params }) {
 
                         {/* Wallet tabs */}
                         <div className="mt-6 overflow-hidden rounded-2xl border border-white/7 bg-[#171717]">
-                          <div className="flex overflow-x-auto hide-scrollbar border-b border-white/7">
-                            <button
-                              onClick={() => setPayTab("blip")}
-                              className={`flex min-w-[140px] flex-1 shrink-0 whitespace-nowrap items-center justify-center gap-2 px-4 py-3 text-sm font-medium transition ${
-                                payTab === "blip"
-                                  ? "border-b-2 border-[#C1ED00] text-white"
-                                  : "text-[#8b93a7] hover:text-white"
-                              }`}
-                            >
-                              <Smartphone size={15} />
-                              Pay with Blip
-                            </button>
-                            <button
-                              onClick={() => setPayTab("wallet")}
-                              className={`flex min-w-[140px] flex-1 shrink-0 whitespace-nowrap items-center justify-center gap-2 px-4 py-3 text-sm font-medium transition ${
-                                payTab === "wallet"
-                                  ? "border-b-2 border-[#38bdf8] text-white"
-                                  : "text-[#8b93a7] hover:text-white"
-                              }`}
-                            >
-                              <Wallet size={15} />
-                              Browser Wallet
-                            </button>
-                            <button
-                              disabled
-                              className="flex min-w-[140px] flex-1 shrink-0 whitespace-nowrap items-center justify-center gap-2 px-4 py-3 text-sm font-medium text-[#4f5868] opacity-50 cursor-not-allowed select-none"
-                            >
-                              <Coins size={15} />
-                              Pay with Qi
-                              <span className="ml-1 text-[10px] uppercase tracking-wider text-[#8b93a7]">
-                                Coming soon
-                              </span>
-                            </button>
-                          </div>
+                          <PaymentMethodSelector payTab={payTab} setPayTab={setPayTab} showQiComingSoon />
 
                           {payTab === "blip" &&
                             pageUrl && (
