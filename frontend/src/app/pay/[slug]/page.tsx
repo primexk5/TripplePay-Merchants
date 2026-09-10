@@ -5,6 +5,7 @@ import {
   ArrowLeft,
   Check,
   Clock,
+  Coins,
   Download,
   Loader2,
   LockKeyhole,
@@ -30,9 +31,12 @@ import {
   waitForOnChainConfirmation,
   fetchLink,
   claimOrderFromLink,
+  reserveQiOnLink,
+  fetchOrderStatus,
   linkPaymentProblem,
   submitPaymentMeta,
   type LinkInfo,
+  type QiLinkClaim,
 } from "@/lib/payment";
 import { currencyDecimals } from "@/lib/currencies";
 import {
@@ -50,6 +54,8 @@ import {
   QUAI_MAINNET_CHAIN,
 } from "@/lib/wallets";
 import { parseError, rawErrorText } from "@/lib/utils";
+import { formatQits } from "@/lib/qi";
+import { QiPaymentPanel } from "@/components/checkout/qi-payment-panel";
 
 type Params = Promise<{ slug: string }>;
 
@@ -58,6 +64,7 @@ type Stage =
   | { name: "notfound" }
   | { name: "ready" }
   | { name: "claiming" }
+  | { name: "qiSettled" }
   | { name: "paying"; step: string }
   | { name: "awaiting"; status: string }
   | { name: "done"; txHash: string; net: string; symbol: string }
@@ -79,11 +86,14 @@ export default function PayPage({ params }: { params: Params }) {
   const [link, setLink] = useState<LinkInfo | null>(null);
   const [connected, setConnected] = useState<string | null>(null);
   const [insideBlip, setInsideBlip] = useState(false);
-  const [payTab, setPayTab] = useState<"blip" | "wallet">("wallet");
+  const [payTab, setPayTab] = useState<"blip" | "wallet" | "qi">("wallet");
   const [blipConnecting, setBlipConnecting] = useState(false);
   const [needsFund, setNeedsFund] = useState(false);
   const [errorDetail, setErrorDetail] = useState<string | null>(null);
   const [customerName, setCustomerName] = useState("");
+  const [qiClaim, setQiClaim] = useState<QiLinkClaim | null>(null);
+  const [qiBusy, setQiBusy] = useState(false);
+  const [qiError, setQiError] = useState<string | null>(null);
   const receiptRef = useRef<HTMLDivElement>(null);
   const [downloading, setDownloading] = useState(false);
   const [claimedOrderId, setClaimedOrderId] = useState<string | null>(null);
@@ -158,6 +168,45 @@ export default function PayPage({ params }: { params: Params }) {
     })();
     return () => { cancelled = true; };
   }, [params]);
+
+  // Reserve an orderId off the pool and get its one-time Qi receive address. Called only from
+  // explicit taps; surfaces pool-exhausted / Qi-disabled errors inline instead of aborting the page.
+  const reserveQi = async () => {
+    setQiBusy(true);
+    setQiError(null);
+    try {
+      const claim = await reserveQiOnLink(slug);
+      if (!claim) {
+        setStage({ name: "notfound" });
+        return;
+      }
+      setQiClaim(claim);
+    } catch (err) {
+      setQiError(parseError(err) || "Could not reserve a Qi address — try again.");
+    } finally {
+      setQiBusy(false);
+    }
+  };
+
+  // Qi settlement is backend-detected (UTXO watches, no contract events) — poll the order digest
+  // and flip to the confirmed screen when the backend flags the order as paid by qits.
+  useEffect(() => {
+    if (stage.name !== "ready" || !qiClaim || qiClaim.qi.settled) return;
+    const timer = setInterval(() => {
+      void (async () => {
+        try {
+          const s = await fetchOrderStatus(qiClaim.merchant, qiClaim.orderId);
+          const q = s?.qi ?? null;
+          if (!q) return;
+          setQiClaim((prev) => (prev ? { ...prev, qi: q } : prev));
+          if (q.settled) setStage({ name: "qiSettled" });
+        } catch {
+          /* transient — keep polling */
+        }
+      })();
+    }, 6000);
+    return () => clearInterval(timer);
+  }, [stage.name, qiClaim]);
 
   const downloadReceipt = async () => {
     if (!receiptRef.current) return;
@@ -344,7 +393,7 @@ export default function PayPage({ params }: { params: Params }) {
               className="inline-flex w-full items-center justify-center gap-2 text-sm text-[#8b93a7] py-2 transition hover:text-white"
             >
               <ArrowLeft size={15} />
-              Return to TripplePay || Marchants
+              Return to TripplePay || Merchants
             </Link>
           </div>
           {/* Hidden receipt for download */}
@@ -383,7 +432,7 @@ export default function PayPage({ params }: { params: Params }) {
           className="inline-flex items-center gap-2 text-sm text-[#8b93a7] hover:text-white"
         >
           <ArrowLeft size={15} />
-          TripplePay || Marchants
+          TripplePay || Merchants
         </Link>
 
         <div className="mt-10 rounded-3xl border border-white/7 bg-[#171717] p-6 sm:p-8">
@@ -557,6 +606,43 @@ export default function PayPage({ params }: { params: Params }) {
                             </button>
                           )}
                         </div>
+
+                        {/* Qi, inside the Blip in-app browser */}
+                        <div className="mt-5 border-t border-white/7 pt-5">
+                          {qiClaim ? (
+                            <QiPaymentPanel
+                              address={qiClaim.qi.address}
+                              qits={qiClaim.qi.qits}
+                              orderId={qiClaim.orderId}
+                              settled={qiClaim.qi.settled}
+                            />
+                          ) : (
+                            <div className="flex flex-col items-center gap-3 text-center">
+                              <p className="max-w-xs text-xs leading-5 text-[#8b93a7]">
+                                Pay with Qi — Quai&apos;s UTXO ledger. Reserve this
+                                order&apos;s one-time receive address, then send the
+                                exact qits from the Qi tab.
+                              </p>
+                              {qiError && (
+                                <p className="max-w-xs text-xs leading-5 text-red-400">
+                                  {qiError}
+                                </p>
+                              )}
+                              <button
+                                onClick={() => void reserveQi()}
+                                disabled={qiBusy}
+                                className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#ddff56] py-3 text-sm font-semibold text-[#061018] transition hover:bg-[#ddff56]/90 disabled:opacity-60"
+                              >
+                                {qiBusy ? (
+                                  <Loader2 size={15} className="animate-spin" />
+                                ) : (
+                                  <Coins size={15} />
+                                )}
+                                {qiBusy ? "Reserving address…" : "Get Qi address"}
+                              </button>
+                            </div>
+                          )}
+                        </div>
                       </div>
                     ) : (
                       <>
@@ -605,6 +691,16 @@ export default function PayPage({ params }: { params: Params }) {
                             >
                               <Wallet size={15} />
                               Browser Wallet
+                            </button>
+                            <button
+                              disabled
+                              className="flex flex-1 items-center justify-center gap-2 py-3 text-sm font-medium text-[#4f5868] opacity-50 cursor-not-allowed select-none"
+                            >
+                              <Coins size={15} />
+                              Pay with Qi
+                              <span className="ml-1 text-[10px] uppercase tracking-wider text-[#8b93a7]">
+                                Coming soon
+                              </span>
                             </button>
                           </div>
 
@@ -705,6 +801,19 @@ export default function PayPage({ params }: { params: Params }) {
                               </div>
                             </div>
                           )}
+
+                          {payTab === "qi" && (
+                            <div className="p-6 flex flex-col items-center gap-3 text-center opacity-50 pointer-events-none select-none">
+                              <Coins size={28} className="text-[#4f5868]" />
+                              <p className="max-w-xs text-xs leading-5 text-[#8b93a7]">
+                                Qi payments are coming soon — Quai&apos;s native UTXO
+                                settlement will be available here.
+                              </p>
+                              <span className="inline-block rounded-full border border-white/10 bg-[#171717] px-3 py-1 text-[10px] uppercase tracking-wider text-[#8b93a7]">
+                                Coming soon
+                              </span>
+                            </div>
+                          )}
                         </div>
 
                         {/* Security badges */}
@@ -757,6 +866,30 @@ export default function PayPage({ params }: { params: Params }) {
               </>
             )}
 
+          {/* Qi settled */}
+          {stage.name === "qiSettled" && qiClaim && link && (
+            <div className="py-10 text-center">
+              <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full border border-[#ddff56]/25 bg-[#ddff56]/10 text-[#ddff56]">
+                <Coins size={24} />
+              </div>
+              <p className="mt-4 text-sm font-medium text-white">
+                Qi payment received
+              </p>
+              <p className="mx-auto mt-2 max-w-sm text-xs leading-5 text-[#8b93a7]">
+                Your payment of{" "}
+                <span className="text-white">{formatQits(qiClaim.qi.qits)}</span> was
+                detected on the Qi network.{" "}
+                {link.shopName || link.merchantName} will be notified
+                automatically.
+              </p>
+              <div className="mt-6 space-y-2 rounded-2xl border border-white/7 bg-[#171717] p-4 text-left font-mono text-xs text-[#8b93a7]">
+                <p className="break-all">
+                  order: <span className="text-white">{qiClaim.orderId.slice(0, 20)}…</span>
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* Error */}
           {stage.name === "error" && (
             <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-600">
@@ -800,7 +933,7 @@ export default function PayPage({ params }: { params: Params }) {
         </div>
 
         <p className="mt-5 text-center text-xs text-[#4f5868]">
-          Checkout powered by TripplePay || Marchants — payment goes directly to the
+          Checkout powered by TripplePay || Merchants — payment goes directly to the
           merchant&apos;s wallet.
         </p>
       </div>

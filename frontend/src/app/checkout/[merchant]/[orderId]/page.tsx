@@ -5,6 +5,7 @@ import {
   ArrowLeft,
   Check,
   Clock,
+  Coins,
   Download,
   Loader2,
   LockKeyhole,
@@ -29,6 +30,7 @@ import {
   waitForOnChainConfirmation,
   submitPaymentMeta,
   type OnChainOrder,
+  type QiOrder,
 } from "@/lib/payment";
 import { currencyDecimals, currencySymbol } from "@/lib/currencies";
 import {
@@ -45,6 +47,8 @@ import {
   storeWalletId,
 } from "@/lib/wallets";
 import { parseError, rawErrorText } from "@/lib/utils";
+import { formatQits } from "@/lib/qi";
+import { QiPaymentPanel } from "@/components/checkout/qi-payment-panel";
 
 type Params = Promise<{ merchant: string; orderId: string }>;
 
@@ -53,6 +57,7 @@ type Stage =
   | { name: "notfound" }
   | { name: "expired" }
   | { name: "settled" }
+  | { name: "qiSettled" }
   | { name: "ready" }
   | { name: "paying"; step: string }
   | { name: "awaiting"; status: string }
@@ -87,7 +92,8 @@ export default function CheckoutPage({ params }: { params: Params }) {
     }
   };
   const [order, setOrder] = useState<OnChainOrder | null>(null);
-  const [payTab, setPayTab] = useState<"blip" | "wallet">("wallet");
+  const [qiOrder, setQiOrder] = useState<QiOrder | null>(null);
+  const [payTab, setPayTab] = useState<"blip" | "wallet" | "qi">("wallet");
   const [connected, setConnected] = useState<string | null>(null);
   const [needsFund, setNeedsFund] = useState(false);
   const [errorDetail, setErrorDetail] = useState<string | null>(null);
@@ -152,14 +158,15 @@ export default function CheckoutPage({ params }: { params: Params }) {
       setMerchant(m);
       setOrderId(id);
       try {
-        let o = await getOrderOnChain(m, id);
-        if (!o?.exists) {
-          const status = await fetchOrderStatus(m, id);
-          if (!status) {
-            setStage({ name: "notfound" });
-            return;
-          }
-          o = {
+        // Status (backend) is fetched alongside the on-chain order: it carries the Qi receive
+        // info and doubles as the fallback when the RPC is unreachable.
+        const [o, status] = await Promise.all([
+          getOrderOnChain(m, id).catch(() => null),
+          fetchOrderStatus(m, id).catch(() => null),
+        ]);
+        let resolved = o;
+        if (!resolved?.exists && status) {
+          resolved = {
             merchant: m,
             settled: status.settled,
             exists: true,
@@ -173,16 +180,20 @@ export default function CheckoutPage({ params }: { params: Params }) {
             nonce: 0n,
           };
         }
-        if (!o) {
+        if (!resolved) {
           setStage({ name: "notfound" });
           return;
         }
-        setOrder(o);
-        if (!o.exists) {
+        setOrder(resolved);
+        const q = status?.qi ?? null;
+        setQiOrder(q);
+        if (!resolved.exists) {
           setStage({ name: "notfound" });
-        } else if (o.settled) {
+        } else if (resolved.settled) {
           setStage({ name: "settled" });
-        } else if (isExpired(o.expiry)) {
+        } else if (resolved.exists && q?.settled) {
+          setStage({ name: "qiSettled" });
+        } else if (isExpired(resolved.expiry)) {
           setStage({ name: "expired" });
         } else {
           setStage({ name: "ready" });
@@ -195,6 +206,25 @@ export default function CheckoutPage({ params }: { params: Params }) {
       cancelled = true;
     };
   }, [params]);
+
+  // Qi is a UTXO ledger with no contract events — settlement is detected by the backend watching
+  // the order's one-time receive address. Poll the digest for the settled flag while paying.
+  useEffect(() => {
+    if (stage.name !== "ready" || !order || !qiOrder || qiOrder.settled) return;
+    const timer = setInterval(() => {
+      void (async () => {
+        try {
+          const s = await fetchOrderStatus(order.merchant, orderId);
+          const q = s?.qi ?? null;
+          setQiOrder(q);
+          if (q?.settled) setStage({ name: "qiSettled" });
+        } catch {
+          /* transient network hiccup — keep polling */
+        }
+      })();
+    }, 6000);
+    return () => clearInterval(timer);
+  }, [stage.name, order, orderId, qiOrder]);
 
   const isNative = (o: OnChainOrder) =>
     o.token.toLowerCase() === ZERO_ADDRESS.toLowerCase();
@@ -336,7 +366,7 @@ export default function CheckoutPage({ params }: { params: Params }) {
               className="inline-flex w-full items-center justify-center gap-2 text-sm text-[#8b93a7] py-2 transition hover:text-white"
             >
               <ArrowLeft size={15} />
-              Return to TripplePay || Marchants
+              Return to TripplePay || Merchants
             </Link>
           </div>
           <div className="absolute left-[-9999px] top-0 opacity-0 pointer-events-none">
@@ -364,7 +394,7 @@ export default function CheckoutPage({ params }: { params: Params }) {
           className="inline-flex items-center gap-2 text-sm text-[#8b93a7] hover:text-[#061018]"
         >
           <ArrowLeft size={15} />
-          TripplePay || Marchants
+          TripplePay || Merchants
         </Link>
 
         <div className="mt-10 rounded-3xl border border-white/7 bg-[#171717] p-6 sm:p-8">
@@ -417,6 +447,22 @@ export default function CheckoutPage({ params }: { params: Params }) {
               <p className="mx-auto mt-2 max-w-sm text-xs leading-5 text-[#8b93a7]">
                 This order was settled. The merchant has been notified via
                 webhook.
+              </p>
+            </div>
+          )}
+
+          {stage.name === "qiSettled" && qiOrder && (
+            <div className="py-10 text-center">
+              <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full border border-[#ddff56]/25 bg-[#ddff56]/10 text-[#ddff56]">
+                <Coins size={24} />
+              </div>
+              <p className="mt-4 text-sm font-medium text-white">
+                Qi payment received
+              </p>
+              <p className="mx-auto mt-2 max-w-sm text-xs leading-5 text-[#8b93a7]">
+                Your payment of <span className="text-white">{formatQits(qiOrder.qits)}</span> was
+                detected on the Qi network. The merchant will be notified
+                automatically.
               </p>
             </div>
           )}
@@ -520,6 +566,16 @@ export default function CheckoutPage({ params }: { params: Params }) {
                           </button>
                         )}
                       </div>
+
+                      {qiOrder && !qiOrder.settled && (
+                        <div className="mt-5 border-t border-white/7 pt-5">
+                          <QiPaymentPanel
+                            address={qiOrder.address}
+                            qits={qiOrder.qits}
+                            orderId={orderId}
+                          />
+                        </div>
+                      )}
                     </div>
                   ) : (
                     <>
@@ -567,6 +623,16 @@ export default function CheckoutPage({ params }: { params: Params }) {
                           >
                             <Wallet size={15} />
                             Browser Wallet
+                          </button>
+                          <button
+                            disabled
+                            className="flex flex-1 items-center justify-center gap-2 py-3 text-sm font-medium text-[#4f5868] opacity-50 cursor-not-allowed select-none"
+                          >
+                            <Coins size={15} />
+                            Pay with Qi
+                            <span className="ml-1 text-[10px] uppercase tracking-wider text-[#8b93a7]">
+                              Coming soon
+                            </span>
                           </button>
                         </div>
 
@@ -659,6 +725,19 @@ export default function CheckoutPage({ params }: { params: Params }) {
                                 label="Connect wallet to pay"
                               />
                             )}
+                          </div>
+                        )}
+
+                        {payTab === "qi" && (
+                          <div className="p-6 flex flex-col items-center gap-3 text-center opacity-50 pointer-events-none select-none">
+                            <Coins size={28} className="text-[#4f5868]" />
+                            <p className="max-w-xs text-xs leading-5 text-[#8b93a7]">
+                              Qi payments are coming soon — Quai&apos;s native UTXO
+                              settlement will be available here.
+                            </p>
+                            <span className="inline-block rounded-full border border-white/10 bg-[#171717] px-3 py-1 text-[10px] uppercase tracking-wider text-[#8b93a7]">
+                              Coming soon
+                            </span>
                           </div>
                         )}
                       </div>
