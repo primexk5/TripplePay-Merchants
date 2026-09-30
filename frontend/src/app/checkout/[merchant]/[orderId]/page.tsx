@@ -11,8 +11,6 @@ import {
   Loader2,
   ShieldCheck,
   Smartphone,
-  Wallet,
-  ReceiptText,
 } from "lucide-react";
 import { PaymentMethodSelector } from "@/components/checkout/payment-method-selector";
 import { useEffect, useState, useRef } from "react";
@@ -629,7 +627,6 @@ export default function CheckoutPage({
                         <PaymentMethodSelector
                           payTab={payTab}
                           setPayTab={setPayTab}
-                          showQiComingSoon
                           chainKind={chain.kind}
                         />
 
@@ -728,15 +725,23 @@ export default function CheckoutPage({
                         )}
 
                         {payTab === "qi" && (
-                          <div className="p-6 flex flex-col items-center gap-3 text-center opacity-50 pointer-events-none select-none">
-                            <Coins size={28} className="text-[#4f5868]" />
-                            <p className="max-w-xs text-xs leading-5 text-[#8b93a7]">
-                              Qi payments are coming soon — Quai&apos;s native UTXO
-                              settlement will be available here.
-                            </p>
-                            <span className="inline-block rounded-full border border-white/10 bg-[#171717] px-3 py-1 text-[10px] uppercase tracking-wider text-[#8b93a7]">
-                              Coming soon
-                            </span>
+                          <div className="p-6">
+                            {qiOrder ? (
+                              <QiPaymentPanel
+                                address={qiOrder.address}
+                                qits={qiOrder.qits}
+                                orderId={orderId}
+                              />
+                            ) : (
+                              <div className="flex flex-col items-center gap-3 text-center">
+                                <Coins size={28} className="text-[#4f5868]" />
+                                <p className="max-w-xs text-xs leading-5 text-[#8b93a7]">
+                                  Qi payments aren&apos;t enabled for this
+                                  checkout — the merchant hasn&apos;t configured a
+                                  Qi wallet.
+                                </p>
+                              </div>
+                            )}
                           </div>
                         )}
                       </div>

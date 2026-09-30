@@ -121,6 +121,41 @@ const EnvSchema = z.object({
   // Force TLS for the Postgres connection (Railway requires it). Auto-detected from sslmode in
   // DATABASE_URL when present; set true explicitly if your URL omits it.
   DATABASE_SSL: boolish(false),
+
+  // --- e-commerce gateway (fiat-quoted prefilled orders for shop plugins) ---
+  // Live QUAI↔fiat rate feed used by POST /v1/gateway/orders. Points at a CoinGecko-style
+  // `simple/price` JSON (ids=quai-network, vs_currencies=usd,ngn). When unset (or on fetch
+  // failure) the fixed GATEWAY_FALLBACK_* rates are used; when neither exists the gateway rejects
+  // gateway orders with a clear "no rate available" error.
+  GATEWAY_RATE_URL: z.string().url().optional(),
+  // How long a fetched rate is cached before the next gateway quote re-fetches it.
+  GATEWAY_RATE_TTL_MS: z.coerce.number().int().positive().default(60_000),
+  GATEWAY_FALLBACK_USD_PER_QUAI: z
+    .string()
+    .optional()
+    .transform((v) => (v && v.trim() !== '' ? Number(v) : undefined))
+    .pipe(z.number().positive().optional()),
+  GATEWAY_FALLBACK_NGN_PER_QUAI: z
+    .string()
+    .optional()
+    .transform((v) => (v && v.trim() !== '' ? Number(v) : undefined))
+    .pipe(z.number().positive().optional()),
+  // Default per-merchant markup applied when a merchant hasn't set settings.quaiMarkupBps.
+  GATEWAY_MARKUP_BPS_DEFAULT: z.coerce.number().int().min(0).max(10_000).default(0),
+  // Public origin of the payment page (e.g. https://pay.example.com). Used to build the
+  // checkoutUrl a gateway order returns. When unset the backend derives it from the request
+  // (protocol + host) — set it explicitly behind a proxy/NAT so links stay correct.
+  PUBLIC_BASE_URL: z.string().url().optional(),
+
+  // --- relayer-funded EVM order registration --------------------------------------------
+  // When set, the backend can register EVM orders on a merchant's behalf (paid gas from this
+  // key) via PayWithQuai.registerOrderFor, so a plugin merchant needs no QUAI gas balance in
+  // their payout wallet. Requires a PayWithQuai upgrade that exposes registerOrderFor.
+  RELAYER_PRIVATE_KEY: z
+    .string()
+    .regex(/^0x[0-9a-fA-F]{64}$/, 'RELAYER_PRIVATE_KEY must be a 32-byte hex private key')
+    .optional(),
+
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
   LOG_PRETTY: boolish(false),
 });

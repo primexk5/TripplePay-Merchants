@@ -10,4 +10,5 @@ export const PAYWITHQUAI_ABI = [
   'function getOrder(address merchant, bytes32 orderId) view returns (tuple(address merchant, bool settled, bool exists, uint16 feeBps, address token, uint256 amount, uint256 expiry, address feeRecipient, uint256 settledAt, address expectedPayer, uint64 nonce))',
   'function feeBps() view returns (uint96)',
   'function feeRecipient() view returns (address)',
+  'function registerOrderFor(address merchant, bytes32 orderId, address token, uint256 amount, uint256 expiry) returns (uint64 nonce)',
 ] as const;

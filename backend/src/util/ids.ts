@@ -14,6 +14,12 @@ export function newWebhookSecret(): string {
   return `whsec_${token(24)}`;
 }
 
+/** A merchant server-to-server API key. Shown exactly once at issuance; the merchant's store
+ *  backend sends it as `X-Merchant-Key` on gateway calls. */
+export function newApiKey(): string {
+  return `qmkey_${token(24)}`;
+}
+
 const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
 /** 8-character base62 slug for short payment-link URLs (~218 trillion combinations). */

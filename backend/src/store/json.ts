@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSync, closeSync, fsyncSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Store } from './index.js';
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey } from '../types.js';
 import { log } from '../logger.js';
 
 const logger = log('store');
@@ -16,6 +16,7 @@ interface FileShape {
   claims: Record<string, LinkClaim[]>;  // key: slug — array of all claims for that link
   orderMeta: Record<string, OrderMeta>; // key: lowercased orderId
   qiOrders: Record<string, QiOrder>;    // key: lowercased orderId
+  apiKeys: Record<string, MerchantApiKey>; // key: the API key bearer secret
 }
 
 /** Case-insensitive lookup key binding a delivery to its (merchant, orderId). */
@@ -81,7 +82,7 @@ export class JsonStore implements Store {
   }
 
   private read(): FileShape {
-    if (!existsSync(this.path)) return { cursors: {}, merchants: {}, deliveries: {}, sessions: {}, nonces: {}, links: {}, claims: {}, orderMeta: {}, qiOrders: {} };
+    if (!existsSync(this.path)) return { cursors: {}, merchants: {}, deliveries: {}, sessions: {}, nonces: {}, links: {}, claims: {}, orderMeta: {}, qiOrders: {}, apiKeys: {} };
     try {
       const parsed = JSON.parse(readFileSync(this.path, 'utf8')) as {
         cursor?: number | null;
@@ -123,6 +124,7 @@ export class JsonStore implements Store {
         claims: (parsed as Partial<FileShape>).claims ?? {},
         orderMeta,
         qiOrders: (parsed as Partial<FileShape>).qiOrders ?? {},
+        apiKeys: (parsed as Partial<FileShape>).apiKeys ?? {},
       };
     } catch (err) {
       throw new Error(`Failed to read store at ${this.path}: ${(err as Error).message}`);
@@ -196,6 +198,33 @@ export class JsonStore implements Store {
 
   async listMerchants(): Promise<Merchant[]> {
     return Object.values(this.data.merchants);
+  }
+
+  // --- merchant API keys ---
+
+  async createMerchantApiKey(k: MerchantApiKey): Promise<void> {
+    this.data.apiKeys[k.key] = { ...k, merchantAddress: k.merchantAddress.toLowerCase() };
+    this.flush();
+  }
+
+  async getMerchantByApiKey(key: string): Promise<Merchant | undefined> {
+    const rec = this.data.apiKeys[key];
+    if (!rec) return undefined;
+    return this.data.merchants[rec.merchantAddress];
+  }
+
+  async listMerchantApiKeys(merchantAddress: string): Promise<MerchantApiKey[]> {
+    const addr = merchantAddress.toLowerCase();
+    return Object.values(this.data.apiKeys)
+      .filter((k) => k.merchantAddress === addr)
+      .sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  async revokeMerchantApiKey(key: string): Promise<void> {
+    if (Object.hasOwn(this.data.apiKeys, key)) {
+      delete this.data.apiKeys[key];
+      this.flush();
+    }
   }
 
   async insertDeliveryIfAbsent(d: WebhookDelivery): Promise<boolean> {
@@ -427,7 +456,15 @@ export class JsonStore implements Store {
   // --- order metadata ---
 
   async saveOrderMeta(meta: OrderMeta): Promise<void> {
-    this.data.orderMeta[meta.orderId] = meta;
+    const key = meta.orderId.toLowerCase();
+    const existing = this.data.orderMeta[key];
+    // Gateway order creation writes the merchant's shop `reference`; later writes (checkout name /
+    // link slug) don't carry one — preserve the reference rather than silently dropping it.
+    if (existing && existing.reference !== undefined && meta.reference === undefined) {
+      this.data.orderMeta[key] = { ...meta, reference: existing.reference };
+    } else {
+      this.data.orderMeta[key] = { ...meta, orderId: key };
+    }
     this.flush();
   }
 
@@ -454,6 +491,13 @@ export class JsonStore implements Store {
 
   async listQiOrders(): Promise<QiOrder[]> {
     return Object.values(this.data.qiOrders);
+  }
+
+  async listQiOrdersByMerchant(merchantAddress: string): Promise<QiOrder[]> {
+    const addr = merchantAddress.toLowerCase();
+    return Object.values(this.data.qiOrders)
+      .filter((o) => o.merchantAddress === addr)
+      .sort((a, b) => b.createdAt - a.createdAt);
   }
 
   async markQiOrderSettled(orderId: string, receivedQits: string, txHashes: string[]): Promise<QiOrder | undefined> {

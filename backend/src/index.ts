@@ -84,7 +84,9 @@ async function main(): Promise<void> {
   // QiIndexer.start() is itself already a no-op when qi.enabled is false, so there is nothing
   // chain-specific to gate here.
   const qi = new QiService(cfg, store);
-  const qiIndexer = new QiIndexer(qi, store, cfg);
+  // Qi settles on the default (Quai) chain — pass its chainId so Qi payloads/deliveries are
+  // labeled the same way the on-chain indexers label theirs.
+  const qiIndexer = new QiIndexer(qi, store, cfg, registry.default.config.chainId);
 
   const app = createServer(store, registry.default.client, cfg, qi, registry, indexers);
   const server: Server = app.listen(cfg.PORT, () => boot.info({ port: cfg.PORT }, 'HTTP API listening'));

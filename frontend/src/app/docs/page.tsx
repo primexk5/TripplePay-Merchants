@@ -88,7 +88,7 @@ await window.ethereum.request({
     chainName: 'Quai Network (Mainnet)',
     nativeCurrency: { name: 'Quai', symbol: 'QUAI', decimals: 18 },
     rpcUrls: ['https://rpc.quai.network'],
-    blockExplorerUrls: ['https://quaiscan.io'],
+    blockExplorerUrls: ['https://explorer.qu.ai'],
   }],
 });`;
 

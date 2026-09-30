@@ -12,7 +12,6 @@ import {
   ShieldCheck,
   Smartphone,
   Users,
-  Wallet,
 } from "lucide-react";
 import { useEffect, useState, useRef, useCallback } from "react";
 import { PaymentMethodSelector } from "@/components/checkout/payment-method-selector";
@@ -634,14 +633,16 @@ export default function PayPage({ params }: { params: Params }) {
                                 </p>
                               )}
                               <button
-                                disabled
-                                className="flex w-full items-center justify-center gap-2 rounded-xl bg-white/5 py-3 text-sm font-semibold text-[#4f5868] opacity-50 cursor-not-allowed select-none"
+                                onClick={() => void reserveQi()}
+                                disabled={qiBusy}
+                                className="flex w-full items-center justify-center gap-2 rounded-xl bg-white/5 py-3 text-sm font-semibold text-white transition hover:bg-white/10 disabled:opacity-60"
                               >
-                                <Coins size={15} />
-                                Get Qi address
-                                <span className="ml-1 text-[10px] uppercase tracking-wider text-[#8b93a7]">
-                                  Coming soon
-                                </span>
+                                {qiBusy ? (
+                                  <Loader2 size={15} className="animate-spin" />
+                                ) : (
+                                  <Coins size={15} />
+                                )}
+                                {qiBusy ? "Reserving…" : "Get Qi address"}
                               </button>
                             </div>
                           )}
@@ -675,7 +676,6 @@ export default function PayPage({ params }: { params: Params }) {
                           <PaymentMethodSelector
                             payTab={payTab}
                             setPayTab={setPayTab}
-                            showQiComingSoon
                             chainKind={chain.kind}
                           />
 
@@ -779,15 +779,43 @@ export default function PayPage({ params }: { params: Params }) {
                           )}
 
                           {payTab === "qi" && (
-                            <div className="p-6 flex flex-col items-center gap-3 text-center opacity-50 pointer-events-none select-none">
-                              <Coins size={28} className="text-[#4f5868]" />
-                              <p className="max-w-xs text-xs leading-5 text-[#8b93a7]">
-                                Qi payments are coming soon — Quai&apos;s native UTXO
-                                settlement will be available here.
-                              </p>
-                              <span className="inline-block rounded-full border border-white/10 bg-[#171717] px-3 py-1 text-[10px] uppercase tracking-wider text-[#8b93a7]">
-                                Coming soon
-                              </span>
+                            <div className="p-6">
+                              {qiClaim ? (
+                                <QiPaymentPanel
+                                  address={qiClaim.qi.address}
+                                  qits={qiClaim.qi.qits}
+                                  orderId={qiClaim.orderId}
+                                  settled={qiClaim.qi.settled}
+                                />
+                              ) : (
+                                <div className="flex flex-col items-center gap-3 text-center">
+                                  <p className="max-w-xs text-xs leading-5 text-[#8b93a7]">
+                                    Pay with Qi — Quai&apos;s UTXO ledger. Reserve
+                                    this order&apos;s one-time receive address, then
+                                    send the exact qits from the Qi tab of your
+                                    wallet.
+                                  </p>
+                                  {qiError && (
+                                    <p className="max-w-xs text-xs leading-5 text-red-400">
+                                      {qiError}
+                                    </p>
+                                  )}
+                                  <button
+                                    onClick={() => void reserveQi()}
+                                    disabled={qiBusy}
+                                    className="flex w-full items-center justify-center gap-2 rounded-xl bg-white/5 py-3 text-sm font-semibold text-white transition hover:bg-white/10 disabled:opacity-60"
+                                  >
+                                    {qiBusy ? (
+                                      <Loader2 size={15} className="animate-spin" />
+                                    ) : (
+                                      <Coins size={15} />
+                                    )}
+                                    {qiBusy
+                                      ? "Reserving…"
+                                      : "Get Qi address"}
+                                  </button>
+                                </div>
+                              )}
                             </div>
                           )}
                         </div>

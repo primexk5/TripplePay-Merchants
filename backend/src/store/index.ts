@@ -1,4 +1,4 @@
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey } from '../types.js';
 
 /**
  * Persistence boundary for the relayer. The default local implementation ({@link JsonStore}) is a
@@ -19,6 +19,13 @@ export interface Store {
   getMerchantByAddress(address: string): Promise<Merchant | undefined>;
   getMerchantById(merchantId: string): Promise<Merchant | undefined>;
   listMerchants(): Promise<Merchant[]>;
+
+  // --- merchant API keys (server-to-server gateway auth) ---
+  createMerchantApiKey(k: MerchantApiKey): Promise<void>;
+  /** Resolve the merchant owning an API key (surfaces the key's lastUsedAt) or undefined. */
+  getMerchantByApiKey(key: string): Promise<Merchant | undefined>;
+  listMerchantApiKeys(merchantAddress: string): Promise<MerchantApiKey[]>;
+  revokeMerchantApiKey(key: string): Promise<void>;
 
   // --- webhook deliveries (id == paymentId; also the payment idempotency key) ---
   /** Insert a delivery only if its id is new. Returns true if inserted, false if it already existed. */
@@ -82,6 +89,8 @@ export interface Store {
   insertQiOrder(order: QiOrder): Promise<boolean>;
   getQiOrder(orderId: string): Promise<QiOrder | undefined>;
   listQiOrders(): Promise<QiOrder[]>;
+  /** Qi orders for a specific merchant payout address, newest first. */
+  listQiOrdersByMerchant(merchantAddress: string): Promise<QiOrder[]>;
   /** Record that the order's receive address has accumulated at least its required qits. Returns
    *  the updated order, or undefined if the orderId doesn't exist. */
   markQiOrderSettled(orderId: string, receivedQits: string, txHashes: string[]): Promise<QiOrder | undefined>;

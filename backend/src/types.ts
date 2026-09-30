@@ -26,6 +26,14 @@ export function paymentId(e: Pick<PaymentEvent, 'txHash' | 'logIndex'>): string 
   return `${e.txHash.toLowerCase()}:${e.logIndex}`;
 }
 
+/** Per-merchant gateway pricing: the markup applied over the live QUAI market rate at quote time
+ *  (in basis points) and the fiat currencies the shop quotes in. Stored on the Merchant record;
+ *  absent → use the gateway defaults (GATEWAY_MARKUP_BPS_DEFAULT, ['USD','NGN']). */
+export interface MerchantSettings {
+  quaiMarkupBps: number; // 0..10000; +100 bps ≈ +1% over the market rate
+  fiatCurrencies: string[]; // e.g. ['USD','NGN'] — lowercase-when-compared
+}
+
 export interface Merchant {
   merchantId: string; // platform id, e.g. "mch_ab12..."
   address: string; // lowercased on-chain payout address (the map key)
@@ -34,6 +42,17 @@ export interface Merchant {
   webhookSecret: string; // used to HMAC-sign deliveries to this merchant
   active: boolean;
   createdAt: number;
+  settings?: MerchantSettings;
+}
+
+/** A server-to-server API key a merchant issues for their store backend (plugins). The key is a
+ *  bearer secret (`X-Merchant-Key`) that resolves to the owning merchant, exactly like a session. */
+export interface MerchantApiKey {
+  key: string; // e.g. "qmkey_..." — stored plaintext (see JsonStore file-permission note)
+  merchantAddress: string; // lowercased owner
+  label: string;
+  createdAt: number; // unix ms
+  lastUsedAt: number; // unix ms, best-effort
 }
 
 /** An opaque bearer-token session issued after a wallet-signature login. */
@@ -62,15 +81,27 @@ export interface WebhookPayload {
     merchant: string; // on-chain address
     orderId: string; // bytes32 hex
     payer: string;
-    token: string; // NATIVE_TOKEN for native QUAI
-    amount: string; // gross amount the payer sent, smallest unit, decimal string
-    feeBps: number; // platform fee rate locked at order registration (basis points)
-    fee: string; // platform fee withheld = floor(amount * feeBps / 10000), smallest unit, decimal string
-    net: string; // amount - fee, what the merchant actually received, smallest unit, decimal string
-    txHash: string;
-    blockNumber: number;
-    timestamp: number; // on-chain event timestamp
-    nonce: number; // per-merchant order nonce; distinguishes order-id reuse after a purge
+    token: string; // NATIVE_TOKEN for native QUAI; "qi" for Qi UTXO settlements
+    amount: string; // gross amount: smallest-unit for on-chain, qits for Qi
+    feeBps: number; // platform fee rate; 0 for Qi (no fee model yet)
+    fee: string; // platform fee; "0" for Qi
+    net: string; // amount - fee; equals amount for Qi
+    txHash: string; // on-chain tx hash; first outpoint tx hash for Qi
+    blockNumber: number; // 0 for Qi (no EVM block)
+    timestamp: number; // on-chain event timestamp; settledAt (unix ms) for Qi
+    nonce: number; // per-merchant order nonce; 0 for Qi
+    /** Discriminator: which ledger settled this payment. When absent, assume 'quai'|'token' (pre-Qi payloads). */
+    asset?: 'quai' | 'token' | 'qi';
+    /** Present only when asset === 'qi'. Full UTXO settlement context for the merchant. */
+    qi?: {
+      address: string;  // one-time receive address derived for the order
+      qits: string;     // required amount (decimal qits)
+      receivedQits: string; // total value seen on the address (decimal qits)
+      txHashes: string[]; // outpoint tx hashes counted toward settlement
+    };
+    /** Gateway links only: the merchant's own shop order reference tied to this order. Lets a
+     *  plugin map a webhook straight to its order — no need to remember orderId ↔ shop order. */
+    reference?: string;
   };
 }
 
@@ -93,6 +124,10 @@ export interface PaymentLink {
   multiPay: boolean;          // true = many customers can pay
   /** Pre-registered orderIds available for customers to claim (multiPay only). */
   orderPool: string[];        // bytes32 hex strings
+  /** Gateway (shop-plugin) links only: the fixed orderId minted at creation time. Single-pay
+   *  prefilled orders that never consume a pool slot — Qi is derived up front, and the checkout
+   *  resolves the pre-minted Qi order instead of popping the pool. */
+  gatewayOrderId?: string;
   createdAt: number;          // unix ms
 }
 
@@ -138,6 +173,7 @@ export interface OrderMeta {
   customerName?: string;      // optional display name the payer typed
   source: OrderSource;        // 'link' = paid a payment-link page, 'checkout' = merchant checkout/API order page
   slug?: string;              // set when source === 'link'
+  reference?: string;         // gateway links: the shop's order reference (merchant's own order #)
   createdAt: number;
 }
 

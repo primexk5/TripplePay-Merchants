@@ -4,13 +4,12 @@ import { Smartphone, Wallet, Coins, ChevronDown } from "lucide-react";
 interface PaymentMethodSelectorProps {
   payTab: "blip" | "wallet" | "qi";
   setPayTab: (tab: "blip" | "wallet" | "qi") => void;
-  showQiComingSoon?: boolean;
   /** Blip and Qi are Quai-only — omit or pass "quai" for the unchanged default behaviour; pass
    *  "evm" to show only the browser-wallet option. */
   chainKind?: "quai" | "evm";
 }
 
-export function PaymentMethodSelector({ payTab, setPayTab, showQiComingSoon, chainKind = "quai" }: PaymentMethodSelectorProps) {
+export function PaymentMethodSelector({ payTab, setPayTab, chainKind = "quai" }: PaymentMethodSelectorProps) {
   const [isOpen, setIsOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const showBlipAndQi = chainKind === "quai";
@@ -28,12 +27,14 @@ export function PaymentMethodSelector({ payTab, setPayTab, showQiComingSoon, cha
   const getLabel = (val: string) => {
     if (val === "blip") return "Pay with Blip";
     if (val === "wallet") return "Browser Wallet";
+    if (val === "qi") return "Pay with Qi";
     return "";
   };
 
   const getIcon = (val: string) => {
     if (val === "blip") return <Smartphone size={15} />;
     if (val === "wallet") return <Wallet size={15} />;
+    if (val === "qi") return <Coins size={15} />;
     return null;
   };
 
@@ -80,15 +81,20 @@ export function PaymentMethodSelector({ payTab, setPayTab, showQiComingSoon, cha
             Browser Wallet
           </button>
           
-          {showBlipAndQi && showQiComingSoon && (
+          {showBlipAndQi && (
             <button
-              disabled
-              className="flex w-full items-center gap-2 px-4 py-3 text-sm font-medium text-[#4f5868] opacity-50 cursor-not-allowed select-none border-t border-white/7"
+              onClick={() => {
+                setPayTab("qi");
+                setIsOpen(false);
+              }}
+              className={`flex w-full items-center gap-2 border-t border-white/7 px-4 py-3 text-sm font-medium transition ${
+                payTab === "qi" ? "bg-white/10 text-white" : "text-[#8b93a7] hover:bg-white/5 hover:text-white"
+              }`}
             >
               <Coins size={15} />
               Pay with Qi
               <span className="ml-auto text-[10px] uppercase tracking-wider text-[#8b93a7]">
-                Coming soon
+                Qits
               </span>
             </button>
           )}
