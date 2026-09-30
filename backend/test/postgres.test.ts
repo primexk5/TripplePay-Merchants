@@ -25,6 +25,7 @@ const merchant = (over: Partial<Merchant> = {}): Merchant => ({
 
 const delivery = (id: string, over: Partial<WebhookDelivery> = {}): WebhookDelivery => ({
   id,
+  chainId: 9,
   merchantId: 'mch_1',
   url: 'https://example.test/webhook',
   payload: {
@@ -33,6 +34,7 @@ const delivery = (id: string, over: Partial<WebhookDelivery> = {}): WebhookDeliv
     created: 1,
     data: {
       merchantId: 'mch_1',
+      chainId: 9,
       merchant: '0x00000000000000000000000000000000000000A1',
       orderId: '0x' + '11'.repeat(32),
       payer: '0x00000000000000000000000000000000000000B2',
@@ -58,6 +60,7 @@ const delivery = (id: string, over: Partial<WebhookDelivery> = {}): WebhookDeliv
 
 const link = (over: Partial<PaymentLink> = {}): PaymentLink => ({
   slug: 'abc12345',
+  chainId: 9,
   merchantAddress: merchant().address,
   merchantId: 'mch_1',
   merchantName: 'Acme',

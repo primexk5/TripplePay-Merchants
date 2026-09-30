@@ -22,7 +22,15 @@ const logger = log('store:postgres');
 export class PostgresStore implements Store {
   readonly pool: Pool;
 
-  constructor(connectionString: string, options: { ssl?: boolean } = {}) {
+  /** `defaultChainId`: what a pre-multi-chain row (link/order_meta with a NULL chain_id, or a
+   *  delivery whose stored payload predates chainId) is read back as. Optional so existing
+   *  `new PostgresStore(url, opts)` call sites keep working unchanged; production always passes
+   *  the real default chain's chainId (see index.ts). */
+  constructor(
+    connectionString: string,
+    options: { ssl?: boolean } = {},
+    private readonly defaultChainId: number = 9,
+  ) {
     // node-postgres does NOT parse `sslmode` from the connection string itself, and Railway
     // requires TLS. Honor an explicit flag, else fall back to whatever sslmode the URL declares.
     const url = new URL(connectionString);
@@ -126,6 +134,12 @@ export class PostgresStore implements Store {
       );
       CREATE INDEX IF NOT EXISTS order_meta_merchant ON order_meta (merchant_address, created_at DESC);
 
+      -- Multi-chain migration (idempotent, safe to run every boot): a nullable chain_id, backfilled
+      -- below for any pre-existing rows and indexed for per-chain queries. Never touches any other
+      -- column, and never drops/recreates the table — existing data survives unchanged.
+      ALTER TABLE links ADD COLUMN IF NOT EXISTS chain_id BIGINT;
+      ALTER TABLE order_meta ADD COLUMN IF NOT EXISTS chain_id BIGINT;
+
       CREATE TABLE IF NOT EXISTS qi_orders (
         order_id         TEXT PRIMARY KEY,
         merchant_address TEXT NOT NULL,
@@ -140,6 +154,14 @@ export class PostgresStore implements Store {
       -- For the Qi indexer sweep: pending (unsettled) orders, oldest first.
       CREATE INDEX IF NOT EXISTS qi_orders_pending ON qi_orders (settled, created_at);
     `);
+
+    // Backfill + index chain_id (parameterized — can't live in the template literal above).
+    // WHERE chain_id IS NULL makes this a no-op on every boot after the first, so re-running it
+    // is always safe and never overwrites a chain_id a caller has already set.
+    await this.pool.query('UPDATE links SET chain_id = $1 WHERE chain_id IS NULL', [this.defaultChainId]);
+    await this.pool.query('UPDATE order_meta SET chain_id = $1 WHERE chain_id IS NULL', [this.defaultChainId]);
+    await this.pool.query('CREATE INDEX IF NOT EXISTS links_chain ON links (chain_id)');
+    await this.pool.query('CREATE INDEX IF NOT EXISTS order_meta_chain ON order_meta (chain_id)');
   }
 
   // --- indexer cursor ---
@@ -219,7 +241,7 @@ export class PostgresStore implements Store {
 
   async getDelivery(id: string): Promise<WebhookDelivery | undefined> {
     const { rows } = await this.pool.query('SELECT * FROM deliveries WHERE id = $1', [id]);
-    return rows.length ? mapDelivery(rows[0]!) : undefined;
+    return rows.length ? mapDelivery(rows[0]!, this.defaultChainId) : undefined;
   }
 
   async getDeliveryByOrder(merchant: string, orderId: string): Promise<WebhookDelivery | undefined> {
@@ -230,7 +252,7 @@ export class PostgresStore implements Store {
        LIMIT 1`,
       [merchant.toLowerCase(), orderId.toLowerCase()],
     );
-    return rows.length ? mapDelivery(rows[0]!) : undefined;
+    return rows.length ? mapDelivery(rows[0]!, this.defaultChainId) : undefined;
   }
 
   async updateDelivery(d: WebhookDelivery): Promise<void> {
@@ -326,7 +348,7 @@ export class PostgresStore implements Store {
        LIMIT $2`,
       [now, limit],
     );
-    return rows.map(mapDelivery);
+    return rows.map((r) => mapDelivery(r, this.defaultChainId));
   }
 
   async listDeliveries(limit: number): Promise<WebhookDelivery[]> {
@@ -334,7 +356,7 @@ export class PostgresStore implements Store {
       'SELECT * FROM deliveries ORDER BY created_at DESC, id LIMIT $1',
       [limit],
     );
-    return rows.map(mapDelivery);
+    return rows.map((r) => mapDelivery(r, this.defaultChainId));
   }
 
   // --- auth sessions ---
@@ -404,8 +426,8 @@ export class PostgresStore implements Store {
   async upsertLink(link: PaymentLink): Promise<void> {
     await this.pool.query(
       `INSERT INTO links (slug, merchant_address, merchant_id, merchant_name, shop_name, token_address,
-                          amount, amount_display, symbol, expiry_duration_secs, multi_pay, order_pool, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                          amount, amount_display, symbol, expiry_duration_secs, multi_pay, order_pool, created_at, chain_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        ON CONFLICT (slug) DO UPDATE SET
          merchant_address = EXCLUDED.merchant_address,
          merchant_id = EXCLUDED.merchant_id,
@@ -418,7 +440,8 @@ export class PostgresStore implements Store {
          expiry_duration_secs = EXCLUDED.expiry_duration_secs,
          multi_pay = EXCLUDED.multi_pay,
          order_pool = EXCLUDED.order_pool,
-         created_at = EXCLUDED.created_at`,
+         created_at = EXCLUDED.created_at,
+         chain_id = EXCLUDED.chain_id`,
       [
         link.slug,
         link.merchantAddress,
@@ -433,13 +456,14 @@ export class PostgresStore implements Store {
         link.multiPay,
         JSON.stringify(link.orderPool),
         link.createdAt,
+        link.chainId,
       ],
     );
   }
 
   async getLink(slug: string): Promise<PaymentLink | undefined> {
     const { rows } = await this.pool.query('SELECT * FROM links WHERE slug = $1', [slug]);
-    return rows.length ? mapLink(rows[0]!) : undefined;
+    return rows.length ? mapLink(rows[0]!, this.defaultChainId) : undefined;
   }
 
   async listLinksForMerchant(merchantAddress: string): Promise<PaymentLink[]> {
@@ -447,7 +471,7 @@ export class PostgresStore implements Store {
       'SELECT * FROM links WHERE merchant_address = $1 ORDER BY created_at DESC',
       [merchantAddress.toLowerCase()],
     );
-    return rows.map(mapLink);
+    return rows.map((r) => mapLink(r, this.defaultChainId));
   }
 
   /** Pop an orderId off the pool atomically: the row is locked (FOR UPDATE) so two concurrent
@@ -556,13 +580,22 @@ export class PostgresStore implements Store {
 
   async saveOrderMeta(meta: OrderMeta): Promise<void> {
     await this.pool.query(
-      `INSERT INTO order_meta (order_id, merchant_address, customer_name, source, slug, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO order_meta (order_id, merchant_address, customer_name, source, slug, created_at, chain_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (order_id) DO UPDATE SET
          customer_name = COALESCE(EXCLUDED.customer_name, order_meta.customer_name),
          source        = EXCLUDED.source,
-         slug          = EXCLUDED.slug`,
-      [meta.orderId.toLowerCase(), meta.merchantAddress.toLowerCase(), meta.customerName ?? null, meta.source, meta.slug ?? null, meta.createdAt],
+         slug          = EXCLUDED.slug,
+         chain_id      = EXCLUDED.chain_id`,
+      [
+        meta.orderId.toLowerCase(),
+        meta.merchantAddress.toLowerCase(),
+        meta.customerName ?? null,
+        meta.source,
+        meta.slug ?? null,
+        meta.createdAt,
+        meta.chainId,
+      ],
     );
   }
 
@@ -575,6 +608,7 @@ export class PostgresStore implements Store {
     const r = rows[0]!;
     return {
       orderId: r.order_id as string,
+      chainId: r.chain_id === null ? this.defaultChainId : toNum(r.chain_id),
       merchantAddress: r.merchant_address as string,
       customerName: (r.customer_name as string | null) ?? undefined,
       source: r.source as OrderMeta['source'],
@@ -679,12 +713,17 @@ function mapMerchant(row: Record<string, unknown>): Merchant {
   };
 }
 
-function mapDelivery(row: Record<string, unknown>): WebhookDelivery {
+// `deliveries` has no chain_id column (see init()'s migration comment) — the top-level
+// WebhookDelivery.chainId is derived from the payload's own (already-persisted) chainId instead,
+// falling back to defaultChainId for a delivery whose payload predates multi-chain support.
+function mapDelivery(row: Record<string, unknown>, defaultChainId: number): WebhookDelivery {
+  const payload = row.payload as WebhookDelivery['payload'];
   return {
     id: row.id as string,
+    chainId: payload.data.chainId ?? defaultChainId,
     merchantId: row.merchant_id as string,
     url: row.url as string,
-    payload: row.payload as WebhookDelivery['payload'],
+    payload,
     status: row.status as WebhookDelivery['status'],
     attempts: toNum(row.attempts),
     nextAttemptAt: toNum(row.next_attempt_at),
@@ -704,9 +743,10 @@ function mapSession(row: Record<string, unknown>): Session {
   };
 }
 
-function mapLink(row: Record<string, unknown>): PaymentLink {
+function mapLink(row: Record<string, unknown>, defaultChainId: number): PaymentLink {
   return {
     slug: row.slug as string,
+    chainId: row.chain_id === null ? defaultChainId : toNum(row.chain_id),
     merchantAddress: row.merchant_address as string,
     merchantId: row.merchant_id as string,
     merchantName: row.merchant_name as string,

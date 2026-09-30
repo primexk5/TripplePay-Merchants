@@ -5,11 +5,15 @@ interface PaymentMethodSelectorProps {
   payTab: "blip" | "wallet" | "qi";
   setPayTab: (tab: "blip" | "wallet" | "qi") => void;
   showQiComingSoon?: boolean;
+  /** Blip and Qi are Quai-only — omit or pass "quai" for the unchanged default behaviour; pass
+   *  "evm" to show only the browser-wallet option. */
+  chainKind?: "quai" | "evm";
 }
 
-export function PaymentMethodSelector({ payTab, setPayTab, showQiComingSoon }: PaymentMethodSelectorProps) {
+export function PaymentMethodSelector({ payTab, setPayTab, showQiComingSoon, chainKind = "quai" }: PaymentMethodSelectorProps) {
   const [isOpen, setIsOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const showBlipAndQi = chainKind === "quai";
 
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -48,19 +52,21 @@ export function PaymentMethodSelector({ payTab, setPayTab, showQiComingSoon }: P
 
       {isOpen && (
         <div className="absolute left-0 right-0 top-full z-10 overflow-hidden rounded-b-xl border border-t-0 border-white/7 bg-[#171717] shadow-lg">
-          <button
-            onClick={() => {
-              setPayTab("blip");
-              setIsOpen(false);
-            }}
-            className={`flex w-full items-center gap-2 px-4 py-3 text-sm font-medium transition ${
-              payTab === "blip" ? "bg-white/10 text-white" : "text-[#8b93a7] hover:bg-white/5 hover:text-white"
-            }`}
-          >
-            <Smartphone size={15} />
-            Pay with Blip
-          </button>
-          
+          {showBlipAndQi && (
+            <button
+              onClick={() => {
+                setPayTab("blip");
+                setIsOpen(false);
+              }}
+              className={`flex w-full items-center gap-2 px-4 py-3 text-sm font-medium transition ${
+                payTab === "blip" ? "bg-white/10 text-white" : "text-[#8b93a7] hover:bg-white/5 hover:text-white"
+              }`}
+            >
+              <Smartphone size={15} />
+              Pay with Blip
+            </button>
+          )}
+
           <button
             onClick={() => {
               setPayTab("wallet");
@@ -74,7 +80,7 @@ export function PaymentMethodSelector({ payTab, setPayTab, showQiComingSoon }: P
             Browser Wallet
           </button>
           
-          {showQiComingSoon && (
+          {showBlipAndQi && showQiComingSoon && (
             <button
               disabled
               className="flex w-full items-center gap-2 px-4 py-3 text-sm font-medium text-[#4f5868] opacity-50 cursor-not-allowed select-none border-t border-white/7"

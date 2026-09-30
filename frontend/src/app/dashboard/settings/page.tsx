@@ -187,7 +187,7 @@ export default function SettingsPage() {
                   {address}
                 </p>
                 <p className="mt-2 text-xs text-emerald-300">
-                  Connected to Quai network · Cyprus-1
+                  This address can receive payments on every chain you create links on — merchants are chain-free.
                 </p>
               </div>
             ) : (
@@ -195,6 +195,7 @@ export default function SettingsPage() {
                 connectedAddress={null}
                 onConnected={setAddress}
                 label="Connect settlement wallet"
+                chain="any"
               />
             )}
           </section>

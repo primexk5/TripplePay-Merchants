@@ -3,14 +3,18 @@
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { parseError } from "@/lib/utils";
-import { formatQuai, formatUnits } from "quais";
+import { formatUnits as formatUnitsQuai } from "quais";
+import { formatUnits as formatUnitsEvm } from "ethers";
 import { backendFetch } from "@/lib/payment";
 import { currencyDecimals, currencySymbol } from "@/lib/currencies";
+import { getChainById, getDefaultChain, type ChainInfo, type ChainKind } from "@/lib/chains";
+import { getActiveWallet, getWalletChainId, subscribeToWalletChanges } from "@/lib/wallets";
 import { getSessionToken, isLoggedIn, logout } from "@/lib/auth";
 
 export interface DeliveryData {
   merchant: string;
   orderId: string;
+  chainId: number;
   payer: string;
   token: string;
   amount: string;
@@ -160,15 +164,168 @@ export function useRelayerData(intervalMs = 8000) {
   return { deliveries, merchants, loading, error, refresh };
 }
 
-/** Exact-decimal amount formatting — Number() division loses precision on big values. */
-export function formatDeliveryAmount(net: string, token: string): string {
-  if (token === "0x0000000000000000000000000000000000000000") {
-    return `${formatQuai(net)} QUAI`;
+/**
+ * The chain the connected wallet currently reports — resolved via the existing
+ * getWalletChainId/getChainById primitives (never a parallel detection path). Falls back to the
+ * default chain if no wallet is connected yet, or if its reported chain isn't one this app
+ * configures. Every dashboard surface that needs to scope its figures/copy to "whichever chain
+ * the merchant is actually connected to" (instead of assuming Quai) shares this one hook.
+ */
+export function useConnectedChain(): ChainInfo {
+  const [chain, setChain] = useState<ChainInfo>(getDefaultChain());
+  useEffect(() => {
+    let cancelled = false;
+    const resolve = () => {
+      const wallet = getActiveWallet();
+      if (!wallet) {
+        if (!cancelled) setChain(getDefaultChain());
+        return;
+      }
+      void (async () => {
+        const hex = await getWalletChainId(wallet.provider);
+        const numeric = hex ? parseInt(hex, 16) : NaN;
+        const resolved = Number.isFinite(numeric) ? getChainById(numeric) : undefined;
+        // Only ever resolve to a LIVE chain — a wallet reporting a chain we configure but that
+        // isn't actually usable right now (not-yet-launched / misconfigured) must fall back to
+        // the default exactly like an unrecognized chain would, never hand callers something
+        // they can't act on.
+        if (!cancelled) setChain(resolved?.available ? resolved : getDefaultChain());
+      })();
+    };
+    resolve();
+    // Reconnecting via a DIFFERENT component (e.g. the header badge) must update this page's
+    // figures without a manual refresh — see wallets.ts's subscribeToWalletChanges.
+    const unsubscribe = subscribeToWalletChanges(resolve);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+  return chain;
+}
+
+/**
+ * State for a chain-SELECTOR (Wallet Balances' tabs, the payment-link Chain picker): seeded from
+ * the connected wallet's own chain (useConnectedChain) rather than always opening on the
+ * configured default, so a merchant connected elsewhere doesn't have to notice and switch on
+ * every visit. Once the merchant picks a chain explicitly through the returned setter, that
+ * choice sticks — a later wallet-driven update (reconnect, account change) reseeds the default,
+ * it never overrides an explicit pick already made.
+ */
+export function useChainSelector(): [ChainInfo, (chain: ChainInfo) => void] {
+  const connectedChain = useConnectedChain();
+  const [chain, setChainState] = useState<ChainInfo>(connectedChain);
+  const [manuallySelected, setManuallySelected] = useState(false);
+  // Adjusting state when connectedChain changes, computed during render rather than in an effect
+  // (React's own recommended pattern for this — see "Adjusting state when a prop changes" in the
+  // React docs) — avoids the extra render an effect-based sync would cost, and this lint rule
+  // requires it.
+  const [prevConnectedChain, setPrevConnectedChain] = useState(connectedChain);
+  if (connectedChain !== prevConnectedChain) {
+    setPrevConnectedChain(connectedChain);
+    if (!manuallySelected) setChainState(connectedChain);
   }
-  return `${formatUnits(net, currencyDecimals(token))} ${currencySymbol(token)}`;
+  const setChain = useCallback((c: ChainInfo) => {
+    setManuallySelected(true);
+    setChainState(c);
+  }, []);
+  return [chain, setChain];
+}
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+/**
+ * Converts a raw amount to a display string that is accurate AND readable at both ends of the
+ * scale — the single formatter every token/native amount on the dashboard goes through, so one
+ * card can never disagree with another. A fixed low decimal count (2, as wallet-balances.tsx used
+ * to truncate to) silently rounds a real small balance down to "0.00", which reads as "my money
+ * is gone" for something like 0.0098 ETH; showing the FULL raw precision everywhere instead makes
+ * ordinary larger amounts unreadable (many chains use 18 decimals). Split the difference:
+ *   - A genuinely zero amount (every fractional digit, if any, is 0) returns the bare "0" —
+ *     visibly distinct from any non-zero amount, which always shows at least one significant digit.
+ *   - An amount with a non-zero whole part is capped at 6 fractional places (trailing zeros
+ *     trimmed) — losing precision past that is an ordinary, standard readability tradeoff once the
+ *     whole part alone already establishes the amount isn't zero or dust.
+ *   - An amount under 1 shows enough digits PAST its first significant fractional digit that it
+ *     reads as what it actually is, however small — never collapsed to a misleadingly round
+ *     number the way a fixed decimal cap would.
+ */
+export function formatTokenAmount(value: bigint, decimals: number, kind: ChainKind): string {
+  const full = kind === "quai" ? formatUnitsQuai(value, decimals) : formatUnitsEvm(value, decimals);
+  const [whole, fracRaw = ""] = full.split(".");
+
+  if (whole !== "0") {
+    const frac = fracRaw.slice(0, 6).replace(/0+$/, "");
+    return frac ? `${whole}.${frac}` : whole;
+  }
+
+  const firstSignificant = fracRaw.search(/[1-9]/);
+  if (firstSignificant === -1) return "0";
+  const precision = Math.max(firstSignificant + 4, 6);
+  const frac = fracRaw.slice(0, precision).replace(/0+$/, "");
+  return `0.${frac}`;
+}
+
+/** Shared low-level formatter both formatDeliveryAmount and summarizeVolume build on — one place
+ *  that knows "native uses the chain's own nativeCurrency; anything else goes through the
+ *  chain-indexed currencies registry", so the two never drift apart. */
+function formatChainAmount(net: string | bigint, token: string, chain: ChainInfo): string {
+  if (token.toLowerCase() === ZERO_ADDRESS) {
+    const formatted = formatTokenAmount(BigInt(net), chain.nativeCurrency.decimals, chain.kind);
+    return `${formatted} ${chain.nativeCurrency.symbol}`;
+  }
+  const decimals = currencyDecimals(token, chain.chainId);
+  const formatted = formatTokenAmount(BigInt(net), decimals, chain.kind);
+  return `${formatted} ${currencySymbol(token, chain.chainId)}`;
+}
+
+/** Exact-decimal amount formatting — Number() division loses precision on big values.
+ *  `chainId` is the delivery's own chain (from its webhook payload) — pass it so the right
+ *  chain's native symbol/decimals and ERC-20 registry are used instead of always assuming Quai. */
+export function formatDeliveryAmount(net: string, token: string, chainId?: number): string {
+  const chain = (chainId !== undefined ? getChainById(chainId) : undefined) ?? getDefaultChain();
+  return formatChainAmount(net, token, chain);
+}
+
+/**
+ * Aggregates a set of deliveries' net amounts per token, for ONE chain, and formats each total
+ * via THAT chain's own currency registry (native first) — e.g. "1.5 ETH + 40.0 mUSD" for
+ * Robinhood Chain testnet, never "QUAI" for a chain that isn't Quai. Deliveries for other chains
+ * are ignored internally, so callers don't have to pre-filter (dashboard overview and analytics
+ * both also filter separately for their OTHER chain-scoped stats — this is just a safety net for
+ * the volume figure specifically). Empty input (or a chain with zero deliveries) returns the
+ * chain's native currency at zero, so the UI always has something sensible to show.
+ */
+export function summarizeVolume(deliveries: Delivery[], chain: ChainInfo): string {
+  const totals = new Map<string, bigint>();
+  for (const d of deliveries) {
+    if (d.payload.data.chainId !== chain.chainId) continue;
+    const token = d.payload.data.token.toLowerCase();
+    totals.set(token, (totals.get(token) ?? 0n) + BigInt(d.payload.data.net));
+  }
+  const parts: string[] = [];
+  const nativeTotal = totals.get(ZERO_ADDRESS) ?? 0n;
+  if (nativeTotal > 0n || totals.size === 0) {
+    parts.push(formatChainAmount(nativeTotal, ZERO_ADDRESS, chain));
+  }
+  for (const [token, amount] of totals) {
+    if (token === ZERO_ADDRESS || amount === 0n) continue;
+    parts.push(formatChainAmount(amount, token, chain));
+  }
+  return parts.join(" + ");
 }
 
 export function formatTimestamp(msOrSec: number): string {
   const ms = msOrSec > 1e12 ? msOrSec : msOrSec * 1000;
   return new Date(ms).toLocaleString();
+}
+
+/** Explorer link for a delivery's OWN chain — never a hardcoded quaiscan.io. A delivery list
+ *  spans every configured chain, so each row must resolve its own link rather than the page
+ *  assuming one explorer for all of them. Null when the chain is unrecognized or has no
+ *  configured explorer (caller should omit the link rather than render a dead one). */
+export function deliveryExplorerUrl(chainId: number, txHash: string): string | null {
+  const chain = getChainById(chainId);
+  if (!chain?.explorerUrl) return null;
+  return `${chain.explorerUrl}/tx/${txHash}`;
 }

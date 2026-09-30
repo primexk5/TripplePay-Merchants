@@ -73,7 +73,7 @@ export function MerchantShowcase() {
           <p className="text-sm font-medium text-sky-400">MERCHANTS ON TRIPPLEPAY</p>
           <h2 className="mt-4 text-3xl font-semibold tracking-tight text-white sm:text-4xl">
             Businesses already settling{" "}
-            <span className="text-slate-500">on Quai.</span>
+            <span className="text-slate-500">on-chain.</span>
           </h2>
           {merchants !== null && (
             <p className="mt-3 text-sm text-slate-500">
@@ -121,7 +121,7 @@ export function MerchantShowcase() {
                     <BadgeCheck className="h-4 w-4 shrink-0 text-sky-400" />
                   </div>
                   <p className="mt-1 text-xs leading-5 text-slate-500">
-                    Accepting QUAI & stablecoin payments
+                    Accepting on-chain payments
                   </p>
                   <p className="mt-1.5 flex items-center gap-1 text-[11px] text-slate-600">
                     <Store className="h-3 w-3" />

@@ -57,6 +57,7 @@ const merchant: Merchant = {
 function delivery(): WebhookDelivery {
   return {
     id: '0xabc:0',
+    chainId: 9,
     merchantId: 'mch_1',
     url: 'https://example.test/webhook',
     payload: {
@@ -65,6 +66,7 @@ function delivery(): WebhookDelivery {
       created: 1,
       data: {
         merchantId: 'mch_1',
+        chainId: 9,
         merchant: '0x00000000000000000000000000000000000000A1',
         orderId: '0x' + '11'.repeat(32),
         payer: '0x00000000000000000000000000000000000000B2',

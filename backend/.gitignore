@@ -10,6 +10,8 @@ dist/
 data/
 .env
 .env.local
+# Local multi-chain deployment config (see chains.example.json for the tracked template).
+chains.json
 
 # Logs
 *.log

@@ -9,47 +9,42 @@ import {
   Plus,
   TrendingUp,
 } from "lucide-react";
-import { formatQuai, formatUnits } from "quais";
 import { DashboardShell } from "@/components/layout/dashboard-shell";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { StatCard } from "@/components/ui/stat-card";
 import { WalletBalances } from "@/components/ui/wallet-balances";
-import { formatDeliveryAmount, useRelayerData } from "@/lib/relayer";
-import { MUSDQ_ADDRESS, currencyDecimals, currencySymbol } from "@/lib/currencies";
-
-const QUAI_SCAN = "https://quaiscan.io/tx/";
+import {
+  summarizeVolume,
+  useRelayerData,
+  useConnectedChain,
+  formatDeliveryAmount,
+  deliveryExplorerUrl,
+} from "@/lib/relayer";
 
 export default function DashboardPage() {
   const { deliveries, merchants, loading, error } = useRelayerData();
 
-  const delivered = deliveries.filter((d) => d.status === "delivered");
-  const ZERO = 0n;
+  // Which chain the connected wallet currently reports — the figures below are scoped to it (a
+  // merchant's links/payments can span several chains; see the note near the totals for why
+  // this page shows ONE chain's numbers at a time rather than a blended, mislabeled total).
+  const chain = useConnectedChain();
+
+  const chainDeliveries = deliveries.filter((d) => d.payload.data.chainId === chain.chainId);
+  const otherChainCount = deliveries.length - chainDeliveries.length;
+  const delivered = chainDeliveries.filter((d) => d.status === "delivered");
   // Webhook state is a notification detail, not payment status — every row here already
   // represents a CONFIRMED on-chain settlement (the indexer only records settled payments).
   // Only merchants that actually configured a receiver URL see webhook delivery info.
   const usesWebhook = merchants.some((m) => m.webhookUrl);
-  // Every delivery record corresponds to a payment settled on-chain (payment.confirmed), so the
-  // totals count all of them regardless of webhook delivery outcome.
-  const totalQuaiWei = deliveries.reduce(
-    (sum, d) => sum + (d.payload.data.token === "0x0000000000000000000000000000000000000000" ? BigInt(d.payload.data.net) : ZERO),
-    ZERO,
-  );
-  const totalTokenUnits = deliveries.reduce(
-    (sum, d) => sum + (d.payload.data.token !== "0x0000000000000000000000000000000000000000" ? BigInt(d.payload.data.net) : ZERO),
-    ZERO,
-  );
   const successRate =
-    deliveries.length > 0
-      ? Math.round((delivered.length / deliveries.length) * 1000) / 10
+    chainDeliveries.length > 0
+      ? Math.round((delivered.length / chainDeliveries.length) * 1000) / 10
       : 0;
-  const pending = deliveries.filter((d) => d.status === "pending").length;
+  const pending = chainDeliveries.filter((d) => d.status === "pending").length;
 
-  // Exact-decimal sums: formatQuai/formatUnits do the 10^n scaling without Number() precision loss.
-  const totalDisplay = `${formatQuai(totalQuaiWei)} QUAI${
-    totalTokenUnits > ZERO
-      ? ` + ${formatUnits(totalTokenUnits, currencyDecimals(MUSDQ_ADDRESS ?? ""))} ${currencySymbol(MUSDQ_ADDRESS ?? "")}`
-      : ""
-  }`;
+  // Chain-scoped, chain-correctly-labeled volume (native + any ERC-20s), via the shared
+  // chain-indexed currencies registry — never a hardcoded "QUAI"/mUSDQ assumption.
+  const totalDisplay = summarizeVolume(chainDeliveries, chain);
 
   return (
     <DashboardShell>
@@ -63,7 +58,15 @@ export default function DashboardPage() {
               Merchant overview
             </h1>
             <p className="mt-2 text-sm text-[#8b93a7]">
-              Live from the PayWithQuai relayer on Quai mainnet.
+              Live from the PayWithQuai relayer on {chain.name}.
+              {otherChainCount > 0 && (
+                <>
+                  {" "}
+                  <Link href="/dashboard/payments" className="text-[#38bdf8] hover:underline">
+                    +{otherChainCount} payment{otherChainCount !== 1 ? "s" : ""} on other chains
+                  </Link>
+                </>
+              )}
             </p>
           </div>
 
@@ -88,7 +91,7 @@ export default function DashboardPage() {
 
         <div className="space-y-4">
           <StatCard
-            label="Total received"
+            label={`Total received on ${chain.name}`}
             value={totalDisplay}
             description={`${delivered.length} confirmed payment(s)`}
             icon={DollarSign}
@@ -96,7 +99,7 @@ export default function DashboardPage() {
 
           <StatCard
             label="Transactions"
-            value={String(deliveries.length)}
+            value={String(chainDeliveries.length)}
             description={`${pending} pending in queue`}
             icon={CreditCard}
           />
@@ -110,8 +113,8 @@ export default function DashboardPage() {
 
           <StatCard
             label="Network"
-            value="Quai Mainnet"
-            description="Cyprus-1 · chain 9"
+            value={chain.name}
+            description="Settlement network"
             icon={ArrowUpRight}
           />
         </div>
@@ -126,7 +129,7 @@ export default function DashboardPage() {
               <div>
                 <h2 className="font-semibold">Recent payments</h2>
                 <p className="mt-1 text-xs text-[#8b93a7]">
-                  Confirmed settlements via the relayer
+                  Confirmed settlements via the relayer, across all chains
                 </p>
               </div>
 
@@ -153,7 +156,7 @@ export default function DashboardPage() {
                   >
                     <div className="min-w-0">
                       <p className="truncate text-sm font-medium">
-                        {formatDeliveryAmount(d.payload.data.net, d.payload.data.token)}
+                        {formatDeliveryAmount(d.payload.data.net, d.payload.data.token, d.payload.data.chainId)}
                       </p>
                       <p className="mt-0.5 truncate font-mono text-xs text-[#8b93a7]">
                         {d.meta?.payerName
@@ -189,15 +192,17 @@ export default function DashboardPage() {
                           </span>
                         )}
                       </div>
-                      <a
-                        href={`${QUAI_SCAN}${d.payload.data.txHash}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-[#8b93a7] transition hover:text-[#38bdf8]"
-                        title="View on Quaiscan"
-                      >
-                        <ArrowUpRight size={14} />
-                      </a>
+                      {deliveryExplorerUrl(d.payload.data.chainId, d.payload.data.txHash) && (
+                        <a
+                          href={deliveryExplorerUrl(d.payload.data.chainId, d.payload.data.txHash)!}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-[#8b93a7] transition hover:text-[#38bdf8]"
+                          title="View on this chain's explorer"
+                        >
+                          <ArrowUpRight size={14} />
+                        </a>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -252,9 +257,10 @@ export default function DashboardPage() {
             <section className="rounded-2xl border border-white/7 bg-[#171717] p-5">
               <h2 className="font-semibold">Direct settlement</h2>
               <p className="mt-1 text-xs leading-5 text-[#8b93a7]">
-                Payments settle straight to your wallet on Quai — verified
-                on-chain, no website or receiver URL needed. Add a webhook in
-                Settings only if you want automated notifications.
+                Payments settle straight to your wallet on whichever chain
+                each link is created on — verified on-chain, no website or
+                receiver URL needed. Add a webhook in Settings only if you
+                want automated notifications.
               </p>
             </section>
           )}

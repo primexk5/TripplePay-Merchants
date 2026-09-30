@@ -1,12 +1,16 @@
 "use client";
 
 import { BrowserProvider } from "quais";
+import { BrowserProvider as EvmBrowserProvider } from "ethers";
 import { backendFetch } from "@/lib/payment";
 import {
-  ensureQuaiNetwork,
+  ensureNetwork,
   getActiveWallet,
-  QUAI_MAINNET_CHAIN,
+  getWalletChainId,
+  chainsSupportedBy,
+  type DetectedWallet,
 } from "@/lib/wallets";
+import { listChains } from "@/lib/chains";
 
 /**
  * Session management for the merchant dashboard.
@@ -84,34 +88,69 @@ export function isLoggedIn(): boolean {
  * The message is minted by the backend per request (single-use nonce + chain id + realm bound),
  * so a captured signature can never be replayed.
  *
+ * Merchants are chain-free (product rule): the challenge/signature may be bound to ANY chain
+ * this deployment currently has enabled, so a merchant can log in once and then create links on
+ * any chain. This signs for whichever chain the wallet is CURRENTLY on (if it's one of this
+ * deployment's configured chains), falling back to the default chain otherwise — it does not
+ * force a network switch just to log in.
+ *
  * NEVER initiates a wallet connection: `preConnectedAddress` must come from an explicit
  * user action (WalletSelector / Blip connect button). If it's missing we fail loudly
  * instead of silently firing a connection popup the user didn't ask for.
+ *
+ * `walletOverride` lets a caller sign in with a wallet that ISN'T (yet) the app's stored active
+ * wallet — e.g. the dashboard's "sign in as this account" flow, which must prove a completed
+ * signature from the newly-connected wallet BEFORE flipping which wallet the app treats as
+ * active. Defaults to the active wallet, so every existing caller keeps behaving exactly as
+ * before.
  */
 export async function loginWithWallet(
   preConnectedAddress?: string,
+  walletOverride?: DetectedWallet,
 ): Promise<LoginResult> {
-  const wallet = getActiveWallet();
+  const wallet = walletOverride ?? getActiveWallet();
   if (!wallet) {
     throw new Error("No wallet connected — connect a wallet first.");
   }
   if (!preConnectedAddress) {
     throw new Error("Connect your wallet first, then press Sign in.");
   }
-  // Only Pelagus skips network checks (its EIP-3326 requests hang). Blip goes through the
-  // full verify → switch → add path — its documented provider supports both methods.
-  const quaiNative = wallet.brand === "pelagus";
-  await ensureQuaiNetwork(wallet.provider, QUAI_MAINNET_CHAIN, { quaiNative });
+
+  // Resolve the target chain from what THIS WALLET can actually sign for — never the global
+  // default — before any network request. Previously this fell back to getDefaultChain() (Quai)
+  // whenever the wallet's current network wasn't a configured chain, which pushed a plain EVM
+  // wallet like MetaMask onto Quai (Cyprus-1): a network it has no quai_* support for, leaving it
+  // stuck with "unsupported operation". A wallet that can't serve any configured chain fails
+  // here with a clear message instead.
+  const supportedChains = chainsSupportedBy(wallet, listChains());
+  if (supportedChains.length === 0) {
+    throw new Error(`${wallet.name} can't sign for any chain this app supports.`);
+  }
+  const currentHex = await getWalletChainId(wallet.provider);
+  const currentChainId = currentHex ? parseInt(currentHex, 16) : NaN;
+  // Prefer whatever chain the wallet already reports, but only among chains it can actually
+  // reach — otherwise fall back to the first chain it supports, not the app's global default.
+  const chain =
+    (Number.isFinite(currentChainId)
+      ? supportedChains.find((c) => c.chainId === currentChainId)
+      : undefined) ?? supportedChains[0]!;
+
+  await ensureNetwork(wallet, chain);
   const address = preConnectedAddress;
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const provider = new BrowserProvider(wallet.provider as any, "any");
-  const signer = await provider.getSigner();
+  let signer;
+  if (chain.kind === "quai") {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    signer = await new BrowserProvider(wallet.provider as any, "any").getSigner();
+  } else {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    signer = await new EvmBrowserProvider(wallet.provider as any).getSigner();
+  }
 
   const challenge = await backendFetch("/v1/auth/challenge", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ address }),
+    body: JSON.stringify({ address, chainId: chain.chainId }),
   });
   const challengeBody = (await challenge.json().catch(() => null)) as {
     message?: string;

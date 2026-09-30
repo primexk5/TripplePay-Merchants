@@ -132,12 +132,17 @@ while (Date.now() < deadline) {
 
 const envVars = `# Client (browser) — MUST be NEXT_PUBLIC_* or it ships as undefined
 NEXT_PUBLIC_RPC_URL=https://rpc.quai.network
-NEXT_PUBLIC_CHAIN_ID=9
+NEXT_PUBLIC_CHAIN_ID=9                # selects the default chain — see NEXT_PUBLIC_CHAINS below
 NEXT_PUBLIC_PAYWITHQUAI_ADDRESS=0x…   # from contracts/deployments/cyprus1.json
 NEXT_PUBLIC_MUSDQ_ADDRESS=0x…         # mainnet stablecoin (6 decimals)
 NEXT_PUBLIC_USDT_ADDRESS=0x…          # optional override — canonical USDT is built in
 NEXT_PUBLIC_WQUAI_ADDRESS=0x…         # optional override — canonical WQUAI is built in
 NEXT_PUBLIC_BACKEND_URL=https://tripplepay-three.vercel.app
+
+# Other chains (e.g. Robinhood Chain testnet, already built in) — see src/lib/chains.ts.
+# Inline JSON array, merged over the built-in chains by chainId; each link picks ONE of these
+# chains at creation time.
+# NEXT_PUBLIC_CHAINS=[{"chainId":84532,"slug":"base-sepolia","kind":"evm","name":"Base Sepolia","rpcUrl":"...","contractAddress":"0x...","nativeCurrency":{"name":"Ether","symbol":"ETH","decimals":18}}]
 
 # Server-only — NEVER prefix with NEXT_PUBLIC_ (ships to the browser bundle)
 BACKEND_PRIVATE_KEY=...   # payout wallet: signs registrations, receives funds
@@ -150,6 +155,7 @@ const webhookJson = `{
   "created": 1738340000,
   "data": {
     "merchantId": "mch_ab12...",
+    "chainId":    9,               // which configured chain this payment settled on
     "merchant":   "0x00...",       // on-chain payout address
     "orderId":    "0x...",
     "payer":      "0x...",

@@ -1,17 +1,24 @@
 import express, { type Express, type Request, type Response, type NextFunction } from 'express';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { getAddress, verifyMessage } from 'quais';
 import { z } from 'zod';
 import type { Store } from '../store/index.js';
-import type { QuaiClient } from '../chain/client.js';
+import type { ChainClient } from '../chain/types.js';
+import type { ChainRegistry } from '../chain/index.js';
 import type { QiService } from '../chain/qi.js';
 import type { Config } from '../config.js';
 import type { Merchant, Session, PaymentLink, WebhookDelivery, QiOrder } from '../types.js';
 import { newMerchantId, newWebhookSecret, newSlug } from '../util/ids.js';
+import {
+  normalizeAddressAnyKind,
+  normalizeAddressForKind,
+  recoverMessageSignerForKind,
+  type ChainAddressKind,
+} from '../util/address.js';
 import { assertSafeWebhookUrl, UnsafeWebhookUrlError } from '../webhooks/urlGuard.js';
 import { rateLimit } from './rateLimit.js';
 import { cors } from './cors.js';
 import { cursorScope } from '../indexer/indexer.js';
+import type { Indexer } from '../indexer/indexer.js';
 import { log } from '../logger.js';
 
 const logger = log('api');
@@ -53,9 +60,35 @@ function parseAcceptedTokens(value: unknown): Set<string> {
   );
 }
 
+/** A chain resolved for the current request: its live client plus the identifying fields every
+ *  route needs (id/slug, chainId, kind, name, per-chain token allowlist). In multi-chain mode
+ *  (a ChainRegistry was passed to createServer) this comes from the registry; otherwise it's
+ *  synthesized once from the legacy single-chain `client`/`cfg`, below. */
+interface ResolvedChain {
+  client: ChainClient;
+  id: string;
+  chainId: number;
+  kind: ChainAddressKind;
+  name: string;
+  acceptedTokens?: string[];
+}
+
+interface ChainHealthView {
+  id: string;
+  chainId: number;
+  kind: ChainAddressKind;
+  name: string;
+  contract: string;
+  cursor: number | null;
+  lastPollAt: number | null;
+  lastSuccessAt: number | null;
+  lastError: string | null;
+  healthy: boolean;
+}
+
 /**
  * Builds the HTTP API:
- *   GET  /health                          liveness + indexer cursor
+ *   GET  /health                          liveness + per-chain indexer health
  *   GET  /v1/orders/:merchant/:orderId    order + settlement status (on-chain + local)
  *   POST /v1/auth/login                   wallet-signature login -> bearer session token
  *   POST /v1/auth/logout                  invalidate the session token
@@ -67,10 +100,98 @@ function parseAcceptedTokens(value: unknown): Set<string> {
  *   PATCH /v1/merchants/:address           (admin) update name/webhookUrl/active without rotating secret
  *   GET  /v1/deliveries                    (admin) recent webhook deliveries (debugging)
  *   POST /v1/deliveries/:id/retry          (admin) re-queue a failed/skipped delivery
+ *   GET  /v1/chains                        (admin) configured chains + health
  * Admin routes require `Authorization: Bearer <ADMIN_API_KEY>`. Self-service routes require a
  * session token issued by POST /v1/auth/login.
+ *
+ * `registry`/`indexers` are optional and additive: when absent (every existing caller/test that
+ * predates multi-chain support), every route behaves exactly as it did against the single
+ * `client`/`cfg` chain — see `legacyChain` and `resolveChain()` below. Production (src/index.ts)
+ * always passes both.
  */
-export function createServer(store: Store, client: QuaiClient, cfg: Config, qiService?: QiService): Express {
+export function createServer(
+  store: Store,
+  client: ChainClient,
+  cfg: Config,
+  qiService?: QiService,
+  registry?: ChainRegistry,
+  indexers?: Map<number, Indexer>,
+): Express {
+  // The single implied chain when no registry is configured — reproduces the pre-multi-chain
+  // behaviour exactly (same id/kind normalization normalizeAddress/recoverMessageSigner used).
+  const legacyChain: ResolvedChain = {
+    client,
+    id: cfg.CHAIN_KIND === 'evm' ? 'evm' : 'quai',
+    chainId: cfg.CHAIN_ID,
+    kind: cfg.CHAIN_KIND === 'evm' ? 'evm' : 'quai',
+    name: cfg.CHAIN_KIND === 'evm' ? `EVM chain ${cfg.CHAIN_ID}` : 'Quai',
+    acceptedTokens: cfg.ACCEPTED_TOKENS,
+  };
+
+  /** Resolves a request-supplied chain identifier (numeric chainId, numeric string, or slug)
+   *  against the configured chains. Undefined/empty resolves to the default chain. Returns
+   *  undefined only for an id/slug that matches no enabled chain — the caller turns that into a
+   *  400 (or 503 for a link whose chain has since been disabled). */
+  function resolveChain(idOrSlug: string | number | undefined | null): ResolvedChain | undefined {
+    if (registry) {
+      const entry = registry.resolve(idOrSlug ?? undefined);
+      if (!entry) return undefined;
+      return {
+        client: entry.client,
+        id: entry.config.id,
+        chainId: entry.config.chainId,
+        kind: entry.config.kind,
+        name: entry.config.name,
+        acceptedTokens: entry.config.acceptedTokens,
+      };
+    }
+    // Legacy path: exactly one chain (cfg's own). An explicit id/slug must match it.
+    if (
+      idOrSlug !== undefined &&
+      idOrSlug !== null &&
+      idOrSlug !== '' &&
+      String(idOrSlug) !== String(legacyChain.chainId) &&
+      String(idOrSlug) !== legacyChain.id
+    ) {
+      return undefined;
+    }
+    return legacyChain;
+  }
+
+  const defaultChain = (): ResolvedChain => (registry ? resolveChain(undefined)! : legacyChain);
+
+  async function computeChainsHealth(): Promise<ChainHealthView[]> {
+    const list: ResolvedChain[] = registry
+      ? registry.entries.map((e) => ({
+          client: e.client,
+          id: e.config.id,
+          chainId: e.config.chainId,
+          kind: e.config.kind,
+          name: e.config.name,
+          acceptedTokens: e.config.acceptedTokens,
+        }))
+      : [legacyChain];
+    return Promise.all(
+      list.map(async (c) => {
+        const scope = cursorScope(c.chainId, c.client.address);
+        const cursor = (await store.getCursor(scope)) ?? null;
+        const h = indexers?.get(c.chainId)?.health() ?? { lastPollAt: null, lastSuccessAt: null, lastError: null };
+        return {
+          id: c.id,
+          chainId: c.chainId,
+          kind: c.kind,
+          name: c.name,
+          contract: c.client.address,
+          cursor,
+          lastPollAt: h.lastPollAt,
+          lastSuccessAt: h.lastSuccessAt,
+          lastError: h.lastError,
+          healthy: h.lastError === null,
+        };
+      }),
+    );
+  }
+
   const app = express();
   app.disable('x-powered-by');
   // `req.ip` (rate-limiter keys, login logging) is only the real client address when the hop
@@ -89,13 +210,21 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config, qiSe
   });
 
   app.get('/health', asyncHandler(async (_req, res) => {
-    const scope = cursorScope(cfg.CHAIN_ID, cfg.PAYWITHQUAI_ADDRESS);
+    const chains = await computeChainsHealth();
+    const def = defaultChain();
+    const scope = cursorScope(def.chainId, def.client.address);
     res.json({
       status: 'ok',
+      // Legacy top-level fields (single-chain deployments predate the `chains` array below):
+      // always the DEFAULT chain's values, computed via the registry when one is configured, and
+      // otherwise byte-identical to the original single-chain computation.
+      chainKind: def.kind,
       contract: client.address,
-      chainId: cfg.CHAIN_ID,
+      chainId: def.chainId,
       cursor: (await store.getCursor(scope)) ?? null,
       qi: qiService?.enabled ? { enabled: true, rpc: qiService.rpcUrl } : { enabled: false },
+      chains,
+      healthy: chains.every((c) => c.healthy),
     });
   }));
 
@@ -111,7 +240,8 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config, qiSe
     const orderId = req.params.orderId ?? '';
     let merchant: string;
     try {
-      merchant = getAddress(merchantParam);
+      // Merchants are chain-free (product rule) — accept either address-format convention.
+      merchant = normalizeAddressAnyKind(merchantParam);
     } catch {
       return res.status(400).json({ error: 'invalid merchant address' });
     }
@@ -119,12 +249,21 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config, qiSe
       return res.status(400).json({ error: 'orderId must be a 32-byte hex string' });
     }
 
+    const chainParam = typeof req.query.chainId === 'string' ? req.query.chainId : undefined;
+    const chain = resolveChain(chainParam);
+    if (!chain) {
+      return res.status(400).json({ error: `unknown or disabled chainId "${chainParam}"` });
+    }
+
     // DEV ONLY: for the demo merchant under QI_DEV_SIMULATE, synthesize the order rather than
     // calling the chain — an unregistered merchant's getOrder may throw OR return a zeroed
-    // `exists:true` struct (observed on Orchard), which would incorrectly yield amount 0.
+    // `exists:true` struct (observed on Orchard), which would incorrectly yield amount 0. Qi (and
+    // this demo) is Quai-only, so this never fires for an EVM-chain lookup.
     const isDevDemo =
-      cfg.QI_DEV_SIMULATE && cfg.QI_DEV_DEMO_MERCHANT?.toLowerCase() === merchant.toLowerCase();
-    let order: Awaited<ReturnType<QuaiClient['getOrder']>>;
+      cfg.QI_DEV_SIMULATE &&
+      chain.kind === 'quai' &&
+      cfg.QI_DEV_DEMO_MERCHANT?.toLowerCase() === merchant.toLowerCase();
+    let order: Awaited<ReturnType<ChainClient['getOrder']>>;
     if (isDevDemo) {
       logger.warn({ merchant, orderId }, 'dev demo order synthesized (QI_DEV_SIMULATE)');
       order = {
@@ -141,16 +280,17 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config, qiSe
         nonce: 0n,
       };
     } else {
-      order = await client.getOrder(merchant, orderId);
+      order = await chain.client.getOrder(merchant, orderId);
     }
     if (!order.exists) return res.status(404).json({ error: 'order not found' });
 
     const delivery = await store.getDeliveryByOrder(merchant, orderId);
-    // Qi surface: derive (or load) the order's one-time receive address. When Qi is disabled this
-    // stays null and the checkout shows only the on-chain payment path. Derivation is lazily
-    // triggered by the checkout reading the order — no background job, no wasted addresses.
+    // Qi surface: derive (or load) the order's one-time receive address. Qi is Quai-only, so this
+    // stays null for every EVM-chain order, exactly as it does for any order when Qi is disabled.
+    // Derivation is lazily triggered by the checkout reading the order — no background job, no
+    // wasted addresses.
     let qi: ReturnType<typeof qiView> | null = null;
-    if (qiService?.enabled) {
+    if (qiService?.enabled && chain.kind === 'quai') {
       const qits = qiService.orderQits(order.amount);
       let rec = await store.getQiOrder(orderId);
       if (!rec) rec = await qiService.ensureQiOrder(orderId, merchant, qits);
@@ -159,6 +299,7 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config, qiSe
     res.json({
       merchant,
       orderId,
+      chainId: chain.chainId,
       token: order.token,
       amount: order.amount.toString(),
       feeBps: order.feeBps,
@@ -180,7 +321,7 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config, qiSe
   app.post('/v1/orders/:merchant/:orderId/meta', ordersLimiter, asyncHandler(async (req, res) => {
     let merchant: string;
     try {
-      merchant = getAddress(req.params.merchant ?? '');
+      merchant = normalizeAddressAnyKind(req.params.merchant ?? '');
     } catch {
       return res.status(400).json({ error: 'invalid merchant address' });
     }
@@ -192,15 +333,22 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config, qiSe
     const parsed = OrderMetaSchema.safeParse(req.body ?? {});
     if (!parsed.success) return res.status(400).json({ error: 'invalid metadata' });
 
-    // A slug only counts as a "link" source if it actually belongs to this merchant.
+    // A slug only counts as a "link" source if it actually belongs to this merchant. The chain is
+    // carried through from the link when one applies; otherwise this is a direct checkout/API
+    // order against the default chain.
     let slug: string | undefined;
+    let chainId = defaultChain().chainId;
     if (parsed.data.slug) {
       const link = await store.getLink(parsed.data.slug);
-      if (link && link.merchantAddress === merchant.toLowerCase()) slug = link.slug;
+      if (link && link.merchantAddress === merchant.toLowerCase()) {
+        slug = link.slug;
+        chainId = link.chainId;
+      }
     }
 
     await store.saveOrderMeta({
       orderId,
+      chainId,
       merchantAddress: merchant.toLowerCase(),
       customerName: parsed.data.customerName,
       source: slug ? 'link' : 'checkout',
@@ -226,8 +374,9 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config, qiSe
   const COOKIE_SAME_SITE = COOKIE_SECURE ? 'None' : 'Lax';
 
   const AddressSchema = z.string().regex(/^0x[0-9a-fA-F]{40}$/, 'address must be a 20-byte hex address');
+  const ChainIdOrSlugSchema = z.union([z.string(), z.number()]).optional();
 
-  const ChallengeSchema = z.object({ address: AddressSchema });
+  const ChallengeSchema = z.object({ address: AddressSchema, chainId: ChainIdOrSlugSchema });
   const LoginSchema = z.object({
     address: AddressSchema,
     message: z.string(),
@@ -245,13 +394,23 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config, qiSe
     }
     let address: string;
     try {
-      address = getAddress(parsed.data.address);
+      // The merchant's identity is chain-free; the challenge itself still binds to ONE chain
+      // (below) so the signature can be verified under that chain's own signing scheme.
+      address = normalizeAddressAnyKind(parsed.data.address);
     } catch {
       return res.status(400).json({ error: 'address fails checksum validation' });
     }
+    const chain = resolveChain(parsed.data.chainId);
+    if (!chain) {
+      return res.status(400).json({ error: `unknown or disabled chain "${parsed.data.chainId}"` });
+    }
     const nonce = randomBytes(24).toString('hex');
     await store.createNonce(nonce, address.toLowerCase(), Date.now() + LOGIN_WINDOW_MS);
-    const message = `tripplepay-login:${address}:${nonce}:${cfg.CHAIN_ID}:${cfg.LOGIN_REALM}`;
+    // Message format is UNCHANGED: tripplepay-login:<address>:<nonce>:<chainId>:<realm>. Only the
+    // chainId component now varies per request (any enabled chain, not always one fixed value) —
+    // see POST /v1/auth/login for why accepting any of this deployment's configured chains here
+    // keeps replay protection intact.
+    const message = `tripplepay-login:${address}:${nonce}:${chain.chainId}:${cfg.LOGIN_REALM}`;
     res.json({ nonce, message, expiresAt: Date.now() + LOGIN_WINDOW_MS });
   }));
 
@@ -264,7 +423,7 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config, qiSe
 
     let address: string;
     try {
-      address = getAddress(parsed.data.address);
+      address = normalizeAddressAnyKind(parsed.data.address);
     } catch {
       return res.status(400).json({ error: 'address fails checksum validation' });
     }
@@ -275,13 +434,24 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config, qiSe
     const match = /^tripplepay-login:(0x[0-9a-fA-F]{40}):([0-9a-fA-F]{16,}):(\d+):([A-Za-z0-9._-]+)$/.exec(message);
     const signedAddress = match?.[1];
     const nonce = match?.[2];
-    const chainId = match?.[3];
+    const chainIdStr = match?.[3];
     const realm = match?.[4];
+
+    // Merchants are chain-free (product rule): a login challenge/signature may be bound to ANY
+    // chain this deployment currently has ENABLED — not one fixed chainId — because the same
+    // merchant record works across every chain. This does not weaken replay protection: a
+    // signature is still only valid for THIS deployment (LOGIN_REALM must match exactly) and only
+    // for a chain THIS deployment actually recognizes right now — an unrecognized or since-
+    // disabled chainId verifies against nothing, exactly like a wrong LOGIN_REALM does today. The
+    // single-use nonce (consumed below) is what actually prevents replay of a captured signature,
+    // independent of chain; the chainId/realm binding only prevents a signature captured on a
+    // DIFFERENT deployment (or a chain this one doesn't run) from ever being presented as valid.
+    const loginChain = match ? resolveChain(chainIdStr) : undefined;
     if (
       !match ||
       !signedAddress ||
       signedAddress.toLowerCase() !== address.toLowerCase() ||
-      chainId !== String(cfg.CHAIN_ID) ||
+      !loginChain ||
       realm !== cfg.LOGIN_REALM
     ) {
       return res.status(401).json({ error: 'invalid credentials' });
@@ -294,10 +464,11 @@ export function createServer(store: Store, client: QuaiClient, cfg: Config, qiSe
     }
 
     // The signature proves ownership of the wallet: the recovered signer must equal the address
-    // the merchant claims. verifyMessage throws on malformed input -> 400, not a 500.
+    // the merchant claims, verified under the CHALLENGED chain's own signing scheme.
+    // recoverMessageSignerForKind throws on malformed input -> caught below -> 401.
     let recovered: string;
     try {
-      recovered = verifyMessage(message, signature);
+      recovered = recoverMessageSignerForKind(loginChain.kind, message, signature);
     } catch {
       return res.status(401).json({ error: 'invalid credentials' });
     }
@@ -424,6 +595,9 @@ await store.upsertMerchant(updated);
     multiPay: z.boolean().default(false),
     /** Pre-registered orderIds sent by the merchant after signing them on-chain. */
     orderPool: z.array(z.string().regex(/^0x[0-9a-fA-F]{64}$/)).default([]),
+    /** Which chain this link is denominated on — a chain slug or numeric chainId. Defaults to
+     *  the default chain. A link belongs to exactly ONE chain, fixed at creation. */
+    chainId: ChainIdOrSlugSchema,
   });
 
   app.post('/v1/links', auth, asyncHandler(async (req, res) => {
@@ -437,6 +611,11 @@ await store.upsertMerchant(updated);
     }
     const d = parsed.data;
 
+    const chain = resolveChain(d.chainId);
+    if (!chain) {
+      return res.status(400).json({ error: `unknown or disabled chain "${d.chainId}"` });
+    }
+
     // Single-pay links need exactly one orderId in the pool.
     if (!d.multiPay && d.orderPool.length !== 1) {
       return res.status(400).json({ error: 'single-pay link requires exactly one orderId in orderPool' });
@@ -446,9 +625,10 @@ await store.upsertMerchant(updated);
       return res.status(400).json({ error: 'multi-pay link requires at least one pre-registered orderId' });
     }
 
-    // Optional ERC-20 allowlist (ACCEPTED_TOKENS). Native QUAI is always permitted.
+    // Optional ERC-20 allowlist — this chain's own (ACCEPTED_TOKENS in legacy single-chain mode).
+    // Native currency is always permitted.
     const tokenLower = d.tokenAddress.toLowerCase();
-    const accepted = parseAcceptedTokens(cfg.ACCEPTED_TOKENS);
+    const accepted = parseAcceptedTokens(chain.acceptedTokens);
     if (tokenLower !== ZERO_ADDRESS && accepted.size > 0 && !accepted.has(tokenLower)) {
       return res.status(400).json({ error: `token ${d.tokenAddress} is not in ACCEPTED_TOKENS` });
     }
@@ -456,6 +636,7 @@ await store.upsertMerchant(updated);
     const slug = newSlug();
     const link: PaymentLink = {
       slug,
+      chainId: chain.chainId,
       merchantAddress: merchant.address,
       merchantId: merchant.merchantId,
       merchantName: merchant.name,
@@ -470,15 +651,18 @@ await store.upsertMerchant(updated);
       createdAt: Date.now(),
     };
     await store.upsertLink(link);
-    logger.info({ slug, merchantId: merchant.merchantId, multiPay: d.multiPay, poolSize: d.orderPool.length }, 'payment link created');
-    res.status(201).json(publicLink(link));
+    logger.info(
+      { slug, merchantId: merchant.merchantId, chainId: chain.chainId, multiPay: d.multiPay, poolSize: d.orderPool.length },
+      'payment link created',
+    );
+    res.status(201).json(publicLink(link, chain));
   }));
 
   app.get('/v1/links', auth, asyncHandler(async (req, res) => {
     const session = res.locals.session as Session;
     const merchant = await store.getMerchantById(session.merchantId);
     if (!merchant) return res.status(404).json({ error: 'merchant not found' });
-    const links = (await store.listLinksForMerchant(merchant.address)).map(publicLink);
+    const links = (await store.listLinksForMerchant(merchant.address)).map((l) => publicLink(l, resolveChain(l.chainId)));
     res.json({ links });
   }));
 
@@ -492,7 +676,7 @@ await store.upsertMerchant(updated);
     const slug = req.params.slug ?? '';
     const link = await store.getLink(slug);
     if (!link) return res.status(404).json({ error: 'link not found' });
-    res.json(publicLink(link));
+    res.json(publicLink(link, resolveChain(link.chainId)));
   }));
 
   // Public merchant directory (landing-page showcase). Safe fields only — never expose
@@ -520,6 +704,10 @@ await store.upsertMerchant(updated);
     const slug = req.params.slug ?? '';
     const link = await store.getLink(slug);
     if (!link) return res.status(404).json({ error: 'link not found' });
+    const chain = resolveChain(link.chainId);
+    if (!chain) {
+      return res.status(503).json({ error: 'this link\'s chain is not currently available' });
+    }
 
     const parsed = ClaimSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -527,7 +715,8 @@ await store.upsertMerchant(updated);
     }
     let payerAddress: string;
     try {
-      payerAddress = getAddress(parsed.data.payerAddress);
+      // The payer's wallet is chain-free too — accept either address-format convention.
+      payerAddress = normalizeAddressAnyKind(parsed.data.payerAddress);
     } catch {
       return res.status(400).json({ error: 'payerAddress fails checksum validation' });
     }
@@ -555,7 +744,8 @@ await store.upsertMerchant(updated);
       logger.info({ slug, payerAddress, orderId: recycled }, 'stale claim recycled');
       return res.json({
         orderId: recycled,
-        merchant: getAddress(link.merchantAddress),
+        chainId: link.chainId,
+        merchant: normalizeAddressForKind(chain.kind, link.merchantAddress),
         token: link.tokenAddress,
         amount: link.amount,
         poolRemaining: link.orderPool.length,
@@ -569,7 +759,8 @@ await store.upsertMerchant(updated);
     logger.info({ slug, payerAddress, orderId }, 'order claimed from pool');
     res.json({
       orderId,
-      merchant: getAddress(link.merchantAddress),
+      chainId: link.chainId,
+      merchant: normalizeAddressForKind(chain.kind, link.merchantAddress),
       token: link.tokenAddress,
       amount: link.amount,
       poolRemaining: link.orderPool.length,
@@ -579,7 +770,9 @@ await store.upsertMerchant(updated);
   // Qi variant of the claim: the payer isn't known until the customer opens their Qi wallet, so
   // this route reserves an orderId up front and returns its freshly-derived receive address. The
   // checkout then shows the address as a QR/copy target and polls /v1/orders/... for settlement.
-  // Returns 404 for a missing link, 503 when Qi is disabled or the pool is empty.
+  // Qi is Quai-only — returns 503 for a link whose chain isn't Quai, in addition to the existing
+  // "Qi disabled on this deployment" case.
+  // Returns 404 for a missing link, 503 when Qi is disabled/inapplicable or the pool is empty.
   app.post('/v1/links/:slug/qi-claim', linkLimiter, asyncHandler(async (req, res) => {
     const slug = req.params.slug ?? '';
     const link = await store.getLink(slug);
@@ -587,6 +780,10 @@ await store.upsertMerchant(updated);
 
     if (!qiService?.enabled) {
       return res.status(503).json({ error: 'Qi payments are not enabled on this deployment' });
+    }
+    const chain = resolveChain(link.chainId);
+    if (!chain || chain.kind !== 'quai') {
+      return res.status(503).json({ error: 'Qi payments are only available for links on the Quai chain' });
     }
 
     // Recycle abandoned Qi reservations too: an earlier qi-claim that never received funds leaves
@@ -609,7 +806,8 @@ await store.upsertMerchant(updated);
     }
     res.json({
       orderId,
-      merchant: getAddress(link.merchantAddress),
+      chainId: link.chainId,
+      merchant: normalizeAddressForKind(chain.kind, link.merchantAddress),
       amount: link.amount,
       poolRemaining: link.orderPool.length,
       qi: qiView(rec),
@@ -672,7 +870,8 @@ await store.upsertMerchant(updated);
     }
     let address: string;
     try {
-      address = getAddress(parsed.data.address);
+      // Merchants are chain-free — accept either address-format convention (see product rules).
+      address = normalizeAddressAnyKind(parsed.data.address);
     } catch {
       // Mixed-case input passes the regex but fails checksum validation — a client error, not
       // a server fault (must not bubble into the 500 handler).
@@ -715,7 +914,7 @@ await store.upsertMerchant(updated);
   admin.patch('/merchants/:address', asyncHandler(async (req, res) => {
     let address: string;
     try {
-      address = getAddress(req.params.address ?? '');
+      address = normalizeAddressAnyKind(req.params.address ?? '');
     } catch {
       return res.status(400).json({ error: 'invalid merchant address' });
     }
@@ -784,6 +983,10 @@ await store.upsertMerchant(updated);
     res.json({ id, previously: d.status, status: 'pending', attempts: 0 });
   }));
 
+  admin.get('/chains', asyncHandler(async (_req, res) => {
+    res.json({ chains: await computeChainsHealth(), default: defaultChain().id });
+  }));
+
   app.use('/v1', admin);
 
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
@@ -799,11 +1002,14 @@ await store.upsertMerchant(updated);
   return app;
 }
 
-/** Merchant view without the signing secret. */
+/** Merchant view without the signing secret. Merchants are chain-free (product rule): the same
+ *  record is valid across every configured chain, so the payout address is validated/formatted
+ *  under whichever address-format rule (EIP-55 or Quai zone-checksum) accepts it — see
+ *  normalizeAddressAnyKind. */
 function publicMerchant(m: Merchant) {
   return {
     merchantId: m.merchantId,
-    address: getAddress(m.address),
+    address: normalizeAddressAnyKind(m.address),
     name: m.name,
     webhookUrl: m.webhookUrl,
     active: m.active,
@@ -811,11 +1017,18 @@ function publicMerchant(m: Merchant) {
   };
 }
 
-/** Link view — omits the internal orderPool array; pool size only. */
-function publicLink(l: PaymentLink) {
+/** Link view — omits the internal orderPool array; pool size only. Includes the link's chain
+ *  (a link belongs to exactly one chain, fixed at creation) so a multi-chain dashboard can label
+ *  it without a second API call. `chain` is undefined if the link's chain has since been
+ *  disabled/removed — the link itself still renders, with `chain: null` and a best-effort
+ *  (EIP-55) address format. */
+function publicLink(l: PaymentLink, chain: ResolvedChain | undefined) {
+  const kind: ChainAddressKind = chain?.kind ?? 'evm';
   return {
     slug: l.slug,
-    merchantAddress: getAddress(l.merchantAddress),
+    chainId: l.chainId,
+    chain: chain ? { id: chain.id, chainId: chain.chainId, kind: chain.kind, name: chain.name } : null,
+    merchantAddress: normalizeAddressForKind(kind, l.merchantAddress),
     merchantId: l.merchantId,
     merchantName: l.merchantName,
     shopName: l.shopName,

@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "dotenv": "^16.6.1",
+    "ethers": "^6.13.5",
     "express": "^4.21.2",
     "ipaddr.js": "^1.9.1",
     "pg": "^8.23.0",

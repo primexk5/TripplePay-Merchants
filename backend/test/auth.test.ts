@@ -96,6 +96,7 @@ async function onboardMerchant(base: string, address = merchantAddress): Promise
 async function seedDelivery(store: JsonStore, merchantId: string, over: Partial<WebhookDelivery> = {}): Promise<WebhookDelivery> {
   const d: WebhookDelivery = {
     id: '0x' + 'cd'.repeat(32) + ':0',
+    chainId: 9,
     merchantId,
     url: 'https://example.test/webhook',
     payload: {
@@ -104,6 +105,7 @@ async function seedDelivery(store: JsonStore, merchantId: string, over: Partial<
       created: 1,
       data: {
         merchantId,
+        chainId: 9,
         merchant: merchantAddress,
         orderId: '0x' + '22'.repeat(32),
         payer: '0x00000000000000000000000000000000000000b2',
@@ -134,12 +136,14 @@ async function seedDelivery(store: JsonStore, merchantId: string, over: Partial<
 async function otherMerchantDelivery(store: JsonStore): Promise<WebhookDelivery> {
   return await seedDelivery(store, 'mch_other', {
     id: '0x' + 'ef'.repeat(32) + ':0',
+    chainId: 9,
     payload: {
       id: '0x' + 'ef'.repeat(32) + ':0',
       type: 'payment.confirmed',
       created: 1,
       data: {
         merchantId: 'mch_other',
+        chainId: 9,
         merchant: '0x00000000000000000000000000000000000000d4',
         orderId: '0x' + '33'.repeat(32),
         payer: '0x00000000000000000000000000000000000000b2',

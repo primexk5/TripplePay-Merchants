@@ -54,6 +54,11 @@ export interface WebhookPayload {
   created: number; // unix seconds the event was emitted by the relayer
   data: {
     merchantId: string;
+    // Which chain this payment arrived on (chains.ts ChainConfig.chainId). Required: this is a
+    // payments system, and a delivery must never exist without knowing which chain its payment
+    // settled on. A delivery persisted before this field existed is backfilled with the default
+    // chain's id on read (JsonStore/PostgresStore) — see store/json.ts and store/postgres.ts.
+    chainId: number;
     merchant: string; // on-chain address
     orderId: string; // bytes32 hex
     payer: string;
@@ -71,9 +76,11 @@ export interface WebhookPayload {
 
 export type DeliveryStatus = 'pending' | 'delivered' | 'failed' | 'skipped';
 
-/** A short-link template created by a merchant from the dashboard. */
+/** A short-link template created by a merchant from the dashboard. A link belongs to exactly ONE
+ *  chain, chosen by the merchant at creation — orders claimed from it inherit that chain. */
 export interface PaymentLink {
   slug: string;               // 8-char base62 ID — the short URL key
+  chainId: number;            // the chain (chains.ts ChainConfig.chainId) this link is denominated on
   merchantAddress: string;    // lowercased payout address
   merchantId: string;         // platform ID for display on receipt
   merchantName: string;       // from merchant record at creation time
@@ -126,6 +133,7 @@ export type OrderSource = 'link' | 'checkout';
 
 export interface OrderMeta {
   orderId: string;            // bytes32 hex, lowercased
+  chainId: number;            // inherited from the link (source === 'link'), else the default chain
   merchantAddress: string;    // lowercased
   customerName?: string;      // optional display name the payer typed
   source: OrderSource;        // 'link' = paid a payment-link page, 'checkout' = merchant checkout/API order page
@@ -136,6 +144,9 @@ export interface OrderMeta {
 
 export interface WebhookDelivery {
   id: string; // == paymentId
+  // Which chain this payment arrived on. Required — see WebhookPayload.data.chainId. A delivery
+  // persisted before this field existed is backfilled with the default chain's id on read.
+  chainId: number;
   merchantId: string;
   url: string;
   payload: WebhookPayload;

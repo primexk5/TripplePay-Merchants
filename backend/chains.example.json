@@ -1,0 +1,47 @@
+[
+  {
+    "id": "quai",
+    "chainId": 9,
+    "kind": "quai",
+    "name": "Quai (Cyprus-1)",
+    "rpcUrl": "https://rpc.quai.network/cyprus1",
+    "contractAddress": "0x0072174EF6d0C2EB605449b0014169D104c42BbC",
+    "confirmations": 12,
+    "pollIntervalMs": 5000,
+    "maxBlockRange": 2000,
+    "acceptedTokens": [
+      "0x0049F7cbCa3556C2DfaE62Aafa7015F99de1b8f5",
+      "0x006C3e2AaAE5DB1bCd11A1a097cE572312EADdBB"
+    ],
+    "explorerUrl": "https://quaiscan.io",
+    "enabled": true,
+    "default": true
+  },
+  {
+    "id": "robinhood-testnet",
+    "chainId": 46630,
+    "kind": "evm",
+    "name": "Robinhood Chain (testnet)",
+    "rpcUrl": "https://rpc.testnet.chain.robinhood.com/rpc",
+    "contractAddress": "0xe2C0d033102B7ad963deC4b44B5e1e94bca1385f",
+    "startBlock": 120942283,
+    "confirmations": 20,
+    "pollIntervalMs": 5000,
+    "maxBlockRange": 2000,
+    "explorerUrl": "https://explorer.testnet.chain.robinhood.com",
+    "enabled": true
+  },
+  {
+    "id": "base-sepolia",
+    "chainId": 84532,
+    "kind": "evm",
+    "name": "Base Sepolia (testnet)",
+    "rpcUrl": "https://sepolia.base.org",
+    "contractAddress": "0x0000000000000000000000000000000000000000",
+    "confirmations": 10,
+    "pollIntervalMs": 5000,
+    "maxBlockRange": 2000,
+    "explorerUrl": "https://sepolia.basescan.org",
+    "enabled": false
+  }
+]

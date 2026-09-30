@@ -11,6 +11,24 @@ const boolish = (def: boolean) =>
     .transform((v) => (v === undefined ? def : v === 'true' || v === '1'));
 
 const EnvSchema = z.object({
+  // --- Multi-chain configuration (see src/chains.ts) ---------------------------------------
+  // CHAINS_JSON (inline JSON array) or CHAINS_CONFIG_PATH (path to a JSON file, default
+  // ./chains.json if present) describe every chain this process serves; see
+  // backend/chains.example.json and backend/README.md. When NEITHER is set and no ./chains.json
+  // file exists, chains.ts synthesizes a single chain from the legacy vars below (RPC_URL,
+  // CHAIN_ID, PAYWITHQUAI_ADDRESS, CHAIN_KIND, START_BLOCK, CONFIRMATIONS, POLL_INTERVAL_MS,
+  // MAX_BLOCK_RANGE, ACCEPTED_TOKENS) so an existing single-chain deployment is unaffected.
+  CHAINS_JSON: z.string().optional(),
+  CHAINS_CONFIG_PATH: z.string().optional(),
+
+  // Selects the chain client for the LEGACY single-chain fallback path above (chains.ts only
+  // reads this when neither CHAINS_JSON nor a chains.json file is present).
+  // DEPRECATED: prefer CHAINS_JSON/CHAINS_CONFIG_PATH, where each chain declares its own "kind".
+  // Kept working indefinitely for existing single-chain deployments — never removed silently.
+  // "quai" (default) is the quais-SDK path — Cyprus-1 zone rules, Qi support. "evm" is the
+  // ethers v6 path for standard EVM chains (Robinhood Chain testnet, Base Sepolia, ...).
+  CHAIN_KIND: z.enum(['quai', 'evm']).default('quai'),
+
   RPC_URL: z.string().url(),
   CHAIN_ID: z.coerce.number().int().positive(),
   PAYWITHQUAI_ADDRESS: z
@@ -131,6 +149,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       'QI_DEV_SIMULATE=true is not allowed with NODE_ENV=production — it fabricates checkout ' +
         'orders and lets anyone with the admin key mark Qi orders settled without payment.',
     );
+  }
+  // Qi (UTXO-ledger checkout) is Quai-only — it has no meaning on a standard EVM chain. Checked
+  // against the raw env (not parsed.data) so a QI_* var left at its zod default doesn't trip
+  // this — only a value the operator actually set does.
+  if (parsed.data.CHAIN_KIND === 'evm') {
+    const qiVarsSet = Object.keys(env).filter(
+      (k) => k.startsWith('QI_') && env[k] !== undefined && env[k] !== '',
+    );
+    if (qiVarsSet.length > 0) {
+      throw new Error(
+        `CHAIN_KIND=evm cannot be combined with Qi variables (${qiVarsSet.join(', ')}) — Qi is ` +
+          'Quai-only. Remove them from this deployment\'s env, or run it with CHAIN_KIND=quai (or unset).',
+      );
+    }
   }
   cached = parsed.data;
   return cached;

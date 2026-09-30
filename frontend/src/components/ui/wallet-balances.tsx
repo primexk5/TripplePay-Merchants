@@ -1,9 +1,16 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { BrowserProvider, Contract, formatUnits, parseQuai } from "quais";
-import { getActiveWallet, QUAI_MAINNET_CHAIN } from "@/lib/wallets";
+import { BrowserProvider, Contract, parseQuai } from "quais";
+import {
+  BrowserProvider as EvmBrowserProvider,
+  JsonRpcProvider as EvmJsonRpcProvider,
+  Contract as EvmContract,
+} from "ethers";
+import { getActiveWallet } from "@/lib/wallets";
 import { getRpcProvider } from "@/lib/payment";
+import { listChains, type ChainInfo } from "@/lib/chains";
+import { useChainSelector, formatTokenAmount } from "@/lib/relayer";
 import { listCurrencies } from "@/lib/currencies";
 import { requestAppWalletFunding } from "@/lib/blip";
 import { RefreshCw, Wallet as WalletIcon, PlusCircle } from "lucide-react";
@@ -13,22 +20,44 @@ const ERC20_ABI = [
   "function balanceOf(address owner) view returns (uint256)",
 ];
 
-function chainLabel(): string {
-  return "Quai mainnet holdings";
+const evmProviders = new Map<number, EvmJsonRpcProvider>();
+function getEvmRpcProvider(chain: ChainInfo): EvmJsonRpcProvider {
+  let p = evmProviders.get(chain.chainId);
+  if (!p) {
+    p = new EvmJsonRpcProvider(chain.rpcUrl);
+    evmProviders.set(chain.chainId, p);
+  }
+  return p;
 }
 
-/** Truncates a formatted unit string to 2 decimals WITHOUT float math. */
-function shortUnits(value: bigint, decimals: number): string {
-  const [whole, frac = ""] = formatUnits(value, decimals).split(".");
-  return frac ? `${whole}.${frac.slice(0, 2)}` : whole;
+/** Reads a native or ERC-20 balance against the RIGHT chain's own RPC/contract library — kept
+ *  as one small typed helper so the two SDKs' distinct Provider/Contract types never need to be
+ *  unified into an awkward union at the call site. */
+async function readBalance(chain: ChainInfo, address: string, tokenAddress: string | null): Promise<bigint> {
+  if (chain.kind === "quai") {
+    const provider = getRpcProvider();
+    if (!tokenAddress) return provider.getBalance(address);
+    return (await new Contract(tokenAddress, ERC20_ABI, provider).balanceOf(address)) as bigint;
+  }
+  const provider = getEvmRpcProvider(chain);
+  if (!tokenAddress) return provider.getBalance(address);
+  return (await new EvmContract(tokenAddress, ERC20_ABI, provider).balanceOf(address)) as bigint;
 }
 
 export function WalletBalances() {
-  const currencies = listCurrencies();
+  const chains = listChains();
+  const [chain, setChain] = useChainSelector();
+  const currencies = listCurrencies(chain.chainId);
   // Balances keyed by lowercase currency address ("native" for QUAI); null = read failed.
   const [balances, setBalances] = useState<Record<string, string | null>>({});
   const [loading, setLoading] = useState(true);
+  // Genuine failures only (RPC unreachable, etc.) — styled red. A wallet simply not supporting
+  // the selected chain (BUG 2's UX half) is not a failure; that goes through `notice` instead.
   const [error, setError] = useState<string | null>(null);
+  // Calm, plain-language explanation of an ordinary non-error state — no wallet connected yet, or
+  // the connected wallet doesn't support the selected chain. Rendered in normal text colour, never
+  // red: nothing has actually gone wrong.
+  const [notice, setNotice] = useState<string | null>(null);
   const isBlip = getActiveWallet()?.brand === "blip";
   const [topUpAmount, setTopUpAmount] = useState("10");
   const [topUpBusy, setTopUpBusy] = useState(false);
@@ -41,6 +70,7 @@ export function WalletBalances() {
     // silent so it never re-flashes the skeleton the page already shows.
     if (!opts?.silent) setLoading(true);
     setError(null);
+    setNotice(null);
     // Forget any previously-shown balances so a failed refresh can't masquerade as success.
     setBalances({});
 
@@ -50,36 +80,59 @@ export function WalletBalances() {
 
     const wallet = getActiveWallet();
     if (!wallet) {
-      setError("No wallet connected");
+      // Not connecting yet is an ordinary state, not a failure.
+      setNotice("Connect a wallet to see your balances.");
+      setLoading(false);
+      return;
+    }
+
+    // A quai_* RPC call must never be sent to a wallet that doesn't support Quai — guarded HERE,
+    // at the point of the call, rather than trusting the selected tab to already be correct (the
+    // tab is freely switchable independently of which wallet is connected). This is also not a
+    // failure: the merchant's wallet is working fine, it just isn't a Quai wallet.
+    if (chain.kind === "quai" && !wallet.supportsQuai) {
+      setNotice(
+        `Quai balances need a Quai-compatible wallet, such as Pelagus or Blip. ${wallet.name} doesn't support Quai — your payment links on other chains are unaffected.`,
+      );
       setLoading(false);
       return;
     }
 
     try {
-      // Resolve the account from the wallet (no network read), then read balances through the
-      // app's canonical RPC — the network the relayer + contracts actually run on. The wallet's
-      // injected provider can sit on a different node/shard, where eth_call returns no data and
-      // balance reads fail with "missing revert data".
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const accounts = await new BrowserProvider(wallet.provider as any, "any").listAccounts();
+      // Resolve the account from the wallet. This DOES depend on chain kind — quais'
+      // BrowserProvider issues a quai_accounts-style call, which a plain EVM wallet (MetaMask,
+      // Rabby, ...) has no support for and throws "unsupported operation" on. Route by the
+      // SELECTED chain's kind — safe now that the supportsQuai guard above has already ruled out
+      // a quai_* call reaching a wallet that can't answer it.
+      const accounts =
+        chain.kind === "quai"
+          ? // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            await new BrowserProvider(wallet.provider as any, "any").listAccounts()
+          : // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            await new EvmBrowserProvider(wallet.provider as any).listAccounts();
       if (!accounts.length) throw new Error("Wallet locked");
       const address = accounts[0].address;
 
-      const provider = getRpcProvider();
-
-      // Native QUAI + every configured ERC-20 (mUSDQ/USDT/WQUAI registry), read in parallel;
-      // one failing token read must never hide the others.
+      // Read balances through the SELECTED chain's own canonical RPC — the wallet's injected
+      // provider can sit on a different node/shard, where eth_call returns no data and balance
+      // reads fail with "missing revert data".
+      // Native currency + every configured ERC-20 for this chain, read in parallel; one failing
+      // token read must never hide the others.
       const entries: Array<[string, Promise<string | null>]> = [
-        ["native", provider.getBalance(address).then((b) => shortUnits(b, 18)).catch(() => null)],
-        ...listCurrencies()
+        [
+          "native",
+          readBalance(chain, address, null)
+            .then((b) => formatTokenAmount(b, chain.nativeCurrency.decimals, chain.kind))
+            .catch(() => null),
+        ],
+        ...listCurrencies(chain.chainId)
           .filter((c) => c.address !== "0x0000000000000000000000000000000000000000")
           .map(
             (c) =>
               [
                 c.address.toLowerCase(),
-                new Contract(c.address, ERC20_ABI, provider)
-                  .balanceOf(address)
-                  .then((b) => shortUnits(b as bigint, c.decimals))
+                readBalance(chain, address, c.address)
+                  .then((b) => formatTokenAmount(b, c.decimals, chain.kind))
                   .catch(() => null),
               ] as [string, Promise<string | null>],
           ),
@@ -92,10 +145,11 @@ export function WalletBalances() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [chain]);
 
-  // Auto-load once on mount (silent — the skeleton is already showing while loading=true);
-  // all later refreshes go through the button or the Blip top-up flow.
+  // Auto-load on mount AND whenever the selected chain changes (silent — the skeleton is
+  // already showing while loading=true); manual refreshes go through the button or the Blip
+  // top-up flow.
   useEffect(() => {
     // fetchBalances only touches state after its `await Promise.resolve()` yield, but the
     // compiler lint still flags the call itself — same guard the previous implementation used.
@@ -124,7 +178,7 @@ export function WalletBalances() {
     setTopUpError(null);
     try {
       await requestAppWalletFunding(wallet.provider, {
-        chainId: QUAI_MAINNET_CHAIN.chainId,
+        chainId: `0x${chain.chainId.toString(16)}`,
         reason: "manual top-up",
         continueLabel: "Add funds",
         assets: [
@@ -155,7 +209,7 @@ export function WalletBalances() {
           </div>
           <div>
             <h2 className="text-sm font-semibold">Wallet Balances</h2>
-            <p className="text-xs text-[#8b93a7]">Your current {chainLabel()}</p>
+            <p className="text-xs text-[#8b93a7]">Your current {chain.name} holdings</p>
           </div>
         </div>
         <button
@@ -168,8 +222,43 @@ export function WalletBalances() {
         </button>
       </div>
 
+      {chains.length > 1 && (
+        <div className="mb-4 flex flex-wrap gap-2">
+          {chains.map((c) => (
+            <button
+              key={c.chainId}
+              onClick={() => c.available && setChain(c)}
+              disabled={!c.available}
+              title={
+                c.available
+                  ? undefined
+                  : c.availability === "misconfigured"
+                    ? `${c.name} is temporarily unavailable — contact support.`
+                    : `${c.name} is coming soon`
+              }
+              className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition ${
+                !c.available
+                  ? "cursor-not-allowed border-white/7 text-[#4f5868]"
+                  : chain.chainId === c.chainId
+                    ? "border-[#38bdf8] bg-[#38bdf8]/10 text-[#38bdf8]"
+                    : "border-white/7 text-[#8b93a7] hover:text-white"
+              }`}
+            >
+              {c.name}
+              {!c.available && (
+                <span className="ml-1 text-[10px] uppercase text-[#4f5868]">
+                  {c.availability === "misconfigured" ? "Unavailable" : "Soon"}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+
       {error ? (
         <p className="text-sm text-red-400">{error}</p>
+      ) : notice ? (
+        <p className="text-sm text-[#8b93a7]">{notice}</p>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2">
           {currencies.map((c) => {
@@ -178,7 +267,9 @@ export function WalletBalances() {
             return (
               <div key={key} className="rounded-xl border border-white/4 bg-[#0a0a0a] p-4">
                 <p className="text-xs text-[#8b93a7]">
-                  {key === "native" && isBlip ? "Native QUAI · app wallet" : c.symbol}
+                  {key === "native" && isBlip && chain.kind === "quai"
+                    ? `Native ${chain.nativeCurrency.symbol} · app wallet`
+                    : c.symbol}
                 </p>
                 <p className={`mt-1 font-mono text-xl ${key === "native" ? "text-white" : "text-[#34d399]"}`}>
                   {loading ? "..." : value ?? "—"}
@@ -189,7 +280,7 @@ export function WalletBalances() {
         </div>
       )}
 
-      {isBlip && (
+      {isBlip && chain.kind === "quai" && (
         <div className="mt-4 rounded-xl border border-white/7 bg-[#0a0a0a] p-4">
           <p className="text-xs leading-5 text-[#8b93a7]">
             You&apos;re connected with Blip, so this card shows your{" "}

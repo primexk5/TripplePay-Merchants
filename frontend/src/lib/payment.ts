@@ -21,6 +21,8 @@ import {
   requestAppWalletFunding,
 } from "./blip";
 import { currencyDecimals, currencySymbol } from "./currencies";
+import * as evmPayment from "./evmPayment";
+import type { ChainInfo } from "./chains";
 
 export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 export const PAYWITHQUAI_ADDRESS = process.env.NEXT_PUBLIC_PAYWITHQUAI_ADDRESS!;
@@ -524,8 +526,7 @@ async function getSignerOnNetwork(): Promise<Signer> {
   const net = await ensureQuaiNetwork(wallet.provider, chain, { quaiNative });
   if (net === "unsupported") {
     throw new Error(
-      `${wallet.name} couldn't switch to ${chain.chainName} (chain ${parseInt(chain.chainId, 16)}) — ` +
-        `switch networks in your wallet and retry.`,
+      `${wallet.name} couldn't switch to ${chain.chainName} — switch networks in your wallet and retry.`,
     );
   }
   return makeBrowserProvider(wallet.provider).getSigner();
@@ -649,14 +650,20 @@ async function assertMerchantSigner(signer: Signer, merchant: string): Promise<v
   }
 }
 
-/** Merchant registers an order on-chain. Returns the tx receipt. */
+/** Merchant registers an order on-chain. Returns the tx receipt.
+ *  `chain` is optional and dispatches to evmPayment.ts for an "evm"-kind chain; omitted (or a
+ *  "quai"-kind chain) keeps the exact pre-multichain Quai behaviour below. */
 export async function registerOrder(
   merchant: string,
   orderId: string,
   token: string,
   amount: bigint,
   expiry = 0n,
+  chain?: ChainInfo,
 ): Promise<string> {
+  if (chain && chain.kind === "evm") {
+    return evmPayment.registerOrder(chain, merchant, orderId, token, amount, expiry);
+  }
   return registerOnChain(merchant, "registerOrder", [orderId, token, amount, expiry]);
 }
 
@@ -666,7 +673,11 @@ export async function registerOrderBatch(
   token: string,
   amount: bigint,
   expiry = 0n,
+  chain?: ChainInfo,
 ): Promise<string> {
+  if (chain && chain.kind === "evm") {
+    return evmPayment.registerOrderBatch(chain, merchant, orderIds, token, amount, expiry);
+  }
   return registerOnChain(merchant, "registerOrderBatch", [orderIds, token, amount, expiry]);
 }
 
@@ -679,7 +690,11 @@ export async function registerOrderWithPayer(
   amount: bigint,
   expiry: bigint,
   expectedPayer: string,
+  chain?: ChainInfo,
 ): Promise<string> {
+  if (chain && chain.kind === "evm") {
+    return evmPayment.registerOrderWithPayer(chain, merchant, orderId, token, amount, expiry, expectedPayer);
+  }
   return registerOnChain(merchant, "registerOrderWithPayer", [
     orderId,
     token,
@@ -718,13 +733,19 @@ async function registerOnChain(
   return waitForTxReceipt(tx.hash);
 }
 
-/** Customer settles an ERC-20 order (approve + payOrder). Returns the tx receipt. */
+/** Customer settles an ERC-20 order (approve + payOrder). Returns the tx receipt.
+ *  `chain` is optional and dispatches to evmPayment.ts for an "evm"-kind chain; omitted (or a
+ *  "quai"-kind chain) keeps the exact pre-multichain Quai behaviour below. */
 export async function payOrder(
   merchant: string,
   orderId: string,
   token: string,
   amount: bigint,
+  chain?: ChainInfo,
 ): Promise<string> {
+  if (chain && chain.kind === "evm") {
+    return evmPayment.payOrder(chain, merchant, orderId, token, amount);
+  }
   const wallet = getActiveWallet();
   if (!wallet) {
     throw new Error("No wallet connected — connect a wallet first.");
@@ -771,7 +792,7 @@ async function payOrderViaBlip(
   // Cheap guard: single instant quai_chainId read when already on mainnet.
   const net = await ensureQuaiNetwork(provider, QUAI_MAINNET_CHAIN);
   if (net === "unsupported") {
-    throw new Error("Blip couldn't switch to Quai mainnet (chain 9) — switch networks and retry.");
+    throw new Error("Blip couldn't switch to Quai mainnet — switch networks and retry.");
   }
   const from = await blipConnectedAddress(provider);
 
@@ -840,12 +861,22 @@ async function payOrderViaBlip(
   });
 }
 
-/** Customer settles a native QUAI order. Returns the tx receipt. */
+/** Customer settles a native-currency order. Returns the tx receipt.
+ *  `chain` is optional and dispatches to evmPayment.ts for an "evm"-kind chain; omitted (or a
+ *  "quai"-kind chain) keeps the exact pre-multichain Quai behaviour below (including `amount`
+ *  as a QUAI decimal string, which only that path accepts). */
 export async function payOrderNative(
   merchant: string,
   orderId: string,
   amount: bigint | string,
+  chain?: ChainInfo,
 ): Promise<string> {
+  if (chain && chain.kind === "evm") {
+    if (typeof amount !== "bigint") {
+      throw new Error("payOrderNative on an EVM chain requires `amount` as a bigint (smallest unit).");
+    }
+    return evmPayment.payOrderNative(chain, merchant, orderId, amount);
+  }
   const wallet = getActiveWallet();
   if (!wallet) {
     throw new Error("No wallet connected — connect a wallet first.");
@@ -886,7 +917,7 @@ async function payOrderNativeViaBlip(
   // otherwise Blip is asked to switch/add (documented supported) before we send value.
   const net = await ensureQuaiNetwork(provider, QUAI_MAINNET_CHAIN);
   if (net === "unsupported") {
-    throw new Error("Blip couldn't switch to Quai mainnet (chain 9) — switch networks and retry.");
+    throw new Error("Blip couldn't switch to Quai mainnet — switch networks and retry.");
   }
   const from = await blipConnectedAddress(provider);
   await ensureBlipNativeFunding(provider, from, value);
@@ -921,6 +952,7 @@ export interface QiOrder {
 export interface OrderStatus {
   merchant: string;
   orderId: string;
+  chainId: number;
   token: string;
   amount: string;
   feeBps: number;
@@ -931,14 +963,18 @@ export interface OrderStatus {
   webhook: { status: string; attempts: number } | null;
 }
 
-/** Settlement status from the relayer backend (final source of truth). */
+/** Settlement status from the relayer backend (final source of truth). Pass `chain` for an
+ *  order on a non-default chain — omitted, the backend resolves its own default chain, which is
+ *  only correct for that chain's own orders. */
 export async function fetchOrderStatus(
   merchant: string,
   orderId: string,
   timeoutMs = 10_000,
+  chain?: ChainInfo,
 ): Promise<OrderStatus | null> {
+  const qs = chain ? `?chainId=${chain.chainId}` : "";
   const res = await backendFetch(
-    `/v1/orders/${merchant}/${orderId}`,
+    `/v1/orders/${merchant}/${orderId}${qs}`,
     { signal: AbortSignal.timeout(timeoutMs) },
   );
   if (res.status === 404) return null;
@@ -973,11 +1009,16 @@ export async function reserveQiOnLink(
   return (await res.json()) as QiLinkClaim;
 }
 
-/** On-chain fallback when the backend is unreachable. */
+/** On-chain fallback when the backend is unreachable. `chain` dispatches to evmPayment.ts for
+ *  an "evm"-kind chain; omitted (or "quai") keeps the pre-multichain Quai behaviour. */
 export async function isSettledOnChain(
   merchant: string,
   orderId: string,
+  chain?: ChainInfo,
 ): Promise<boolean> {
+  if (chain && chain.kind === "evm") {
+    return evmPayment.isSettledOnChain(chain, merchant, orderId);
+  }
   const contract = new Contract(
     resolvePayAddress(),
     paywithquaiAbi,
@@ -1000,11 +1041,17 @@ export interface OnChainOrder {
   nonce: bigint;
 }
 
-/** Raw order read from the contract (authoritative display + expectedPayer). */
+/** Raw order read from the contract (authoritative display + expectedPayer). `chain` dispatches
+ *  to evmPayment.ts for an "evm"-kind chain; omitted (or "quai") keeps the pre-multichain Quai
+ *  behaviour. */
 export async function getOrderOnChain(
   merchant: string,
   orderId: string,
+  chain?: ChainInfo,
 ): Promise<OnChainOrder | null> {
+  if (chain && chain.kind === "evm") {
+    return evmPayment.getOrderOnChain(chain, merchant, orderId);
+  }
   const contract = new Contract(
     resolvePayAddress(),
     paywithquaiAbi,
@@ -1033,12 +1080,15 @@ export interface ConfirmationResult {
 }
 
 /** Poll until the relayer confirms the webhook. On-chain settlement alone is not treated as
- *  complete — merchants should fulfill on the signed webhook, not just a chain read. */
+ *  complete — merchants should fulfill on the signed webhook, not just a chain read.
+ *  `chain` dispatches the on-chain read to evmPayment.ts for an "evm"-kind chain; the backend
+ *  poll is chain-agnostic (passes chainId through as a query param either way). */
 export async function waitForConfirmation(
   merchant: string,
   orderId: string,
   onProgress?: (webhookStatus: string | null) => void,
   maxSeconds = 120,
+  chain?: ChainInfo,
 ): Promise<ConfirmationResult> {
   const deadline = Date.now() + maxSeconds * 1000;
   let backendOk = false;
@@ -1046,10 +1096,10 @@ export async function waitForConfirmation(
   while (Date.now() < deadline) {
     // Check backend and chain in parallel — a slow backend must never gate the chain read.
     const [order, settledChain] = await Promise.all([
-      fetchOrderStatus(merchant, orderId, 4_000).catch(() => null),
+      fetchOrderStatus(merchant, orderId, 4_000, chain).catch(() => null),
       settledOnChain
         ? Promise.resolve(true)
-        : isSettledOnChain(merchant, orderId).catch(() => false),
+        : isSettledOnChain(merchant, orderId, chain).catch(() => false),
     ]);
     if (order) {
       onProgress?.(order.webhook?.status ?? null);
@@ -1063,7 +1113,7 @@ export async function waitForConfirmation(
     await new Promise((r) => setTimeout(r, 2000));
   }
   if (!settledOnChain) {
-    settledOnChain = await isSettledOnChain(merchant, orderId).catch(() => false);
+    settledOnChain = await isSettledOnChain(merchant, orderId, chain).catch(() => false);
   }
   return { backend: backendOk, settledOnChain, webhookDelivered: false };
 }
@@ -1072,6 +1122,8 @@ export { formatQuai, parseQuai };
 
 export interface LinkInfo {
   slug: string;
+  chainId: number;
+  chain: { id: string; chainId: number; kind: "quai" | "evm"; name: string } | null;
   merchantAddress: string;
   merchantId: string;
   merchantName: string;
@@ -1140,9 +1192,20 @@ export async function submitPaymentMeta(params: {
  * "unsupported addressable value" after the customer has already connected their wallet.
  * Returns an error message for the customer, or null when the link is payable.
  */
-export async function linkPaymentProblem(link: LinkInfo): Promise<string | null> {
+export async function linkPaymentProblem(link: LinkInfo, chain?: ChainInfo): Promise<string | null> {
   const token = (link.tokenAddress ?? "").trim();
   if (token.toLowerCase() === ZERO_ADDRESS.toLowerCase()) return null;
+  if (chain && chain.kind === "evm") {
+    try {
+      const accepted = await evmPayment.isTokenAccepted(chain, token);
+      if (!accepted) {
+        return "This link pays in a token that isn't accepted by the payment contract yet — please ask the merchant to update it.";
+      }
+    } catch {
+      // RPC hiccup — don't block the payment on a failed read; payOrder surfaces real errors.
+    }
+    return null;
+  }
   let addr: string;
   try {
     addr = getAddress(token);
@@ -1209,7 +1272,9 @@ export async function claimOrderFromLink(slug: string, payerAddress: string): Pr
   return body;
 }
 
-/** Create a short link in the backend (requires merchant session cookie). */
+/** Create a short link in the backend (requires merchant session cookie). `chainId` is which
+ *  chain the link is denominated on (a link belongs to exactly one, fixed at creation) — omit it
+ *  for the backend's own default chain (Quai today). */
 export async function createPaymentLink(payload: {
   shopName?: string;
   tokenAddress: string;
@@ -1219,6 +1284,7 @@ export async function createPaymentLink(payload: {
   expiryDurationSecs: number;
   multiPay: boolean;
   orderPool: string[];
+  chainId?: number;
 }): Promise<LinkInfo> {
   const res = await backendFetch('/v1/links', {
     method: 'POST',
@@ -1250,6 +1316,7 @@ export async function waitForOnChainConfirmation(
   orderId: string,
   onProgress?: (status: string) => void,
   maxSeconds = 90,
+  chain?: ChainInfo,
 ): Promise<boolean> {
   const deadline = Date.now() + maxSeconds * 1000;
   onProgress?.('Waiting for block confirmation…');
@@ -1257,8 +1324,8 @@ export async function waitForOnChainConfirmation(
     // Chain + backend in parallel; backend gets a short timeout so a slow or sleeping relayer
     // never delays the fast on-chain confirmation.
     const [settledChain, order] = await Promise.all([
-      isSettledOnChain(merchant, orderId).catch(() => false),
-      fetchOrderStatus(merchant, orderId, 4_000).catch(() => null),
+      isSettledOnChain(merchant, orderId, chain).catch(() => false),
+      fetchOrderStatus(merchant, orderId, 4_000, chain).catch(() => null),
     ]);
     if (settledChain || order?.settled) return true;
     await new Promise((r) => setTimeout(r, 2000));

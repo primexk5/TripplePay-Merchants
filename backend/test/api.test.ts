@@ -77,6 +77,7 @@ const jsonHeaders = { 'content-type': 'application/json' };
 async function seedDelivery(store: JsonStore, over: Partial<WebhookDelivery> = {}): Promise<WebhookDelivery> {
   const d: WebhookDelivery = {
     id: '0x' + 'ab'.repeat(32) + ':0',
+    chainId: 9,
     merchantId: 'mch_1',
     url: 'https://example.test/webhook',
     payload: {
@@ -85,6 +86,7 @@ async function seedDelivery(store: JsonStore, over: Partial<WebhookDelivery> = {
       created: 1,
       data: {
         merchantId: 'mch_1',
+        chainId: 9,
         merchant: MERCHANT_ADDR,
         orderId: ORDER_ID,
         payer: '0x00000000000000000000000000000000000000b2',

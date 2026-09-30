@@ -14,11 +14,10 @@ import {
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { parseError } from "@/lib/utils";
-import { parseQuai } from "quais";
 import { DashboardShell } from "@/components/layout/dashboard-shell";
 import { WalletSelector } from "@/components/ui/wallet-selector";
 import { checkSession } from "@/lib/auth";
-import { getActiveWallet } from "@/lib/wallets";
+import { getActiveWallet, ensureNetwork, silentActiveWalletAddress } from "@/lib/wallets";
 import {
   ZERO_ADDRESS,
   newOrderId,
@@ -28,6 +27,8 @@ import {
   type LinkInfo,
 } from "@/lib/payment";
 import { listCurrencies, findCurrency, NATIVE_CURRENCY } from "@/lib/currencies";
+import { listChains, type ChainInfo } from "@/lib/chains";
+import { useChainSelector } from "@/lib/relayer";
 
 /** Exact decimal-string → smallest-unit conversion (no float math). */
 function toUnits(decimal: string, decimals: number): bigint {
@@ -44,32 +45,54 @@ function shortUrl(slug: string): string {
   return `/pay/${slug}`;
 }
 
-const POOL_SIZE_OPTIONS = [5, 10, 20, 50];
+type ExpiryResult =
+  | { ok: true; expiry: bigint; expiryDurationSecs: number }
+  | { ok: false };
 
-/** Read the connected account from the stored active wallet WITHOUT prompting. */
-async function silentWalletAddress(): Promise<string | null> {
-  const wallet = getActiveWallet();
-  if (!wallet) return null;
-  for (const method of ["quai_accounts", "eth_accounts"]) {
-    try {
-      const accounts = (await wallet.provider.request({ method })) as string[];
-      if (accounts?.length) return accounts[0];
-    } catch {
-      /* try the next method */
-    }
-  }
-  return null;
+/**
+ * Derives the on-chain `expiry` (registered immutably) and the `expiryDurationSecs` sent to the
+ * backend from ONE captured timestamp, so the two can never drift apart. Call this exactly once,
+ * at submit time — never twice, and never during render (Date.now() is impure; this must only
+ * run in response to the merchant's click, not on an arbitrary re-render).
+ */
+function computeExpiry(expiryHoursInput: string): ExpiryResult {
+  if (expiryHoursInput.trim() === "") return { ok: true, expiry: 0n, expiryDurationSecs: 0 };
+  const hours = Number(expiryHoursInput);
+  if (!Number.isFinite(hours) || hours <= 0) return { ok: false };
+  const expiryDurationSecs = Math.round(hours * 3600);
+  const submittedAtSecs = Math.floor(Date.now() / 1000);
+  return { ok: true, expiry: BigInt(submittedAtSecs + expiryDurationSecs), expiryDurationSecs };
 }
+
+const POOL_SIZE_OPTIONS = [5, 10, 20, 50];
 
 export default function LinksPage() {
   // The wallet the merchant signed in with — the ONLY payout destination.
   const [merchantAddress, setMerchantAddress] = useState<string | null>(null);
   // The account currently exposed by the connected wallet (must equal merchantAddress).
   const [connectedAddress, setConnectedAddress] = useState<string | null>(null);
+  // Which chain this link will be created on — a link belongs to exactly one chain, chosen here.
+  const CHAINS = listChains();
+  const [chain, setChain] = useChainSelector();
   const [token, setToken] = useState<string>(NATIVE_CURRENCY.address); // registry currency address
-  const CURRENCIES = listCurrencies();
-  const selected = findCurrency(token) ?? NATIVE_CURRENCY;
+  const CURRENCIES = listCurrencies(chain.chainId);
+  const selected = findCurrency(token, chain.chainId) ?? CURRENCIES[0]!;
   const symbol = selected.symbol;
+
+  // Switching chains invalidates the selected token (addresses aren't valid across chains) —
+  // reset to the new chain's native currency whenever the chain changes, whether from an explicit
+  // pick (selectChain below) or the connected-wallet default seeded by useChainSelector. Adjusted
+  // during render (React's recommended pattern for "state derived from a changed value"), not in
+  // an effect — the lint rule requires it.
+  const [prevChainId, setPrevChainId] = useState(chain.chainId);
+  if (chain.chainId !== prevChainId) {
+    setPrevChainId(chain.chainId);
+    setToken(ZERO_ADDRESS);
+  }
+
+  const selectChain = (c: ChainInfo) => {
+    setChain(c);
+  };
   const [amount, setAmount] = useState("");
   const [shopName, setShopName] = useState("");
   const [expiryHours, setExpiryHours] = useState("");
@@ -113,7 +136,7 @@ export default function LinksPage() {
   // Read the already-connected account silently; connect only if none is available.
   useEffect(() => {
     void (async () => {
-      const addr = await silentWalletAddress().catch(() => null);
+      const addr = await silentActiveWalletAddress().catch(() => null);
       if (addr) setConnectedAddress(addr);
     })();
   }, []);
@@ -123,6 +146,20 @@ export default function LinksPage() {
     if (!payout) {
       setError("Sign in with your wallet to create payment links.");
       return;
+    }
+    // Re-verify the wallet is STILL connected before signing — connectedAddress is a snapshot
+    // from mount (or the last successful connect) and goes stale if the extension locks or
+    // disconnects mid-session. Without this, a merchant hits a cryptic signing error deep in
+    // registerOrderBatch with no "Connect wallet" button visible to recover with, since that UI
+    // only renders while connectedAddress is empty.
+    const stillConnected = await silentActiveWalletAddress().catch(() => null);
+    if (!stillConnected) {
+      setConnectedAddress(null);
+      setError("Your wallet disconnected — connect it again to continue.");
+      return;
+    }
+    if (stillConnected.toLowerCase() !== connectedAddress?.toLowerCase()) {
+      setConnectedAddress(stillConnected);
     }
     if (!connectedAddress) {
       setError("Connect your wallet to sign order registrations — it also receives the payments.");
@@ -136,10 +173,7 @@ export default function LinksPage() {
     }
     let units: bigint;
     try {
-      units =
-        selected.address === ZERO_ADDRESS
-          ? parseQuai(amount)
-          : toUnits(amount, selected.decimals);
+      units = toUnits(amount, selected.decimals);
     } catch {
       setError("Enter a valid amount, e.g. 25.0");
       return;
@@ -158,25 +192,35 @@ export default function LinksPage() {
     // Registry currencies carry their canonical mainnet address; native uses ZERO_ADDRESS.
     const onChainToken: string = selected.address;
 
-    let expiry = 0n;
-    if (expiryHours.trim() !== "") {
-      const hours = Number(expiryHours);
-      if (!Number.isFinite(hours) || hours <= 0) {
-        setError("Expiry must be a positive number of hours.");
-        setBusy(false);
-        setRegistering(false);
-        return;
-      }
-      expiry = BigInt(Math.floor(Date.now() / 1000) + hours * 3600);
+    // `expiry` is registered on-chain and can never be changed afterwards, so it and
+    // `expiryDurationSecs` (sent to the backend, shown to the merchant) must derive from the
+    // exact same captured instant — see computeExpiry's own note on why this can't be two
+    // separate Date.now() reads.
+    const expiryResult = computeExpiry(expiryHours);
+    if (!expiryResult.ok) {
+      setError("Expiry must be a positive number of hours.");
+      setBusy(false);
+      setRegistering(false);
+      return;
     }
+    const { expiry, expiryDurationSecs } = expiryResult;
 
     const orderIds: string[] = [];
     try {
       for (let i = 0; i < poolSize; i++) orderIds.push(newOrderId());
 
+      // Make sure the connected wallet is actually on the chosen chain before asking it to
+      // sign — it may still be on whatever chain it was last switched to. ensureNetwork refuses
+      // outright (no RPC call) if the connected wallet can't serve this chain at all, with a
+      // specific, named error instead of a stuck wallet.
+      const activeWallet = getActiveWallet();
+      if (activeWallet) {
+        await ensureNetwork(activeWallet, chain);
+      }
+
       // Register all orders on-chain in one atomic transaction — signed by the connected
       // wallet, which is the payout wallet (assertMerchantSigner enforces the match).
-      await registerOrderBatch(payout, orderIds, onChainToken, units, expiry);
+      await registerOrderBatch(payout, orderIds, onChainToken, units, expiry, chain);
       setRegistering(false);
 
       // Create the short link in the backend
@@ -186,9 +230,10 @@ export default function LinksPage() {
         amount: units.toString(),
         amountDisplay: amount,
         symbol,
-        expiryDurationSecs: expiry > 0n ? Number(expiry) - Math.floor(Date.now() / 1000) : 0,
+        expiryDurationSecs,
         multiPay,
         orderPool: orderIds,
+        chainId: chain.chainId,
       });
 
       const url = shortUrl(created.slug);
@@ -248,8 +293,9 @@ export default function LinksPage() {
                     {merchantAddress}
                   </p>
                   <p className="mt-1 text-xs leading-5 text-[#8b93a7]">
-                    Payments settle straight to your connected wallet on Quai
-                    mainnet — a platform fee of 0.3% is deducted at settlement.
+                    Payments settle straight to your connected wallet on
+                    whichever chain each link is created on — a platform fee
+                    of 0.3% is deducted at settlement.
                   </p>
                   {connectedAddress &&
                   connectedAddress.toLowerCase() !== merchantAddress.toLowerCase() ? (
@@ -270,15 +316,53 @@ export default function LinksPage() {
                     <WalletSelector
                       connectedAddress={null}
                       onConnected={(addr) => setConnectedAddress(addr)}
+                      onDisconnect={() => setConnectedAddress(null)}
                       label="Connect wallet"
+                      chain={chain}
                     />
                   </div>
                 )}
 
                 <div className="grid gap-4 sm:grid-cols-2">
-                  {/* Asset */}
+                  {/* Chain — the feature this phase exists for: a link is fixed to exactly one
+                      chain, chosen here, which then filters the tokens offered below. */}
                   <div className="sm:col-span-2">
-                    <p className="mb-2 text-sm text-[#8b93a7]">Asset</p>
+                    <p className="mb-2 text-sm text-[#8b93a7]">Chain</p>
+                    <div className="flex flex-wrap overflow-hidden rounded-xl border border-white/7">
+                      {CHAINS.map((c) => (
+                        <button
+                          key={c.chainId}
+                          onClick={() => c.available && selectChain(c)}
+                          disabled={!c.available}
+                          title={
+                            c.available
+                              ? undefined
+                              : c.availability === "misconfigured"
+                                ? `${c.name} is temporarily unavailable — contact support.`
+                                : `${c.name} is coming soon`
+                          }
+                          className={`flex-1 px-4 py-2.5 text-sm font-medium transition ${
+                            !c.available
+                              ? "cursor-not-allowed bg-[#171717] text-[#4f5868]"
+                              : chain.chainId === c.chainId
+                                ? "bg-[#38bdf8] text-[#061018]"
+                                : "bg-[#171717] text-[#8b93a7] hover:text-white"
+                          }`}
+                        >
+                          {c.name}
+                          {!c.available && (
+                            <span className="ml-1.5 text-[10px] uppercase tracking-wider text-[#4f5868]">
+                              {c.availability === "misconfigured" ? "Unavailable" : "Soon"}
+                            </span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Asset — filtered to the chosen chain's currencies. */}
+                  <div className="sm:col-span-2">
+                    <p className="mb-2 text-sm text-[#8b93a7]">Asset on {chain.name}</p>
                     <div className="flex flex-wrap overflow-hidden rounded-xl border border-white/7">
                       {CURRENCIES.map((c) => (
                         <button
@@ -518,6 +602,11 @@ export default function LinksPage() {
                             <p className="truncate text-sm font-medium">
                               {l.amountDisplay} {l.symbol}
                             </p>
+                            {l.chain && (
+                              <span className="inline-flex items-center rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] text-[#8b93a7]">
+                                {l.chain.name}
+                              </span>
+                            )}
                             {l.multiPay && (
                               <span className="inline-flex items-center gap-1 rounded-full border border-[#38bdf8]/20 bg-[#38bdf8]/8 px-2 py-0.5 text-[10px] text-[#38bdf8]">
                                 <Users size={9} />

@@ -42,7 +42,11 @@ export class JsonStore implements Store {
   private readonly byMerchantId = new Map<string, string>(); // merchantId -> address key
   private readonly byOrderKey = new Map<string, string>(); // "<merchant>:<orderId>" -> delivery id
 
-  constructor(path: string) {
+  /** `defaultChainId`: what a pre-multi-chain record (link/order-meta/delivery with no chainId
+   *  of its own) is read back as. Optional so `new JsonStore(path)` keeps working exactly as
+   *  before for every existing caller/test; production always passes the real default chain's
+   *  chainId (see index.ts). */
+  constructor(path: string, private readonly defaultChainId: number = 9) {
     this.path = path;
     this.tmpPath = `${path}.tmp`;
     // 0700: this file holds plaintext webhook secrets (see class note) — keep the whole directory
@@ -68,6 +72,14 @@ export class JsonStore implements Store {
     );
   }
 
+  /** Backfills `chainId` onto a record loaded from disk that predates multi-chain support. A
+   *  genuinely present chainId (including 0, which is not a valid chain id but never occurs in
+   *  practice) always wins over the default. */
+  private withChainId<T extends { chainId?: number }>(rec: T): T & { chainId: number } {
+    const existing = (rec as { chainId?: number }).chainId;
+    return existing === undefined ? { ...rec, chainId: this.defaultChainId } : (rec as T & { chainId: number });
+  }
+
   private read(): FileShape {
     if (!existsSync(this.path)) return { cursors: {}, merchants: {}, deliveries: {}, sessions: {}, nonces: {}, links: {}, claims: {}, orderMeta: {}, qiOrders: {} };
     try {
@@ -86,15 +98,30 @@ export class JsonStore implements Store {
         logger.warn('migrating legacy un-scoped cursor — the indexer will re-scan from START_BLOCK/head');
         parsed.cursors = { legacy: parsed.cursor };
       }
+      // Multi-chain migration: links/order-meta/deliveries written before chainId existed carry
+      // no such field on disk. Backfill it to the default chain, once, here — every getter then
+      // always returns a record with a chainId, with no per-method special-casing.
+      const links: Record<string, PaymentLink> = {};
+      for (const [slug, l] of Object.entries((parsed as Partial<FileShape>).links ?? {})) {
+        links[slug] = this.withChainId(l);
+      }
+      const orderMeta: Record<string, OrderMeta> = {};
+      for (const [id, m] of Object.entries((parsed as Partial<FileShape>).orderMeta ?? {})) {
+        orderMeta[id] = this.withChainId(m);
+      }
+      const deliveries: Record<string, WebhookDelivery> = {};
+      for (const [id, d] of Object.entries(parsed.deliveries ?? {})) {
+        deliveries[id] = this.withChainId(d);
+      }
       return {
         cursors: parsed.cursors ?? {},
         merchants: parsed.merchants ?? {},
-        deliveries: parsed.deliveries ?? {},
+        deliveries,
         sessions: parsed.sessions ?? {},
         nonces: parsed.nonces ?? {},
-        links: (parsed as Partial<FileShape>).links ?? {},
+        links,
         claims: (parsed as Partial<FileShape>).claims ?? {},
-        orderMeta: (parsed as Partial<FileShape>).orderMeta ?? {},
+        orderMeta,
         qiOrders: (parsed as Partial<FileShape>).qiOrders ?? {},
       };
     } catch (err) {

@@ -126,6 +126,37 @@ and `FEE_RECIPIENT` are all set, and verifies the fee routing on-chain after ini
 - Networks: mainnet (`CHAIN_ID=9`, `https://rpc.quai.network`), Orchard testnet
   (`CHAIN_ID=15000`, `https://orchard.rpc.quai.network`) if you need it again.
 
+## Standard EVM chains (testnet)
+
+Alongside the Quai deployment above, `scripts/evm/` is a parallel toolchain — same contracts, same
+initializer/governance model, but using `hre.ethers` (ethers v6) instead of the `quais` SDK, for
+standard EVM testnets. The Quai scripts and networks are untouched by this.
+
+```bash
+cp .env.example .env
+# Fill in EVM_DEPLOYER_PK (a fresh testnet-only key — any address format works, no Cyprus-1
+# zone requirement) and fund it from a faucet:
+#   Robinhood Chain testnet: https://faucet.testnet.chain.robinhood.com
+#   Base Sepolia:            use any public Base Sepolia ETH faucet
+npm run deploy:robinhood-testnet   # or: npm run deploy:base-sepolia
+npm run demo:robinhood-testnet     # or: npm run demo:base-sepolia
+```
+
+- `deploy:robinhood-testnet` / `deploy:base-sepolia` deploy `MockStablecoin` + the `PayWithQuai`
+  implementation + `ERC1967Proxy` (+ `TimelockController` if `MULTISIG_ADDR` is set), allowlist
+  native currency and the mock stablecoin, verify the fee config on-chain, and write
+  `deployments/<network>.json` — same format as the Quai deployment file above, plus
+  `deployBlock` (the proxy's deployment block, for the backend's future `START_BLOCK`) and
+  `explorer` (the network's block-explorer base URL).
+- `demo:robinhood-testnet` / `demo:base-sepolia` run the same end-to-end checkout loop as
+  `npm run demo` (mint, register, approve, pay, both ERC-20 and native), reading addresses from
+  `deployments/<network>.json`.
+- These scripts refuse to run against a mainnet chain id (Quai `9`, Robinhood Chain `4663`, Base
+  `8453`) — EVM mainnet deploys are disabled until the team reviews them.
+- `FEE_RECIPIENT`, `FEE_BPS`, `STABLECOIN_ADDR`, `MULTISIG_ADDR`, `TIMELOCK_MIN_DELAY`,
+  `PAUSE_GUARDIAN_ADDR` and `MERCHANT_ADDR` are shared with the Quai script's `.env` variables —
+  see `.env.example` for the standard-EVM-specific notes on each.
+
 ## Notes & roadmap
 
 - **Quai is sharded — keep everyone in one zone.** Value moves within a single zone, so the

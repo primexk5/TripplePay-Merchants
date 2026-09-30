@@ -19,7 +19,8 @@ import { useEffect, useState, useRef } from "react";
 import { toPng } from "html-to-image";
 import { Receipt } from "@/components/ui/receipt";
 import QRCode from "react-qr-code";
-import { formatQuai, formatUnits, getAddress } from "quais";
+import { formatUnits, getAddress } from "quais";
+import { getAddress as getAddressEvm } from "ethers";
 import { Logo } from "@/components/logo";
 import { WalletSelector } from "@/components/ui/wallet-selector";
 import {
@@ -48,11 +49,16 @@ import {
   getActiveWallet,
   storeWalletId,
 } from "@/lib/wallets";
+import { getChainById, getDefaultChain, type ChainInfo } from "@/lib/chains";
 import { parseError, rawErrorText } from "@/lib/utils";
 import { formatQits } from "@/lib/qi";
 import { QiPaymentPanel } from "@/components/checkout/qi-payment-panel";
 
 type Params = Promise<{ merchant: string; orderId: string }>;
+/** `?chainId=` lets a direct/API-integration checkout link (this route has no payment-link slug
+ *  to read a chain from) say which chain the order lives on. Omitted, the default chain is used
+ *  — unchanged behaviour for every existing single-chain deployment/link. */
+type SearchParams = Promise<{ chainId?: string }>;
 
 type Stage =
   | { name: "loading" }
@@ -70,10 +76,17 @@ function isExpired(expiry: bigint): boolean {
   return expiry > 0n && Math.floor(Date.now() / 1000) > Number(expiry);
 }
 
-export default function CheckoutPage({ params }: { params: Params }) {
+export default function CheckoutPage({
+  params,
+  searchParams,
+}: {
+  params: Params;
+  searchParams: SearchParams;
+}) {
   const [stage, setStage] = useState<Stage>({ name: "loading" });
   const [merchant, setMerchant] = useState("");
   const [orderId, setOrderId] = useState("");
+  const [chain, setChain] = useState<ChainInfo>(getDefaultChain());
   const [customerName, setCustomerName] = useState("");
   const receiptRef = useRef<HTMLDivElement>(null);
   const [downloading, setDownloading] = useState(false);
@@ -142,7 +155,7 @@ export default function CheckoutPage({ params }: { params: Params }) {
     if (!blip) return;
     setBlipConnecting(true);
     try {
-      const addr = await connectWallet(blip);
+      const addr = await connectWallet(blip, chain);
       storeWalletId(blip.id);
       setConnected(addr);
     } catch {
@@ -155,16 +168,20 @@ export default function CheckoutPage({ params }: { params: Params }) {
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const { merchant: m, orderId: id } = await params;
+      const [{ merchant: m, orderId: id }, sp] = await Promise.all([params, searchParams]);
       if (cancelled) return;
       setMerchant(m);
       setOrderId(id);
+      const chainIdParam = sp.chainId ? Number(sp.chainId) : undefined;
+      const resolvedChain =
+        (chainIdParam !== undefined ? getChainById(chainIdParam) : undefined) ?? getDefaultChain();
+      setChain(resolvedChain);
       try {
         // Status (backend) is fetched alongside the on-chain order: it carries the Qi receive
         // info and doubles as the fallback when the RPC is unreachable.
         const [o, status] = await Promise.all([
-          getOrderOnChain(m, id).catch(() => null),
-          fetchOrderStatus(m, id).catch(() => null),
+          getOrderOnChain(m, id, resolvedChain).catch(() => null),
+          fetchOrderStatus(m, id, 10_000, resolvedChain).catch(() => null),
         ]);
         let resolved = o;
         if (!resolved?.exists && status) {
@@ -207,7 +224,7 @@ export default function CheckoutPage({ params }: { params: Params }) {
     return () => {
       cancelled = true;
     };
-  }, [params]);
+  }, [params, searchParams]);
 
   // Qi is a UTXO ledger with no contract events — settlement is detected by the backend watching
   // the order's one-time receive address. Poll the digest for the settled flag while paying.
@@ -216,7 +233,7 @@ export default function CheckoutPage({ params }: { params: Params }) {
     const timer = setInterval(() => {
       void (async () => {
         try {
-          const s = await fetchOrderStatus(order.merchant, orderId);
+          const s = await fetchOrderStatus(order.merchant, orderId, 10_000, chain);
           const q = s?.qi ?? null;
           setQiOrder(q);
           if (q?.settled) setStage({ name: "qiSettled" });
@@ -226,15 +243,18 @@ export default function CheckoutPage({ params }: { params: Params }) {
       })();
     }, 6000);
     return () => clearInterval(timer);
-  }, [stage.name, order, orderId, qiOrder]);
+  }, [stage.name, order, orderId, qiOrder, chain]);
 
   const isNative = (o: OnChainOrder) =>
     o.token.toLowerCase() === ZERO_ADDRESS.toLowerCase();
 
-  const symbol = (o: OnChainOrder) => (isNative(o) ? "QUAI" : currencySymbol(o.token));
+  const symbol = (o: OnChainOrder) =>
+    isNative(o) ? chain.nativeCurrency.symbol : currencySymbol(o.token, chain.chainId);
 
   const formatAmount = (o: OnChainOrder, amount: bigint) =>
-    isNative(o) ? formatQuai(amount) : formatUnits(amount, currencyDecimals(o.token));
+    isNative(o)
+      ? formatUnits(amount, chain.nativeCurrency.decimals)
+      : formatUnits(amount, currencyDecimals(o.token, chain.chainId));
 
   const netAmount = (o: OnChainOrder) =>
     o.amount - (o.amount * BigInt(o.feeBps)) / 10000n;
@@ -269,7 +289,8 @@ export default function CheckoutPage({ params }: { params: Params }) {
     // deep inside the wallet's own tx-building stack with a cryptic null-target error.
     if (!isNative(order)) {
       try {
-        getAddress(order.token);
+        if (chain.kind === "quai") getAddress(order.token);
+        else getAddressEvm(order.token);
       } catch {
         setStage({
           name: "error",
@@ -283,14 +304,16 @@ export default function CheckoutPage({ params }: { params: Params }) {
       setStage({ name: "paying", step: "Awaiting wallet approval…" });
       phase = "send";
       const txHash = isNative(order)
-        ? await payOrderNative(order.merchant, orderId, order.amount)
-        : await payOrder(order.merchant, orderId, order.token, order.amount);
+        ? await payOrderNative(order.merchant, orderId, order.amount, chain)
+        : await payOrder(order.merchant, orderId, order.token, order.amount, chain);
       phase = "confirm";
       setStage({ name: "awaiting", status: "Waiting for block confirmation…" });
       const settled = await waitForOnChainConfirmation(
         order.merchant,
         orderId,
         (status) => setStage({ name: "awaiting", status }),
+        90,
+        chain,
       );
       if (!settled) {
         throw new Error("Payment was not confirmed on-chain — check your wallet and try again.");
@@ -404,7 +427,7 @@ export default function CheckoutPage({ params }: { params: Params }) {
             <div>
               <p className="text-sm font-semibold">Secure checkout</p>
               <p className="mt-1 text-xs text-[#8b93a7]">
-                Pay with Quai — non-custodial
+                Non-custodial checkout on {chain.name}
               </p>
             </div>
             <Logo className="h-10 w-10" />
@@ -505,7 +528,7 @@ export default function CheckoutPage({ params }: { params: Params }) {
               <div className="mt-8 rounded-2xl border border-white/7 bg-[#171717] p-4">
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="text-sm font-medium">Quai Network</p>
+                    <p className="text-sm font-medium">{chain.name}</p>
                     <p className="mt-1 text-xs text-[#8b93a7]">
                       Settlement network
                     </p>
@@ -516,7 +539,7 @@ export default function CheckoutPage({ params }: { params: Params }) {
 
               {stage.name === "ready" && (
                 <>
-                  {insideBlip ? (
+                  {insideBlip && chain.kind === "quai" ? (
                     <div className="mt-6 rounded-2xl border border-[#C1ED00]/25 bg-[#171717] p-6">
                       <p className="text-center text-sm font-medium text-white">
                         Pay with Blip
@@ -603,7 +626,12 @@ export default function CheckoutPage({ params }: { params: Params }) {
                       )}
 
                       <div className="mt-6 overflow-hidden rounded-2xl border border-white/7 bg-[#171717]">
-                        <PaymentMethodSelector payTab={payTab} setPayTab={setPayTab} showQiComingSoon />
+                        <PaymentMethodSelector
+                          payTab={payTab}
+                          setPayTab={setPayTab}
+                          showQiComingSoon
+                          chainKind={chain.kind}
+                        />
 
                         {payTab === "blip" && checkoutUrl && (
                           <div className="flex flex-col items-center p-6">
@@ -659,8 +687,9 @@ export default function CheckoutPage({ params }: { params: Params }) {
                         {payTab === "wallet" && (
                           <div className="p-6">
                             <p className="mb-4 text-center text-xs text-[#8b93a7]">
-                              Connect any Quai-compatible browser wallet
-                              (Pelagus, Blip in-app browser, or MetaMask).
+                              {chain.kind === "quai"
+                                ? "Connect any Quai-compatible browser wallet (Pelagus, Blip in-app browser, or MetaMask)."
+                                : `Connect any browser wallet to pay on ${chain.name}.`}
                             </p>
                             {connected ? (
                               <div className="space-y-3">
@@ -692,6 +721,7 @@ export default function CheckoutPage({ params }: { params: Params }) {
                                 connectedAddress={null}
                                 onConnected={setConnected}
                                 label="Connect wallet to pay"
+                                chain={chain}
                               />
                             )}
                           </div>
@@ -792,7 +822,7 @@ export default function CheckoutPage({ params }: { params: Params }) {
                   setStage({ name: "loading" });
                   void (async () => {
                     try {
-                      const o = await getOrderOnChain(merchant, orderId);
+                      const o = await getOrderOnChain(merchant, orderId, chain);
                       setOrder(o);
                       setStage({ name: "ready" });
                     } catch {

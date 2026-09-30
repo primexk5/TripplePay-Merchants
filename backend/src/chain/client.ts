@@ -9,6 +9,7 @@ import {
   type Shard,
 } from 'quais';
 import { PAYWITHQUAI_ABI } from './abi.js';
+import type { ChainClient } from './types.js';
 import type { Config } from '../config.js';
 import { NATIVE_TOKEN, type PaymentEvent } from '../types.js';
 import { log } from '../logger.js';
@@ -44,7 +45,7 @@ export interface OnChainOrder {
  * which is robust across quais alpha versions and reorg-safe when the caller bounds the range to
  * `head - confirmations`.
  */
-export class QuaiClient {
+export class QuaiClient implements ChainClient {
   readonly address: string;
   private readonly provider: JsonRpcProvider;
   private readonly iface: Interface;

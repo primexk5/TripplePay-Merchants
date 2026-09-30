@@ -201,7 +201,7 @@ export default function LoginPage() {
 
               {tab === "wallet" && (
                 <div className="px-6 py-6 sm:px-8">
-                  <WalletSelector connectedAddress={address} onConnected={setAddress} label="Connect wallet" />
+                  <WalletSelector connectedAddress={address} onConnected={setAddress} label="Connect wallet" chain="any" />
                 </div>
               )}
             </div>

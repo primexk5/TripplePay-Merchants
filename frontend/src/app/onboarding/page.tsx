@@ -184,13 +184,13 @@ export default function OnboardingPage() {
 
               <h2 className="mt-5 text-xl font-semibold">Connect your settlement wallet</h2>
               <p className="mt-1 text-sm leading-6 text-[#8b93a7]">
-                Your wallet receives payments after they settle on the Quai network.
+                This address can receive payments on every chain you create links on — merchants are chain-free.
               </p>
 
               {address ? (
                 /* ── Wallet already connected ── */
                 <div className="mt-6 rounded-xl border border-emerald-400/15 bg-emerald-400/6 px-4 py-3">
-                  <p className="text-xs text-[#8b93a7]">Connected (Cyprus-1)</p>
+                  <p className="text-xs text-[#8b93a7]">Connected</p>
                   <p className="mt-1 break-all font-mono text-xs text-emerald-300">{address}</p>
                   {insideBlip && (
                     <p className="mt-2 text-xs leading-5 text-[#C1ED00]">
@@ -342,6 +342,7 @@ export default function OnboardingPage() {
                           setAddress(addr);
                         }}
                         label="Connect settlement wallet"
+                        chain="any"
                       />
                     </div>
                   )}
@@ -431,7 +432,7 @@ export default function OnboardingPage() {
 
               <h2 className="mt-5 text-xl font-semibold">You&apos;re ready.</h2>
               <p className="mx-auto mt-2 max-w-sm text-sm leading-6 text-[#8b93a7]">
-                {merchant.name} is registered on Quai mainnet.
+                {merchant.name} is registered and ready to accept payments.
                 {merchant.webhookUrl ? (
                   <>
                     {" "}You&apos;ll receive <code>payment.confirmed</code> webhooks at{" "}

@@ -9,10 +9,8 @@ import {
   Wallet2,
   XCircle,
 } from "lucide-react";
-import { formatQuai, formatUnits } from "quais";
 import { DashboardShell } from "@/components/layout/dashboard-shell";
-import { useRelayerData, type Delivery } from "@/lib/relayer";
-import { MUSDQ_ADDRESS, currencyDecimals, currencySymbol } from "@/lib/currencies";
+import { summarizeVolume, formatTokenAmount, useRelayerData, useConnectedChain, type Delivery } from "@/lib/relayer";
 
 interface DailyPoint {
   day: string;
@@ -20,28 +18,11 @@ interface DailyPoint {
   count: number;
 }
 
+/** All figures here are scoped to ONE chain — see the page component for why (a blended,
+ *  cross-chain total would need a single currency to add native-QUAI and native-ETH amounts
+ *  together in, which doesn't exist). `deliveries` is expected to already be filtered to `chain`. */
 function computeStats(deliveries: Delivery[]) {
   const delivered = deliveries.filter((d) => d.status === "delivered");
-  const ZERO = 0n;
-  // Exact-decimal sums — Number() would lose precision on big values.
-  const totalQuai = delivered.reduce((sum, d) => {
-    return (
-      sum +
-      (d.payload.data.token ===
-      "0x0000000000000000000000000000000000000000"
-        ? BigInt(d.payload.data.net)
-        : ZERO)
-    );
-  }, ZERO);
-  const totalToken = delivered.reduce((sum, d) => {
-    return (
-      sum +
-      (d.payload.data.token !==
-      "0x0000000000000000000000000000000000000000"
-        ? BigInt(d.payload.data.net)
-        : ZERO)
-    );
-  }, ZERO);
 
   const byStatus = {
     delivered: delivered.length,
@@ -76,7 +57,7 @@ function computeStats(deliveries: Delivery[]) {
     a.day.localeCompare(b.day),
   );
 
-  return { totalQuai, totalToken, byStatus, successRate, avgDelay, daily };
+  return { byStatus, successRate, avgDelay, daily };
 }
 
 function formatDelay(ms: number): string {
@@ -112,7 +93,15 @@ function MetricCard({
 
 export default function AnalyticsPage() {
   const { deliveries, loading, error } = useRelayerData();
-  const stats = computeStats(deliveries);
+
+  // Scoped to whichever chain the connected wallet currently reports — see the note on
+  // computeStats for why these figures aren't blended across chains.
+  const chain = useConnectedChain();
+
+  const chainDeliveries = deliveries.filter((d) => d.payload.data.chainId === chain.chainId);
+  const otherChainCount = deliveries.length - chainDeliveries.length;
+  const stats = computeStats(chainDeliveries);
+  const totalVolume = summarizeVolume(chainDeliveries, chain);
   const maxDaily = stats.daily.reduce(
     (m, p) => (p.volume > m ? p.volume : m),
     1n,
@@ -128,7 +117,8 @@ export default function AnalyticsPage() {
               Analytics
             </h1>
             <p className="mt-2 text-sm text-[#8b93a7]">
-              Live metrics from the relayer on Quai mainnet.
+              Live metrics from the relayer on {chain.name}.
+              {otherChainCount > 0 && ` (${otherChainCount} payment(s) on other chains not shown)`}
             </p>
           </div>
 
@@ -156,14 +146,14 @@ export default function AnalyticsPage() {
         <section className="space-y-4">
           <MetricCard
             icon={<Wallet2 size={18} />}
-            label="Total volume"
-            value={`${formatQuai(stats.totalQuai)} QUAI`}
-            detail={`${stats.totalToken > 0n ? `+ ${formatUnits(stats.totalToken, currencyDecimals(MUSDQ_ADDRESS ?? ""))} ${currencySymbol(MUSDQ_ADDRESS ?? "")} · ` : ""}confirmed volume`}
+            label={`Total volume on ${chain.name}`}
+            value={totalVolume}
+            detail="confirmed volume"
           />
           <MetricCard
             icon={<BarChart3 size={18} />}
             label="Transactions"
-            value={String(deliveries.length)}
+            value={String(chainDeliveries.length)}
             detail="Total webhooks recorded"
           />
           <MetricCard
@@ -212,7 +202,12 @@ export default function AnalyticsPage() {
                         />
                       </div>
                       <span className="w-16 shrink-0 text-right font-mono text-[11px] text-[#8b93a7]">
-                        {formatQuai(point.volume)}
+                        {/* Pre-existing (not a Quai-hardcoding issue): a day's volume sums every
+                            delivery's raw net amount regardless of token, so a day mixing native
+                            and ERC-20 payments would add incompatible units together. Formatting
+                            here uses the connected chain's native decimals, same as before this
+                            fix — flagging the mixing itself as a separate, out-of-scope bug. */}
+                        {formatTokenAmount(point.volume, chain.nativeCurrency.decimals, chain.kind)}
                       </span>
                     </div>
                   ))}

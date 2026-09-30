@@ -19,7 +19,7 @@ import { PaymentMethodSelector } from "@/components/checkout/payment-method-sele
 import { toPng } from "html-to-image";
 import { Receipt } from "@/components/ui/receipt";
 import QRCode from "react-qr-code";
-import { formatQuai, formatUnits } from "quais";
+import { formatUnits } from "quais";
 import { Logo } from "@/components/logo";
 import { WalletSelector } from "@/components/ui/wallet-selector";
 import {
@@ -49,11 +49,11 @@ import {
 import {
   connectWallet,
   detectWallets,
-  ensureQuaiNetwork,
+  ensureNetwork,
   getActiveWallet,
   storeWalletId,
-  QUAI_MAINNET_CHAIN,
 } from "@/lib/wallets";
+import { getChainById, getDefaultChain, type ChainInfo } from "@/lib/chains";
 import { parseError, rawErrorText } from "@/lib/utils";
 import { formatQits } from "@/lib/qi";
 import { QiPaymentPanel } from "@/components/checkout/qi-payment-panel";
@@ -71,9 +71,18 @@ type Stage =
   | { name: "done"; txHash: string; net: string; symbol: string }
   | { name: "error"; message: string };
 
-function formatAmount(link: LinkInfo, amount: bigint): string {
+function formatAmount(link: LinkInfo, amount: bigint, chain: ChainInfo): string {
   const isNative = link.tokenAddress.toLowerCase() === ZERO_ADDRESS.toLowerCase();
-  return isNative ? formatQuai(amount) : formatUnits(amount, currencyDecimals(link.tokenAddress));
+  return isNative
+    ? formatUnits(amount, chain.nativeCurrency.decimals)
+    : formatUnits(amount, currencyDecimals(link.tokenAddress, chain.chainId));
+}
+
+/** Which chain a link is denominated on — falls back to the default chain when the link (still
+ *  loading, or a legacy link with no chain info) doesn't say, so old links keep working. */
+function chainForLink(link: LinkInfo | null): ChainInfo {
+  if (!link) return getDefaultChain();
+  return getChainById(link.chainId) ?? getDefaultChain();
 }
 
 /** Returns the current page URL (empty string during SSR). */
@@ -100,6 +109,7 @@ export default function PayPage({ params }: { params: Params }) {
   const [claimedOrderId, setClaimedOrderId] = useState<string | null>(null);
   const [claimedMerchant, setClaimedMerchant] = useState<string | null>(null);
   const pageUrl = currentPageUrl();
+  const chain = chainForLink(link);
 
   // Detect the Blip in-app browser (read-only — never requests accounts)
   useEffect(() => {
@@ -135,17 +145,15 @@ export default function PayPage({ params }: { params: Params }) {
     if (!blip) {
       throw new Error("Blip wallet not detected — reopen this page inside the Blip app.");
     }
-    // Blip's provider implements EIP-3326 (verify → switch → add) per its docs.
-    const net = await ensureQuaiNetwork(blip.provider, QUAI_MAINNET_CHAIN);
-    if (net === "unsupported") {
-      throw new Error(
-        "Blip couldn't switch to Quai mainnet (chain 9) — switch networks in Blip and retry.",
-      );
-    }
-    const addr = await connectWallet(blip);
+    // Blip's provider implements EIP-3326 (verify → switch → add) per its docs. Blip is
+    // Quai-only — this whole path is only ever reachable when chain.kind === "quai" (gated in
+    // the JSX below), but ensureNetwork's own capability check protects it regardless: it would
+    // refuse outright (not attempt any RPC call) if `chain` were ever an EVM chain here.
+    await ensureNetwork(blip, chain);
+    const addr = await connectWallet(blip, chain);
     storeWalletId(blip.id);
     setConnected(addr);
-  }, []);
+  }, [chain]);
 
   // Load link metadata
   useEffect(() => {
@@ -196,7 +204,7 @@ export default function PayPage({ params }: { params: Params }) {
     const timer = setInterval(() => {
       void (async () => {
         try {
-          const s = await fetchOrderStatus(qiClaim.merchant, qiClaim.orderId);
+          const s = await fetchOrderStatus(qiClaim.merchant, qiClaim.orderId, 10_000, chain);
           const q = s?.qi ?? null;
           if (!q) return;
           setQiClaim((prev) => (prev ? { ...prev, qi: q } : prev));
@@ -207,7 +215,7 @@ export default function PayPage({ params }: { params: Params }) {
       })();
     }, 6000);
     return () => clearInterval(timer);
-  }, [stage.name, qiClaim]);
+  }, [stage.name, qiClaim, chain]);
 
   const downloadReceipt = async () => {
     if (!receiptRef.current) return;
@@ -246,27 +254,21 @@ export default function PayPage({ params }: { params: Params }) {
     const activeWallet = getActiveWallet();
     let phase = "prepare";
     try {
-      // Ensure the wallet is on the app's network before anything else — a wallet on a
+      // Ensure the wallet is on the link's chain before anything else — a wallet on a
       // different node/shard would sign a tx the chain silently rejects ("missing revert data").
+      // ensureNetwork refuses outright (no RPC call at all) if the active wallet can't serve
+      // this chain at all — e.g. Blip/Pelagus left connected from a previous Quai-chain link,
+      // now opening an EVM-chain one — with a specific, named error instead of a stuck wallet.
       phase = "network";
       const wallet = getActiveWallet();
       if (wallet) {
-        const chain = QUAI_MAINNET_CHAIN;
-        // Only Pelagus skips network checks (its EIP-3326 requests hang). Blip goes through
-        // the full verify → switch → add path — its documented provider supports both methods.
-        const quaiNative = wallet.brand === "pelagus";
-        const net = await ensureQuaiNetwork(wallet.provider, chain, { quaiNative });
-        if (net === "unsupported") {
-          throw new Error(
-            `${wallet.name} couldn't switch to ${chain.chainName} (chain ${parseInt(chain.chainId, 16)}) — switch networks in your wallet and retry.`,
-          );
-        }
+        await ensureNetwork(wallet, chain);
       }
 
       // Step 1: Claim an orderId from the pool
       phase = "claim";
       setStage({ name: "claiming" });
-      const linkProblem = await linkPaymentProblem(link);
+      const linkProblem = await linkPaymentProblem(link, chain);
       if (linkProblem) throw new Error(linkProblem);
       const claim = await claimOrderFromLink(slug, connected);
       const orderId = claim.orderId;
@@ -278,7 +280,7 @@ export default function PayPage({ params }: { params: Params }) {
       // certainly revert never wastes the customer's approval.
       setStage({ name: "paying", step: "Checking order…" });
       const amount = BigInt(link.amount);
-      const onChainOrder = await getOrderOnChain(merchant, orderId);
+      const onChainOrder = await getOrderOnChain(merchant, orderId, chain);
       const precheckError = orderPaymentError(
         onChainOrder,
         connected,
@@ -291,8 +293,8 @@ export default function PayPage({ params }: { params: Params }) {
       phase = "send";
       setStage({ name: "paying", step: "Awaiting wallet approval…" });
       const hash = isNative(link)
-        ? await payOrderNative(merchant, orderId, amount)
-        : await payOrder(merchant, orderId, link.tokenAddress, amount);
+        ? await payOrderNative(merchant, orderId, amount, chain)
+        : await payOrder(merchant, orderId, link.tokenAddress, amount, chain);
 
 
       // Step 4: Wait for on-chain confirmation (instant — no webhook wait)
@@ -302,6 +304,8 @@ export default function PayPage({ params }: { params: Params }) {
         merchant,
         orderId,
         (status) => setStage({ name: "awaiting", status }),
+        90,
+        chain,
       );
       if (!settled) {
         throw new Error("Payment was not confirmed on-chain — check your wallet and try again.");
@@ -309,7 +313,7 @@ export default function PayPage({ params }: { params: Params }) {
       setStage({
         name: "done",
         txHash: hash,
-        net: formatAmount(link, amount),
+        net: formatAmount(link, amount, chain),
         symbol: symbol(link),
       });
       // Best-effort dashboard context (payer name + "paid a link" source) — never blocks.
@@ -448,7 +452,7 @@ export default function PayPage({ params }: { params: Params }) {
                   <p className="mt-1 text-xs text-[#8b93a7]">
                     {link.shopName && link.merchantName
                       ? `by ${link.merchantName}`
-                      : "Pay with Quai — non-custodial"}
+                      : `Non-custodial checkout on ${chain.name}`}
                   </p>
                   {link.multiPay && (
                     <span className="mt-1 inline-flex items-center gap-1 rounded-full border border-[#38bdf8]/20 bg-[#38bdf8]/8 px-2 py-0.5 text-[10px] text-[#38bdf8]">
@@ -461,7 +465,7 @@ export default function PayPage({ params }: { params: Params }) {
                 <>
                   <p className="text-sm font-semibold">Secure checkout</p>
                   <p className="mt-1 text-xs text-[#8b93a7]">
-                    Pay with Quai — non-custodial
+                    Non-custodial checkout
                   </p>
                 </>
               )}
@@ -528,7 +532,7 @@ export default function PayPage({ params }: { params: Params }) {
                 <div className="mt-8 rounded-2xl border border-white/7 bg-[#171717] p-4">
                   <div className="flex items-center justify-between">
                     <div>
-                      <p className="text-sm font-medium">Quai Network</p>
+                      <p className="text-sm font-medium">{chain.name}</p>
                       <p className="mt-1 text-xs text-[#8b93a7]">
                         Settlement network
                       </p>
@@ -539,7 +543,7 @@ export default function PayPage({ params }: { params: Params }) {
 
                 {stage.name === "ready" && (
                   <>
-                    {insideBlip ? (
+                    {insideBlip && chain.kind === "quai" ? (
                       /* Blip in-app browser */
                       <div className="mt-6 rounded-2xl border border-[#C1ED00]/25 bg-[#171717] p-6">
                         <p className="text-center text-sm font-medium text-white">
@@ -668,7 +672,12 @@ export default function PayPage({ params }: { params: Params }) {
 
                         {/* Wallet tabs */}
                         <div className="mt-6 overflow-hidden rounded-2xl border border-white/7 bg-[#171717]">
-                          <PaymentMethodSelector payTab={payTab} setPayTab={setPayTab} showQiComingSoon />
+                          <PaymentMethodSelector
+                            payTab={payTab}
+                            setPayTab={setPayTab}
+                            showQiComingSoon
+                            chainKind={chain.kind}
+                          />
 
                           {payTab === "blip" &&
                             pageUrl && (
@@ -762,6 +771,7 @@ export default function PayPage({ params }: { params: Params }) {
                                     connectedAddress={null}
                                     onConnected={setConnected}
                                     label="Connect wallet to pay"
+                                    chain={chain}
                                   />
                                 )}
                               </div>

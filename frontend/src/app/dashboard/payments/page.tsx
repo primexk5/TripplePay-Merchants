@@ -7,10 +7,10 @@ import { StatusBadge } from "@/components/ui/status-badge";
 import {
   formatDeliveryAmount,
   formatTimestamp,
+  deliveryExplorerUrl,
   useRelayerData,
 } from "@/lib/relayer";
 
-const QUAI_SCAN = "https://quaiscan.io/tx/";
 const STATUSES = ["all", "delivered", "pending", "failed"] as const;
 type StatusFilter = (typeof STATUSES)[number];
 
@@ -45,7 +45,7 @@ export default function PaymentsPage() {
           <p className="mt-2 text-sm text-[#8b93a7]">
             {usesWebhook
               ? "Every row is a confirmed on-chain settlement. The status filter tracks webhook delivery to your endpoint."
-              : "Every row is a settlement confirmed on Quai — funds are already in your wallet."}
+              : "Every row is a settlement confirmed on-chain — funds are already in your wallet."}
           </p>
         </div>
 
@@ -122,6 +122,7 @@ export default function PaymentsPage() {
                   {filtered.map((d) => {
                     const meta = d.meta ?? null;
                     const expanded = expandedId === d.id;
+                    const explorerUrl = deliveryExplorerUrl(d.payload.data.chainId, d.payload.data.txHash);
                     return (
                       <Fragment key={d.id}>
                         <tr
@@ -132,6 +133,7 @@ export default function PaymentsPage() {
                             {formatDeliveryAmount(
                               d.payload.data.net,
                               d.payload.data.token,
+                              d.payload.data.chainId,
                             )}
                           </td>
                           <td className="px-5 py-3.5 font-mono text-xs text-[#8b93a7]">
@@ -175,16 +177,18 @@ export default function PaymentsPage() {
                       </td>
                       <td className="px-5 py-3.5 text-right">
                         <div className="flex items-center justify-end gap-3">
-                          <a
-                            href={`${QUAI_SCAN}${d.payload.data.txHash}`}
-                            target="_blank"
-                            rel="noreferrer"
-                            onClick={(e) => e.stopPropagation()}
-                            className="inline-flex items-center gap-1 text-xs text-[#38bdf8] hover:text-[#67d8ff]"
-                          >
-                            View
-                            <ArrowUpRight size={12} />
-                          </a>
+                          {explorerUrl && (
+                            <a
+                              href={explorerUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              onClick={(e) => e.stopPropagation()}
+                              className="inline-flex items-center gap-1 text-xs text-[#38bdf8] hover:text-[#67d8ff]"
+                            >
+                              View
+                              <ArrowUpRight size={12} />
+                            </a>
+                          )}
                           <ChevronDown
                             size={15}
                             className={`text-[#8b93a7] transition-transform ${expanded ? "rotate-180" : ""}`}
@@ -235,32 +239,38 @@ export default function PaymentsPage() {
                             <div>
                               <p className="text-[#8b93a7]">Gross amount</p>
                               <p className="mt-0.5 font-mono text-white">
-                                {formatDeliveryAmount(d.payload.data.amount, d.payload.data.token)}
+                                {formatDeliveryAmount(d.payload.data.amount, d.payload.data.token, d.payload.data.chainId)}
                               </p>
                             </div>
                             <div>
                               <p className="text-[#8b93a7]">Platform fee ({(d.payload.data.feeBps / 100).toFixed(2)}%)</p>
                               <p className="mt-0.5 font-mono text-white">
-                                {formatDeliveryAmount(d.payload.data.fee, d.payload.data.token)}
+                                {formatDeliveryAmount(d.payload.data.fee, d.payload.data.token, d.payload.data.chainId)}
                               </p>
                             </div>
                             <div>
                               <p className="text-[#8b93a7]">You received</p>
                               <p className="mt-0.5 font-mono font-medium text-emerald-300">
-                                {formatDeliveryAmount(d.payload.data.net, d.payload.data.token)}
+                                {formatDeliveryAmount(d.payload.data.net, d.payload.data.token, d.payload.data.chainId)}
                               </p>
                             </div>
                             <div>
                               <p className="text-[#8b93a7]">Tx hash</p>
-                              <a
-                                href={`${QUAI_SCAN}${d.payload.data.txHash}`}
-                                target="_blank"
-                                rel="noreferrer"
-                                onClick={(e) => e.stopPropagation()}
-                                className="mt-0.5 block truncate font-mono text-[11px] text-[#38bdf8] hover:text-[#67d8ff]"
-                              >
-                                {d.payload.data.txHash}
-                              </a>
+                              {explorerUrl ? (
+                                <a
+                                  href={explorerUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="mt-0.5 block truncate font-mono text-[11px] text-[#38bdf8] hover:text-[#67d8ff]"
+                                >
+                                  {d.payload.data.txHash}
+                                </a>
+                              ) : (
+                                <p className="mt-0.5 block truncate font-mono text-[11px] text-white">
+                                  {d.payload.data.txHash}
+                                </p>
+                              )}
                             </div>
                           </div>
                         </td>
