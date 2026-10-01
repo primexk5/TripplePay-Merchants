@@ -7,7 +7,8 @@ import type { ChainRegistry } from '../chain/index.js';
 import type { QiService } from '../chain/qi.js';
 import type { Config } from '../config.js';
 import type { Merchant, Session, PaymentLink, WebhookDelivery, QiOrder, MerchantApiKey } from '../types.js';
-import { newMerchantId, newWebhookSecret, newSlug, newApiKey } from '../util/ids.js';
+import { newMerchantId, newWebhookSecret, newSlug } from '../util/ids.js';
+import { generateApiKey } from '../util/apikey.js';
 import {
   normalizeAddressAnyKind,
   normalizeAddressForKind,
@@ -1143,29 +1144,33 @@ await store.upsertMerchant(updated);
       return res.status(400).json({ error: 'invalid body', issues: parsed.error.issues });
     }
     const now = Date.now();
-    const key = newApiKey();
-    await store.createMerchantApiKey({
+    // Only the HMAC is persisted; `key` exists in this response and nowhere else, ever.
+    const { key, keyId } = generateApiKey();
+    const { keyRef } = await store.createMerchantApiKey({
       key,
       merchantAddress: merchant.address.toLowerCase(),
       label: parsed.data.label,
       createdAt: now,
-      lastUsedAt: 0,
     });
-    logger.info({ merchantId: merchant.merchantId, label: parsed.data.label }, 'merchant API key issued');
-    res.status(201).json({ key, label: parsed.data.label, createdAt: now });
+    logger.info({ merchantId: merchant.merchantId, label: parsed.data.label, keyId }, 'merchant API key issued');
+    res.status(201).json({ key, keyRef, label: parsed.data.label, createdAt: now });
   }));
 
+  // Metadata only. A previously-returned list of live credentials is enough to take over every
+  // merchant account on the deployment, so listing must never echo the secret back.
   app.get('/v1/me/apikeys', merchantAuth, asyncHandler(async (req, res) => {
     const merchant = res.locals.merchant as Merchant;
     res.json({ apiKeys: await store.listMerchantApiKeys(merchant.address) });
   }));
 
-  app.delete('/v1/me/apikeys/:key', merchantAuth, asyncHandler(async (req, res) => {
+  // Revoke by keyRef. The credential itself must never appear in a URL — it would be captured by
+  // access logs, proxies and browser history, where it outlives the revocation.
+  app.delete('/v1/me/apikeys/:keyRef', merchantAuth, asyncHandler(async (req, res) => {
     const merchant = res.locals.merchant as Merchant;
-    const key = req.params.key ?? '';
+    const keyRef = req.params.keyRef ?? '';
     const mine = await store.listMerchantApiKeys(merchant.address);
-    if (!mine.some((k) => k.key === key)) return res.status(404).json({ error: 'api key not found' });
-    await store.revokeMerchantApiKey(key);
+    if (!mine.some((k) => k.keyRef === keyRef)) return res.status(404).json({ error: 'api key not found' });
+    await store.revokeMerchantApiKeyByRef(keyRef);
     res.sendStatus(204);
   }));
 

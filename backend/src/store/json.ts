@@ -1,7 +1,8 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSync, closeSync, fsyncSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Store } from './index.js';
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey, MerchantApiKeyMeta } from '../types.js';
+import { hashApiKey, apiKeyRef, constantTimeEqual, DEV_API_KEY_PEPPER } from '../util/apikey.js';
 import { log } from '../logger.js';
 
 const logger = log('store');
@@ -16,7 +17,10 @@ interface FileShape {
   claims: Record<string, LinkClaim[]>;  // key: slug — array of all claims for that link
   orderMeta: Record<string, OrderMeta>; // key: lowercased orderId
   qiOrders: Record<string, QiOrder>;    // key: lowercased orderId
-  apiKeys: Record<string, MerchantApiKey>; // key: the API key bearer secret
+  apiKeys: Record<string, MerchantApiKey>; // key: keyHash
+  /** Pre-hashing rows: key -> merchantAddress. Migrated to `apiKeys` on first successful use and
+   *  then deleted, so an existing database.json keeps working without a manual migration step. */
+  legacyApiKeys?: Record<string, string>;
 }
 
 /** Case-insensitive lookup key binding a delivery to its (merchant, orderId). */
@@ -40,6 +44,9 @@ export class JsonStore implements Store {
   private readonly path: string;
   private readonly tmpPath: string;
   private data: FileShape;
+  /** Keyed-hash pepper for API keys. Optional so existing single-arg call sites keep working;
+   *  production always passes cfg.API_KEY_PEPPER (see index.ts). */
+  private readonly apiKeyPepper: string;
   private readonly byMerchantId = new Map<string, string>(); // merchantId -> address key
   private readonly byOrderKey = new Map<string, string>(); // "<merchant>:<orderId>" -> delivery id
 
@@ -47,8 +54,13 @@ export class JsonStore implements Store {
    *  of its own) is read back as. Optional so `new JsonStore(path)` keeps working exactly as
    *  before for every existing caller/test; production always passes the real default chain's
    *  chainId (see index.ts). */
-  constructor(path: string, private readonly defaultChainId: number = 9) {
+  constructor(
+    path: string,
+    private readonly defaultChainId: number = 9,
+    apiKeyPepper: string = '',
+  ) {
     this.path = path;
+    this.apiKeyPepper = apiKeyPepper || DEV_API_KEY_PEPPER;
     this.tmpPath = `${path}.tmp`;
     // 0700: this file holds plaintext webhook secrets (see class note) — keep the whole directory
     // owner-only. mode is masked by umask on creation and is a no-op if the dir already exists.
@@ -114,6 +126,26 @@ export class JsonStore implements Store {
       for (const [id, d] of Object.entries(parsed.deliveries ?? {})) {
         deliveries[id] = this.withChainId(d);
       }
+      // API-key hashing migration. Before this change `apiKeys` was a map of plaintext credential ->
+      // record. Those rows are un-hashable here (the pepper lives in the environment, not the
+      // file), so move them to `legacyApiKeys` keyed by plaintext and let getMerchantByApiKey()
+      // upgrade each one in place the first time its owner actually presents it. Rows already in
+      // the new shape carry a keyHash and pass straight through.
+      const apiKeys: Record<string, MerchantApiKey> = {};
+      const legacyApiKeys: Record<string, string> = { ...((parsed as Partial<FileShape>).legacyApiKeys ?? {}) };
+      for (const [k, rec] of Object.entries((parsed as { apiKeys?: Record<string, unknown> }).apiKeys ?? {})) {
+        const r = rec as Partial<MerchantApiKey> & { key?: string };
+        if (typeof r?.keyHash === 'string' && r.keyHash.length > 0) {
+          apiKeys[k] = rec as MerchantApiKey;
+        } else if (typeof r?.merchantAddress === 'string' && typeof r?.key === 'string') {
+          legacyApiKeys[r.key] = r.merchantAddress ?? '';
+        } else {
+          logger.warn({ entry: k }, 'dropping unrecognised apiKeys entry during migration');
+        }
+      }
+      if (Object.keys(legacyApiKeys).length > 0) {
+        logger.warn({ count: Object.keys(legacyApiKeys).length }, 'found legacy plaintext API keys — they will be hashed on first use');
+      }
       return {
         cursors: parsed.cursors ?? {},
         merchants: parsed.merchants ?? {},
@@ -124,7 +156,8 @@ export class JsonStore implements Store {
         claims: (parsed as Partial<FileShape>).claims ?? {},
         orderMeta,
         qiOrders: (parsed as Partial<FileShape>).qiOrders ?? {},
-        apiKeys: (parsed as Partial<FileShape>).apiKeys ?? {},
+        apiKeys: apiKeys,
+        legacyApiKeys: legacyApiKeys,
       };
     } catch (err) {
       throw new Error(`Failed to read store at ${this.path}: ${(err as Error).message}`);
@@ -202,29 +235,80 @@ export class JsonStore implements Store {
 
   // --- merchant API keys ---
 
-  async createMerchantApiKey(k: MerchantApiKey): Promise<void> {
-    this.data.apiKeys[k.key] = { ...k, merchantAddress: k.merchantAddress.toLowerCase() };
+  async createMerchantApiKey(k: {
+    key: string;
+    merchantAddress: string;
+    label: string;
+    createdAt: number;
+  }): Promise<{ keyRef: string }> {
+    const keyHash = hashApiKey(k.key, this.apiKeyPepper);
+    const keyRef = apiKeyRef(keyHash);
+    this.data.apiKeys[keyHash] = {
+      keyHash,
+      keyRef,
+      merchantAddress: k.merchantAddress.toLowerCase(),
+      label: k.label,
+      createdAt: k.createdAt,
+      lastUsedAt: 0,
+    };
     this.flush();
+    return { keyRef };
   }
 
   async getMerchantByApiKey(key: string): Promise<Merchant | undefined> {
-    const rec = this.data.apiKeys[key];
-    if (!rec) return undefined;
-    return this.data.merchants[rec.merchantAddress];
+    const hash = hashApiKey(key, this.apiKeyPepper);
+    const rec = this.data.apiKeys[hash];
+    if (rec) {
+      this.touchApiKey(hash);
+      return this.data.merchants[rec.merchantAddress];
+    }
+
+    // Legacy: keys issued before hashing were stored as plaintext. Accept one, then rewrite it in
+    // place as a hash so the plaintext copy is gone from disk on the very next boot. The merchant
+    // keeps using the same credential, so this needs no coordination.
+    const legacy = this.data.legacyApiKeys;
+    const legacyAddr = legacy?.[key];
+    if (legacy && legacyAddr) {
+      this.data.apiKeys[hash] = {
+        keyHash: hash,
+        keyRef: apiKeyRef(hash),
+        merchantAddress: legacyAddr.toLowerCase(),
+        label: '(migrated)',
+        createdAt: Date.now(),
+        lastUsedAt: Date.now(),
+      };
+      delete legacy[key];
+      this.flush();
+      logger.warn({ merchantAddress: legacyAddr }, 'migrated legacy plaintext API key to hashed form');
+      return this.data.merchants[legacyAddr.toLowerCase()];
+    }
+    return undefined;
   }
 
-  async listMerchantApiKeys(merchantAddress: string): Promise<MerchantApiKey[]> {
+  async listMerchantApiKeys(merchantAddress: string): Promise<MerchantApiKeyMeta[]> {
     const addr = merchantAddress.toLowerCase();
     return Object.values(this.data.apiKeys)
       .filter((k) => k.merchantAddress === addr)
-      .sort((a, b) => b.createdAt - a.createdAt);
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .map(({ keyRef, label, createdAt, lastUsedAt }) => ({ keyRef, label, createdAt, lastUsedAt }));
   }
 
-  async revokeMerchantApiKey(key: string): Promise<void> {
-    if (Object.hasOwn(this.data.apiKeys, key)) {
-      delete this.data.apiKeys[key];
-      this.flush();
+  async revokeMerchantApiKeyByRef(keyRef: string): Promise<void> {
+    for (const [hash, rec] of Object.entries(this.data.apiKeys)) {
+      if (constantTimeEqual(rec.keyRef, keyRef)) {
+        delete this.data.apiKeys[hash];
+        this.flush();
+        return;
+      }
     }
+  }
+
+  /** Best-effort last-used stamp; never worth failing a request over. */
+  private touchApiKey(hash: string): void {
+    const rec = this.data.apiKeys[hash];
+    if (!rec) return;
+    rec.lastUsedAt = Date.now();
+    this.flush();
   }
 
   async insertDeliveryIfAbsent(d: WebhookDelivery): Promise<boolean> {

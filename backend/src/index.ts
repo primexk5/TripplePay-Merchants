@@ -47,11 +47,16 @@ async function main(): Promise<void> {
   // hardcoded guess.
   const store: Store = cfg.DATABASE_URL
     ? (() => {
-        const pg = new PostgresStore(cfg.DATABASE_URL, { ssl: cfg.DATABASE_SSL }, registry.default.config.chainId);
+        const pg = new PostgresStore(
+          cfg.DATABASE_URL,
+          { ssl: cfg.DATABASE_SSL },
+          registry.default.config.chainId,
+          cfg.API_KEY_PEPPER,
+        );
         boot.info('using PostgreSQL store');
         return pg;
       })()
-    : new JsonStore(cfg.DATABASE_PATH, registry.default.config.chainId);
+    : new JsonStore(cfg.DATABASE_PATH, registry.default.config.chainId, cfg.API_KEY_PEPPER);
 
   const dispatcher = new WebhookDispatcher(store, cfg);
 

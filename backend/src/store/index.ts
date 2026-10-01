@@ -1,4 +1,4 @@
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKeyMeta } from '../types.js';
 
 /**
  * Persistence boundary for the relayer. The default local implementation ({@link JsonStore}) is a
@@ -21,11 +21,22 @@ export interface Store {
   listMerchants(): Promise<Merchant[]>;
 
   // --- merchant API keys (server-to-server gateway auth) ---
-  createMerchantApiKey(k: MerchantApiKey): Promise<void>;
-  /** Resolve the merchant owning an API key (surfaces the key's lastUsedAt) or undefined. */
+  // Implementations hash incoming keys with the server pepper; the credential is never persisted.
+  // See util/apikey.ts for why this is a keyed HMAC and not bcrypt.
+  /** Issue a key from a plaintext credential. The implementation hashes it with its pepper, so
+   *  the pepper never has to reach the API layer; returns the non-secret ref for later revocation. */
+  createMerchantApiKey(k: {
+    key: string;
+    merchantAddress: string;
+    label: string;
+    createdAt: number;
+  }): Promise<{ keyRef: string }>;
+  /** Resolve the merchant owning an API key, or undefined if unknown/revoked. */
   getMerchantByApiKey(key: string): Promise<Merchant | undefined>;
-  listMerchantApiKeys(merchantAddress: string): Promise<MerchantApiKey[]>;
-  revokeMerchantApiKey(key: string): Promise<void>;
+  /** Metadata only — never a usable credential. */
+  listMerchantApiKeys(merchantAddress: string): Promise<MerchantApiKeyMeta[]>;
+  /** Revoke by the non-secret `keyRef`, so a credential never has to appear in a URL. */
+  revokeMerchantApiKeyByRef(keyRef: string): Promise<void>;
 
   // --- webhook deliveries (id == paymentId; also the payment idempotency key) ---
   /** Insert a delivery only if its id is new. Returns true if inserted, false if it already existed. */

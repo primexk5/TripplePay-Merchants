@@ -48,11 +48,22 @@ export interface Merchant {
 /** A server-to-server API key a merchant issues for their store backend (plugins). The key is a
  *  bearer secret (`X-Merchant-Key`) that resolves to the owning merchant, exactly like a session. */
 export interface MerchantApiKey {
-  key: string; // e.g. "qmkey_..." — stored plaintext (see JsonStore file-permission note)
+  /** HMAC-SHA256(pepper, key) hex. The credential itself is never stored — see util/apikey.ts. */
+  keyHash: string;
+  /** Non-secret short handle (e.g. "qmk_7f3a91c2") for revocation URLs and UI display. */
+  keyRef: string;
   merchantAddress: string; // lowercased owner
   label: string;
   createdAt: number; // unix ms
   lastUsedAt: number; // unix ms, best-effort
+}
+
+/** What `GET /v1/me/apikeys` returns: metadata only, never a usable credential. */
+export interface MerchantApiKeyMeta {
+  keyRef: string;
+  label: string;
+  createdAt: number;
+  lastUsedAt: number;
 }
 
 /** An opaque bearer-token session issued after a wallet-signature login. */

@@ -1,6 +1,7 @@
 import { Pool, type PoolClient } from 'pg';
 import type { Store } from './index.js';
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey, MerchantApiKeyMeta } from '../types.js';
+import { hashApiKey, apiKeyRef, DEV_API_KEY_PEPPER } from '../util/apikey.js';
 import { log } from '../logger.js';
 
 const logger = log('store:postgres');
@@ -21,6 +22,9 @@ const logger = log('store:postgres');
  */
 export class PostgresStore implements Store {
   readonly pool: Pool;
+  /** Keyed-hash pepper for API keys. Optional so existing 2/3-arg call sites keep working;
+   *  production always passes cfg.API_KEY_PEPPER (see index.ts). */
+  private readonly apiKeyPepper: string;
 
   /** `defaultChainId`: what a pre-multi-chain row (link/order_meta with a NULL chain_id, or a
    *  delivery whose stored payload predates chainId) is read back as. Optional so existing
@@ -30,7 +34,9 @@ export class PostgresStore implements Store {
     connectionString: string,
     options: { ssl?: boolean } = {},
     private readonly defaultChainId: number = 9,
+    apiKeyPepper: string = '',
   ) {
+    this.apiKeyPepper = apiKeyPepper || DEV_API_KEY_PEPPER;
     // node-postgres does NOT parse `sslmode` from the connection string itself, and Railway
     // requires TLS. Honor an explicit flag, else fall back to whatever sslmode the URL declares.
     const url = new URL(connectionString);
@@ -169,6 +175,22 @@ export class PostgresStore implements Store {
       CREATE INDEX IF NOT EXISTS api_keys_merchant ON api_keys (merchant_address, created_at DESC);
     `);
 
+    // API-key hashing migration. The original table stored the bearer credential in `key` as the
+    // primary key. Credentials are now stored only as HMAC-SHA256(pepper, key) in `key_hash`,
+    // with a short non-secret `key_ref` so keys can be revoked from a URL without ever putting the
+    // secret in one. `key` stays (nullable) as the legacy bucket: the pepper is not available to
+    // SQL, so we cannot re-hash existing rows here — instead each row is upgraded in place the
+    // first time its owner presents it (see getMerchantByApiKey). Once `legacy` is empty, `key`
+    // can be dropped in a later migration.
+    await this.pool.query(`
+      ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_hash TEXT;
+      ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_ref  TEXT;
+      CREATE UNIQUE INDEX IF NOT EXISTS api_keys_key_hash ON api_keys (key_hash) WHERE key_hash IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS api_keys_key_ref  ON api_keys (key_ref)  WHERE key_ref  IS NOT NULL;
+    `);
+    // `key_hash IS NULL` is the legacy marker: it means "this row still holds a plaintext
+    // credential in `key`". Nothing else needs a flag column.
+
     // Backfill + index chain_id (parameterized — can't live in the template literal above).
     // WHERE chain_id IS NULL makes this a no-op on every boot after the first, so re-running it
     // is always safe and never overwrites a chain_id a caller has already set.
@@ -240,44 +262,88 @@ export class PostgresStore implements Store {
 
   // --- merchant API keys ---
 
-  async createMerchantApiKey(k: MerchantApiKey): Promise<void> {
+  async createMerchantApiKey(k: {
+    key: string;
+    merchantAddress: string;
+    label: string;
+    createdAt: number;
+  }): Promise<{ keyRef: string }> {
+    const keyHash = hashApiKey(k.key, this.apiKeyPepper);
+    const keyRef = apiKeyRef(keyHash);
     await this.pool.query(
-      `INSERT INTO api_keys (key, merchant_address, label, created_at, last_used_at)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [k.key, k.merchantAddress.toLowerCase(), k.label, k.createdAt, k.lastUsedAt],
+      `INSERT INTO api_keys (key_hash, key_ref, merchant_address, label, created_at, last_used_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [keyHash, keyRef, k.merchantAddress.toLowerCase(), k.label, k.createdAt, 0],
     );
+    return { keyRef };
   }
 
   async getMerchantByApiKey(key: string): Promise<Merchant | undefined> {
-    const { rows } = await this.pool.query(
+    const hash = hashApiKey(key, this.apiKeyPepper);
+
+    const hashed = await this.pool.query(
       `SELECT m.* FROM api_keys k JOIN merchants m ON m.address = k.merchant_address
-       WHERE k.key = $1`,
-      [key],
+       WHERE k.key_hash = $1`,
+      [hash],
     );
-    if (!rows.length) return undefined;
-    // Best-effort last-used stamp; never worth failing a request over.
-    await this.pool
-      .query('UPDATE api_keys SET last_used_at = $1 WHERE key = $2', [Date.now(), key])
-      .catch(() => undefined);
-    return mapMerchant(rows[0]!);
+    if (hashed.rows.length) {
+      // Best-effort last-used stamp; never worth failing a request over.
+      await this.pool
+        .query('UPDATE api_keys SET last_used_at = $1 WHERE key_hash = $2', [Date.now(), hash])
+        .catch(() => undefined);
+      return mapMerchant(hashed.rows[0]!);
+    }
+
+    // Legacy: a pre-hashing row still holding the plaintext credential. Accept it, then rewrite the
+    // row hashed in place so the plaintext column is emptied immediately. The merchant keeps using
+    // the same credential, so no re-issue and no downtime. Pinned to ONE client, because a manual
+    // BEGIN issued on `pool` could otherwise span two different pooled connections.
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        `UPDATE api_keys
+            SET key = NULL, key_hash = $1, key_ref = $2,
+                label = COALESCE(NULLIF(label, ''), '(migrated)')
+          WHERE key = $3 AND key_hash IS NULL
+        RETURNING merchant_address`,
+        [hash, apiKeyRef(hash), key],
+      );
+      if (!rows.length) {
+        await client.query('ROLLBACK');
+        return undefined;
+      }
+      const owner = await client.query('SELECT * FROM merchants WHERE address = $1', [
+        rows[0]!.merchant_address as string,
+      ]);
+      await client.query('COMMIT');
+      logger.warn('migrated legacy plaintext API key to hashed form');
+      return owner.rows.length ? mapMerchant(owner.rows[0]!) : undefined;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
-  async listMerchantApiKeys(merchantAddress: string): Promise<MerchantApiKey[]> {
+  async listMerchantApiKeys(merchantAddress: string): Promise<MerchantApiKeyMeta[]> {
     const { rows } = await this.pool.query(
-      'SELECT * FROM api_keys WHERE merchant_address = $1 ORDER BY created_at DESC',
+      `SELECT key_ref, label, created_at, last_used_at FROM api_keys
+        WHERE merchant_address = $1 AND key_hash IS NOT NULL
+        ORDER BY created_at DESC`,
       [merchantAddress.toLowerCase()],
     );
     return rows.map((r) => ({
-      key: r.key as string,
-      merchantAddress: r.merchant_address as string,
+      keyRef: r.key_ref as string,
       label: r.label as string,
       createdAt: toNum(r.created_at),
       lastUsedAt: toNum(r.last_used_at),
     }));
   }
 
-  async revokeMerchantApiKey(key: string): Promise<void> {
-    await this.pool.query('DELETE FROM api_keys WHERE key = $1', [key]);
+  async revokeMerchantApiKeyByRef(keyRef: string): Promise<void> {
+    await this.pool.query('DELETE FROM api_keys WHERE key_ref = $1', [keyRef]);
   }
 
   // --- webhook deliveries ---

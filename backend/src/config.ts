@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { DEV_API_KEY_PEPPER } from './util/apikey.js';
 
 /**
  * Environment configuration, validated at startup. Any missing/invalid value fails fast with a
@@ -69,6 +70,14 @@ const EnvSchema = z.object({
   // Only relevant in local dev — the dashboard runs on a different port than the backend.
   CORS_ORIGINS: z.string().default('*'),
   ADMIN_API_KEY: z.string().min(16, 'ADMIN_API_KEY should be at least 16 chars'),
+
+  // HMAC key used to derive the stored hash of every merchant API key. Merchant keys are bearer
+  // credentials, so they are persisted only as HMAC-SHA256(API_KEY_PEPPER, key) — a database dump
+  // (or a leaked backup, or a read-only SQL injection) therefore yields nothing an attacker can
+  // replay. Without the pepper, offline brute-forcing a stolen api_keys table becomes possible.
+  //   generate with:  node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+  // Must be STABLE across restarts and replicas: changing it invalidates every issued key.
+  API_KEY_PEPPER: z.string().min(16, 'API_KEY_PEPPER should be at least 16 chars').default(DEV_API_KEY_PEPPER),
   // Optional ERC-20 allowlist for payment links (comma-separated addresses). Native QUAI is
   // always allowed. When unset/empty, any 20-byte token address may be used.
   ACCEPTED_TOKENS: z
@@ -172,6 +181,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       .map((i) => `  - ${i.path.join('.') || '(root)'}: ${i.message}`)
       .join('\n');
     throw new Error(`Invalid environment configuration:\n${issues}`);
+  }
+  // The dev default keeps `npm run dev` and the test-suite working with a zero-config .env, but it
+  // is a constant in the source, so production must supply a real one.
+  if (env.NODE_ENV === 'production' && parsed.data.API_KEY_PEPPER === DEV_API_KEY_PEPPER) {
+    throw new Error(
+      'API_KEY_PEPPER is required when NODE_ENV=production. Merchant API keys are stored as ' +
+        'HMAC-SHA256(pepper, key) so that a database leak cannot be replayed; without a real ' +
+        'pepper the API-key hashing silently falls back to a constant compiled into the source. ' +
+        'Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64url\'))" ' +
+        'and keep it stable across restarts and replicas.',
+    );
   }
   if (parsed.data.WEBHOOK_ALLOW_INSECURE_URLS && env.NODE_ENV === 'production') {
     throw new Error(
