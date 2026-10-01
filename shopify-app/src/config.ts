@@ -17,6 +17,10 @@ const EnvSchema = z.object({
   GATEWAY_MERCHANT_KEY: z.string().min(1),
   GATEWAY_WEBHOOK_SECRET: z.string().min(1),
   GATEWAY_FIAT_CURRENCY: z.string().min(2).max(4).default('USD'),
+  /** How long an issued OAuth `state` stays valid before the install is rejected as stale. */
+  OAUTH_STATE_TTL_MS: z.coerce.number().int().positive().default(600_000),
+  /** How often to sweep lapsed gateway quotes into `expired`. */
+  EXPIRY_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
   STORE_PATH: z.string().default('./data'),
   ALLOW_INSECURE_SHOP_HOST: boolish(false),
   LOG_PRETTY: boolish(false),
@@ -33,6 +37,8 @@ export interface Config {
   GATEWAY_MERCHANT_KEY: string;
   GATEWAY_WEBHOOK_SECRET: string;
   GATEWAY_FIAT_CURRENCY: string;
+  OAUTH_STATE_TTL_MS: number;
+  EXPIRY_SWEEP_INTERVAL_MS: number;
   STORE_PATH: string;
   ALLOW_INSECURE_SHOP_HOST: boolean;
   LOG_PRETTY: boolean;

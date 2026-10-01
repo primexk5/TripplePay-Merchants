@@ -37,6 +37,9 @@ export function createApp(cfg: ReturnType<typeof loadConfig>) {
     const shop = String(req.query.shop ?? '').toLowerCase();
     if (!isShopDomain(shop)) return res.status(400).send('invalid shop domain');
     const state = randomBytes(16).toString('hex');
+    // Persist the state so /auth/callback can prove this install round-tripped through us. Without
+    // this the callback only checks that `state` was *present*, leaving the install open to CSRF.
+    store.putState({ state, shop, createdAt: Date.now() });
     res.redirect(buildInstallUrl(shop, cfg.SHOPIFY_API_KEY, cfg.SHOPIFY_SCOPES, redirectUri, state));
   });
 
@@ -47,6 +50,19 @@ export function createApp(cfg: ReturnType<typeof loadConfig>) {
     }
     const shop = String(query['shop'] ?? '').toLowerCase();
     if (!isShopDomain(shop)) return res.status(400).send('invalid shop domain');
+
+    // Single-use, shop-bound, time-boxed. Consumed BEFORE the token exchange so a replayed callback
+    // URL cannot mint a second token even if the first exchange failed.
+    const issued = store.consumeState(String(query['state'] ?? ''), shop);
+    if (!issued) {
+      logger.warn({ shop }, 'OAuth state unknown, already used, or issued for another shop');
+      return res.status(401).send('OAuth state invalid or already used — restart the install');
+    }
+    if (Date.now() - issued.createdAt > cfg.OAUTH_STATE_TTL_MS) {
+      logger.warn({ shop, ageMs: Date.now() - issued.createdAt }, 'OAuth install expired before callback');
+      return res.status(401).send('OAuth install expired — restart the install');
+    }
+
     const accessToken = await exchangeCodeForToken(shop, query['code'] as string, cfg.SHOPIFY_API_KEY, cfg.SHOPIFY_API_SECRET);
     store.setSession({ shop, accessToken, installedAt: Date.now(), scopes: cfg.SHOPIFY_SCOPES });
     res.type('html').send(`<h1>Installed</h1><p>Pay with Quai is connected to ${shop}.</p>`);
@@ -65,9 +81,34 @@ export function createApp(cfg: ReturnType<typeof loadConfig>) {
     if (!order) return res.status(200).end();
     if (!order.total_price || Number(order.total_price) <= 0) return res.status(200).end();
 
+    const fiatCurrency = order.currency ?? cfg.GATEWAY_FIAT_CURRENCY;
+    const admin = new AdminApi(session.shop, session.accessToken);
+
+    // Idempotency. Shopify retries orders/create whenever it doesn't get a fast 2xx, and every
+    // retry would otherwise mint another gateway order for the same shop order — double-quoting and
+    // double-charging the customer. Reuse the existing gateway order instead. (Re-writing the
+    // metafields below is itself idempotent, so a retry also repairs a failed first attempt.)
+    const existing = store.getPendingForShopOrder(shop, order.id);
+    if (existing && existing.status !== 'expired') {
+      logger.info({ shop, orderId: order.id, gatewayId: existing.gatewayId, status: existing.status }, 'orders/create retry — reusing gateway order');
+      try {
+        await admin.setOrderPaymentFields(order.id, {
+          paymentUrl: existing.checkoutUrl,
+          gatewayId: existing.gatewayId,
+          quotedAmount: existing.amount,
+          fiatCurrency: existing.fiatCurrency,
+          asset: existing.asset,
+          expiresAt: existing.expiresAt,
+        });
+      } catch (err) {
+        logger.error({ err, shop, orderId: order.id }, 'failed to refresh payment metafields on retry');
+      }
+      return res.json({ received: true, gatewayId: existing.gatewayId, duplicate: true });
+    }
+
     const created = await gateway.createOrder({
       amount: order.total_price,
-      fiatCurrency: order.currency ?? cfg.GATEWAY_FIAT_CURRENCY,
+      fiatCurrency,
       reference: String(order.id),
       token: 'qi',
       expiresInSecs: 1800,
@@ -78,10 +119,34 @@ export function createApp(cfg: ReturnType<typeof loadConfig>) {
       orderId: order.id,
       checkoutUrl: created.checkoutUrl,
       amount: created.quote.quaiDisplay,
-      fiatCurrency: order.currency ?? cfg.GATEWAY_FIAT_CURRENCY,
+      fiatCurrency,
+      asset: created.token,
       status: 'awaiting',
       createdAt: Date.now(),
+      // Trust the gateway's own expiry rather than re-deriving it from expiresInSecs.
+      expiresAt: created.expiresAt,
     });
+
+    // Publish the payment link onto the order so a theme snippet can render it for the customer.
+    // A failure here must NOT fail the webhook: doing so would make Shopify retry, and the retry
+    // guard above would then reuse this gateway order — but the merchant would get a noisy retry
+    // for a link that already exists. The pending record above is the source of truth either way.
+    try {
+      await admin.setOrderPaymentFields(order.id, {
+        paymentUrl: created.checkoutUrl,
+        gatewayId: created.gatewayId,
+        quotedAmount: created.quote.quaiDisplay,
+        fiatCurrency,
+        asset: created.token,
+        expiresAt: created.expiresAt,
+      });
+    } catch (err) {
+      logger.error(
+        { err, shop, orderId: order.id, gatewayId: created.gatewayId },
+        'could not write payment metafields — add the snippet and check the connector log for this checkoutUrl',
+      );
+    }
+
     logger.info({ shop, orderId: order.id, gatewayId: created.gatewayId, checkoutUrl: created.checkoutUrl }, 'gateway order created for shop order');
     res.json({ received: true, gatewayId: created.gatewayId });
   }));
@@ -98,7 +163,7 @@ export function createApp(cfg: ReturnType<typeof loadConfig>) {
     if (!verifyGatewayWebhook(cfg.GATEWAY_WEBHOOK_SECRET, req.header(SIGNATURE_HEADER), rawBody, Math.floor(Date.now() / 1000))) {
       return res.status(401).json({ error: 'invalid signature' });
     }
-    const payload = JSON.parse(rawBody) as PaymentWebhook;
+const payload = JSON.parse(rawBody) as PaymentWebhook;
     if (payload.type !== 'payment.confirmed' || !payload.data.reference) return res.status(204).end();
     const orderId = Number(payload.data.reference);
     const pending = store.getPendingForOrder(orderId);
@@ -108,11 +173,41 @@ export function createApp(cfg: ReturnType<typeof loadConfig>) {
     const session = store.getSession(pending.shop);
     if (!session) return res.status(204).end();
     const admin = new AdminApi(session.shop, session.accessToken);
+
+    // Funds already landed on-chain, so the order is marked paid either way — the merchant should
+    // never be left short just because our quote bookkeeping lapsed. A payment arriving after the
+    // quote expired is not expected (the router enforces expiry), so log it loudly if it happens.
+    const late = pending.status === 'expired' || pending.expiresAt <= Date.now();
+    if (late) {
+      logger.warn(
+        { shop: pending.shop, orderId, gatewayId: pending.gatewayId, expiredAt: pending.expiresAt },
+        'payment confirmed after the gateway quote expired — marking order paid anyway (funds received)',
+      );
+    }
+
     await admin.markOrderPaid(pending.orderId, payload.data.token ?? 'quai');
     store.markPaid(pending.gatewayId);
-    logger.info({ shop: pending.shop, orderId: pending.orderId, gatewayId: pending.gatewayId }, 'shop order marked paid by gateway');
+    // Drop the pay button now that the order is settled.
+    await admin.clearOrderPaymentUrl(pending.orderId).catch(() => undefined);
+    logger.info({ shop: pending.shop, orderId, gatewayId: pending.gatewayId, late }, 'shop order marked paid by gateway');
     res.status(204).end();
   }));
+
+  // Reconcile lapsed quotes. Without this a payment link that timed out stayed `awaiting` forever
+  // and its button kept rendering on the order, inviting a customer to click a dead link. Runs on
+  // an unref'd interval so it never holds the process open on shutdown.
+  const sweeper = setInterval(() => {
+    try {
+      const pruned = store.pruneStates(cfg.OAUTH_STATE_TTL_MS);
+      if (pruned) logger.debug?.({ pruned }, 'pruned stale OAuth states');
+      const expired = store.sweepExpired();
+      if (expired) logger.info({ expired }, 'gateway quotes expired since last sweep');
+    } catch (err) {
+      logger.error({ err }, 'expiry sweep failed');
+    }
+  }, cfg.EXPIRY_SWEEP_INTERVAL_MS);
+  sweeper.unref();
+
 
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     const e = err as { status?: number; message?: string };

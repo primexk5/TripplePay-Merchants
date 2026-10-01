@@ -1,0 +1,73 @@
+{%- comment -%}
+  Pay with Quai — order payment link.
+
+  Renders the checkout URL that the Pay with Quai connector wrote onto the order as a
+  `quai.*` metafield when the order was created. Drop this into your theme (Online Store →
+  Theme code editor → Snippets → Add a new snippet named `pay-with-quai`, then
+  {% render 'pay-with-quai' %}) and place the render wherever the customer needs to pay:
+
+    * Order status page  — {% render 'pay-with-quai' %}   (best default)
+    * Cart / checkout     — same snippet; it hides itself when there is no order yet
+    * A confirmation page — same snippet
+
+  It shows nothing at all unless there is a live link AND the order is still unpaid, so you can
+  leave it in your layout permanently without any conditional logic of your own. The connector
+  deletes `quai.payment_url` when the order is marked paid, and this snippet additionally checks
+  the order's financial status, so a stale metafield can't resurrect a dead button.
+
+  The amount shown is the crypto quote captured when the order was created, not a live price.
+{%- endcomment -%}
+
+{%- liquid
+  assign quai_url = order.metafields.quai.payment_url.value
+  assign quai_amount = order.metafields.quai.quoted_amount.value
+  assign quai_asset = order.metafields.quai.payment_asset.value | default: 'QUAI'
+  assign quai_fiat = order.metafields.quai.fiat_currency.value
+  assign quai_expires_at = order.metafields.quai.expires_at.value
+  assign quai_asset_label = quai_asset | upcase
+
+  assign quai_settled = false
+  if order.financial_status == 'paid'
+    or order.financial_status == 'refunded'
+    or order.financial_status == 'partially_refunded'
+    or order.financial_status == 'voided'
+    assign quai_settled = true
+  endif
+-%}
+
+{%- if quai_url != blank and quai_settled == false -%}
+  <div class="pwq-payment" style="margin: 1.5rem 0; padding: 1.25rem; border: 1px solid #e5e5e5; border-radius: 8px;">
+    <p style="margin: 0 0 .5rem; font-weight: 600;">Pay this order with {{ quai_asset_label }}</p>
+
+    {%- if quai_amount != blank and quai_fiat != blank -%}
+      <p style="margin: 0 0 .75rem; color: #555; font-size: .9rem;">
+        {%- if quai_asset_label == 'QI' -%}
+          Qi has no gas fees — the customer pays the exact quoted amount.
+        {%- else -%}
+          Paid on-chain in {{ quai_asset_label }}.
+        {%- endif -%}
+      </p>
+    {%- endif -%}
+
+    <a class="pwq-payment__button"
+       href="{{ quai_url }}"
+       rel="noopener noreferrer"
+       style="display: inline-block; padding: .7rem 1.4rem; background: #000; color: #fff; text-decoration: none; border-radius: 6px; font-weight: 600;">
+      Pay with {{ quai_asset_label }}
+    </a>
+
+    {%- if quai_expires_at != blank -%}
+      <p style="margin: .75rem 0 0; color: #888; font-size: .8rem;">
+        Quote valid until {{ quai_expires_at | date: '%b %-d, %Y %H:%M' }} UTC. If it expires, ask
+        the store to re-issue the payment link.
+      </p>
+    {%- endif -%}
+
+    <noscript>
+      <p style="margin: .75rem 0 0; color: #888; font-size: .8rem;">
+        JavaScript is not required to pay — copy this link:
+        <br><a href="{{ quai_url }}">{{ quai_url }}</a>
+      </p>
+    </noscript>
+  </div>
+{%- endif -%}

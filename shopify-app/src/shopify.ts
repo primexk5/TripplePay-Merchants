@@ -92,6 +92,48 @@ export class AdminApi {
     });
     logger.info({ shop: this.shop, orderId }, 'order marked paid via transaction');
   }
+
+  /**
+   * Writes the payment details onto the order as `quai.*` metafields. This is what actually gets
+   * the payment link in front of the customer: a theme snippet reads
+   * `order.metafields.quai.payment_url.value` and renders it (see snippets/pay-with-quai.liquid).
+   *
+   * Without this the only record of the checkout URL is the connector's log, so a store has no way
+   * to tell a customer where to pay.
+   */
+  async setOrderPaymentFields(
+    orderId: number,
+    fields: {
+      paymentUrl: string;
+      gatewayId: string;
+      quotedAmount: string;
+      fiatCurrency: string;
+      asset: string;
+      expiresAt: number;
+    },
+  ): Promise<void> {
+    const meta = [
+      { namespace: 'quai', key: 'payment_url', type: 'url', value: fields.paymentUrl },
+      { namespace: 'quai', key: 'gateway_id', type: 'single_line_text_field', value: fields.gatewayId },
+      { namespace: 'quai', key: 'quoted_amount', type: 'single_line_text_field', value: fields.quotedAmount },
+      { namespace: 'quai', key: 'payment_asset', type: 'single_line_text_field', value: fields.asset },
+      { namespace: 'quai', key: 'fiat_currency', type: 'single_line_text_field', value: fields.fiatCurrency },
+      { namespace: 'quai', key: 'expires_at', type: 'date_time', value: new Date(fields.expiresAt).toISOString() },
+    ];
+    await this.request('POST', `/orders/${orderId}/metafields.json`, { metafields: meta });
+    logger.info({ shop: this.shop, orderId, gatewayId: fields.gatewayId }, 'payment metafields written');
+  }
+
+  /** Clears the payment_url metafield once the order is settled or the quote lapses, so a theme
+   *  snippet stops showing a button for a payment that can no longer complete. */
+  async clearOrderPaymentUrl(orderId: number): Promise<void> {
+    try {
+      await this.request('DELETE', `/orders/${orderId}/metafields/quai/payment_url.json`);
+    } catch (err) {
+      // Already gone, or the order has no such metafield — nothing to clear.
+      logger.debug?.({ shop: this.shop, orderId, err }, 'payment_url metafield already absent');
+    }
+  }
 }
 
 export interface OrderInfo {
