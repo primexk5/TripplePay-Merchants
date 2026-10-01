@@ -151,6 +151,24 @@ npm run demo:robinhood-testnet     # or: npm run demo:base-sepolia
 - `demo:robinhood-testnet` / `demo:base-sepolia` run the same end-to-end checkout loop as
   `npm run demo` (mint, register, approve, pay, both ERC-20 and native), reading addresses from
   `deployments/<network>.json`.
+- `allow:robinhood-testnet` / `allow:base-sepolia` allowlist settlement assets on an **already
+  deployed** proxy, without redeploying it. Name the assets with `EXTRA_TOKENS` (or
+  `STABLECOIN_ADDR`; `ONLY_TOKENS` replaces the list, `NO_NATIVE=1` skips native currency):
+
+  ```bash
+  EXTRA_TOKENS=0x<token> npm run allow:robinhood-testnet
+  ```
+
+  Unlike the Quai script, this one has **no hardcoded token list**: every standard EVM chain lists
+  its own tokens, and an address from one chain is meaningless on another, so nothing is guessed.
+  It reads `symbol()`/`decimals()` back on-chain for every address and refuses to send anything if
+  one isn't a readable ERC-20 — so a typo fails before a transaction is broadcast. Take the
+  addresses from that chain's block explorer, and note that a token has to exist on-chain on the
+  chain you're deploying to (a bridged or native-tokenized asset is not the same contract as its
+  Ethereum/Quai counterpart).
+
+  Assets can also be allowlisted during deploy via `EXTRA_TOKENS` in `scripts/evm/deploy.js`;
+  prefer the script above for anything added after the initial deploy, since it verifies symbols.
 - These scripts refuse to run against a mainnet chain id (Quai `9`, Robinhood Chain `4663`, Base
   `8453`) — EVM mainnet deploys are disabled until the team reviews them.
 - `FEE_RECIPIENT`, `FEE_BPS`, `STABLECOIN_ADDR`, `MULTISIG_ADDR`, `TIMELOCK_MIN_DELAY`,

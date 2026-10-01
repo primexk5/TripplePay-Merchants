@@ -157,6 +157,31 @@ async function main() {
     console.log(`Accepted asset: ${process.env.STABLECOIN_ADDR} (STABLECOIN_ADDR)`);
   }
 
+  // Additional ERC-20s to allowlist at deploy time. Standard EVM chains have no canonical token
+  // list (unlike Quai's hardcoded USDT/WQUAI), so these are named explicitly rather than guessed.
+  // Post-deploy additions use scripts/evm/allowTokens.js, which also reads symbol()/decimals()
+  // back on-chain; this path trusts the operator's addresses, so keep EXTRA_TOKENS short and
+  // verify against the chain's explorer before running a deploy.
+  const extraTokens = (process.env.EXTRA_TOKENS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const token of extraTokens) {
+    if (!/^0x[0-9a-fA-F]{40}$/.test(token)) {
+      throw new Error(`EXTRA_TOKENS entry "${token}" is not a valid 20-byte address.`);
+    }
+    if (
+      token.toLowerCase() === ZERO.toLowerCase() ||
+      (process.env.STABLECOIN_ADDR || '').toLowerCase() === token.toLowerCase()
+    ) {
+      console.log(`Skipping ${token} — already allowlisted above.`);
+      continue;
+    }
+    const tx = await pay.setTokenAccepted(token, true);
+    await tx.wait();
+    console.log(`Accepted asset: ${token} (EXTRA_TOKENS)`);
+  }
+
   // --- Fee routing verification: read the fee config back from the proxy and fail hard if it
   // does not match what was requested (mirrors scripts/deploy.js).
   const [onChainFeeRecipient, onChainFeeBps] = await Promise.all([
