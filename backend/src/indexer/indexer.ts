@@ -178,7 +178,12 @@ export class Indexer {
       return;
     }
 
-    const merchant = await this.store.getMerchantByAddress(e.merchant);
+    // Resolve by the PAYOUT address, not the identity address. `e.merchant` is the address the
+    // customer actually paid, read straight off the event, so it is the merchant's configured
+    // destination for this chain — which is not necessarily their login address. Looking this up
+    // with getMerchantByAddress would silently miss the moment those two diverge and turn every
+    // delivery into a `skipped` row against an unknown merchant.
+    const merchant = await this.store.getMerchantByPayoutAddress(this.cfg.CHAIN_ID, e.merchant);
     const meta = await this.store.getOrderMeta(e.orderId); // gateway links carry data.reference
     const nowMs = this.now();
     const payload = this.buildPayload(id, e, merchant?.merchantId ?? unknownMerchantId(e.merchant), order.feeBps, order.nonce, meta?.reference);

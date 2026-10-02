@@ -181,4 +181,67 @@ describe('Indexer', () => {
     expect(d.merchantId).toBe('unregistered:' + ADDR);
     expect(d.url).toBe('');
   });
+
+  // The regression this whole lookup exists to prevent. A merchant's identity address (the wallet
+  // they log in with) and the address their money lands on are different things once per-chain
+  // payouts exist. The indexer only ever sees the payout address off the event, so resolving it
+  // with getMerchantByAddress would miss here — and the failure is SILENT: the payment is still
+  // recorded, just as `skipped` against `unregistered:<payout>`, so the merchant never gets their
+  // webhook and nothing anywhere reports an error.
+  it('delivers a webhook when the payout address differs from the identity address', async () => {
+    const store = freshStore();
+    await store.upsertMerchant({
+      merchantId: 'mch_payout',
+      address: '0x00000000000000000000000000000000000000d1', // identity (login) address
+      name: 'Acme',
+      webhookUrl: 'https://example.test/webhook',
+      webhookSecret: 'whsec_x',
+      active: true,
+      createdAt: 1,
+    });
+    // Money lands here instead — a different address, same merchant.
+    await store.setPayoutAddress({
+      merchantId: 'mch_payout',
+      chainId: 9,
+      address: '0x00000000000000000000000000000000000000A1',
+      source: 'declared',
+      createdAt: 2,
+    });
+
+    const indexer = withPrivates(new Indexer(fakeClient({ events: [event(5)] }), store, cfg, () => 0));
+    await indexer.processEvent(event(5));
+
+    const d = (await store.getDelivery('0x' + 'ab'.repeat(32) + ':0'))!;
+    expect(d.merchantId).toBe('mch_payout');
+    expect(d.status).not.toBe('skipped');
+    expect(d.url).toBe('https://example.test/webhook');
+  });
+
+  it('does not resolve a payout address on the wrong chain', async () => {
+    const store = freshStore();
+    await store.upsertMerchant({
+      merchantId: 'mch_payout',
+      address: '0x00000000000000000000000000000000000000d1',
+      name: 'Acme',
+      webhookUrl: 'https://example.test/webhook',
+      webhookSecret: 'whsec_x',
+      active: true,
+      createdAt: 1,
+    });
+    // Configured for chain 46630 only. This indexer watches chain 9.
+    await store.setPayoutAddress({
+      merchantId: 'mch_payout',
+      chainId: 46630,
+      address: '0x00000000000000000000000000000000000000A1',
+      source: 'declared',
+      createdAt: 2,
+    });
+
+    const indexer = withPrivates(new Indexer(fakeClient({ events: [event(5)] }), store, cfg, () => 0));
+    await indexer.processEvent(event(5));
+
+    const d = (await store.getDelivery('0x' + 'ab'.repeat(32) + ':0'))!;
+    expect(d.merchantId).toBe('unregistered:' + ADDR);
+    expect(d.status).toBe('skipped');
+  });
 });

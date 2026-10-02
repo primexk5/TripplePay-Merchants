@@ -143,7 +143,10 @@ export class QiIndexer {
     const id = qiPaymentId(order.orderId);
     if (await this.store.getDelivery(id)) return; // idempotent: never double-deliver
 
-    const merchant = await this.store.getMerchantByAddress(order.merchantAddress);
+    // Qi is Cyprus-1 only, so this chainId is exact rather than a best guess. Same payout-address
+    // resolution as the EVM indexer: order.merchantAddress is where the money landed, which is the
+    // merchant's configured destination for this chain rather than necessarily their login address.
+    const merchant = await this.store.getMerchantByPayoutAddress(this.chainId, order.merchantAddress);
     const meta = await this.store.getOrderMeta(order.orderId); // gateway links carry data.reference
     const nowMs = this.now();
     const payload = this.buildPayload(id, order, merchant?.merchantId ?? unknownMerchantId(order.merchantAddress), meta?.reference);

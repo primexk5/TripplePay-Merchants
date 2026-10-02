@@ -36,7 +36,10 @@ export interface MerchantSettings {
 
 export interface Merchant {
   merchantId: string; // platform id, e.g. "mch_ab12..."
-  address: string; // lowercased on-chain payout address (the map key)
+  /** The merchant's IDENTITY address — the single wallet they sign in and register with.
+   *  This is no longer assumed to be where their money lands: see MerchantPayoutAddress. It stays
+   *  the merchants table key so every legacy lookup keeps working. */
+  address: string; // lowercased on-chain address (the map key)
   name: string;
   webhookUrl: string;
   webhookSecret: string; // used to HMAC-sign deliveries to this merchant
@@ -44,6 +47,24 @@ export interface Merchant {
   createdAt: number;
   settings?: MerchantSettings;
 }
+
+/** Where a merchant's money lands on ONE chain. A merchant identity can hold several of these —
+ *  one per chain — which is what lets a single wallet-based account accept payments on Quai AND
+ *  Base without needing a second login. */
+export interface MerchantPayoutAddress {
+  merchantId: string;
+  chainId: number;
+  /** lowercased payout destination, valid for `chainId`'s address kind (and Quai zone). */
+  address: string;
+  /** 'login' = seeded from the merchant's identity address; 'declared' = entered by the merchant. */
+  source: PayoutAddressSource;
+  createdAt: number; // unix ms
+}
+
+/** Provenance of a payout destination. Only 'login' rows imply the merchant proved control of the
+ *  address (they signed with it at registration); 'declared' rows are accepted on trust, so the UI
+ *  makes the merchant confirm them. */
+export type PayoutAddressSource = 'login' | 'declared';
 
 /** A server-to-server API key a merchant issues for their store backend (plugins). The key is a
  *  bearer secret (`X-Merchant-Key`) that resolves to the owning merchant, exactly like a session. */

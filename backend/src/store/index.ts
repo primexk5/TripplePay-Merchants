@@ -1,4 +1,4 @@
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKeyMeta, FixedOrderClaimResult } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKeyMeta, MerchantPayoutAddress, PayoutAddressSource, FixedOrderClaimResult } from '../types.js';
 
 /**
  * Persistence boundary for the relayer. The default local implementation ({@link JsonStore}) is a
@@ -17,8 +17,36 @@ export interface Store {
   // --- merchants (keyed by lowercased on-chain address) ---
   upsertMerchant(m: Merchant): Promise<void>;
   getMerchantByAddress(address: string): Promise<Merchant | undefined>;
+  /**
+   * Resolve the merchant that RECEIVED a payment at `address` on `chainId`.
+   *
+   * This is deliberately NOT the same lookup as getMerchantByAddress. A merchant's identity address
+   * (merchants.address) and the address their money actually lands on are different things: a link's
+   * payout address is resolved per chain from merchant_payout_addresses, so a single identity can
+   * receive on Quai at one address and on Base at another. The indexer only ever sees the on-chain
+   * payout address off the PaymentReceived event, so it MUST resolve through here — calling
+   * getMerchantByAddress with a payout address silently misses once the two diverge, and every
+   * payment is recorded as `skipped` against an unknown merchant instead of delivering its webhook.
+   */
+  getMerchantByPayoutAddress(chainId: number, address: string): Promise<Merchant | undefined>;
   getMerchantById(merchantId: string): Promise<Merchant | undefined>;
   listMerchants(): Promise<Merchant[]>;
+
+  // --- per-chain payout addresses (identity stays one wallet; money moves per chain) ---
+  /** Every configured payout destination for a merchant, keyed by chainId. */
+  listPayoutAddresses(merchantId: string): Promise<MerchantPayoutAddress[]>;
+  /** Set (or replace) one chain's payout destination. `source` records whether it was seeded from
+   *  the merchant's identity address or declared by hand. */
+  setPayoutAddress(p: {
+    merchantId: string;
+    chainId: number;
+    address: string;
+    source: PayoutAddressSource;
+    createdAt: number;
+  }): Promise<void>;
+  /** Drop one chain's configured destination. The merchant's identity address still applies as a
+   *  fallback for chains whose address kind it matches, so this never orphans an identity. */
+  clearPayoutAddress(merchantId: string, chainId: number): Promise<void>;
 
   // --- merchant API keys (server-to-server gateway auth) ---
   // Implementations hash incoming keys with the server pepper; the credential is never persisted.

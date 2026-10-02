@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSyn
 import { dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { Store } from './index.js';
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey, MerchantApiKeyMeta, FixedOrderClaimResult } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey, MerchantApiKeyMeta, MerchantPayoutAddress, PayoutAddressSource, FixedOrderClaimResult } from '../types.js';
 import { hashApiKey, apiKeyRef, constantTimeEqual, DEV_API_KEY_PEPPER } from '../util/apikey.js';
 import { log } from '../logger.js';
 
@@ -19,9 +19,16 @@ interface FileShape {
   orderMeta: Record<string, OrderMeta>; // key: lowercased orderId
   qiOrders: Record<string, QiOrder>;    // key: lowercased orderId
   apiKeys: Record<string, MerchantApiKey>; // key: keyHash
+  /** Per-chain payout destinations, keyed `${merchantId}:${chainId}`. */
+  payoutAddresses: Record<string, MerchantPayoutAddress>;
   /** Pre-hashing rows: key -> merchantAddress. Migrated to `apiKeys` on first successful use and
    *  then deleted, so an existing database.json keeps working without a manual migration step. */
   legacyApiKeys?: Record<string, string>;
+}
+
+/** Map key for one merchant's payout destination on one chain. */
+function payoutKey(merchantId: string, chainId: number): string {
+  return `${merchantId}:${chainId}`;
 }
 
 /** Case-insensitive lookup key binding a delivery to its (merchant, orderId). */
@@ -95,7 +102,7 @@ export class JsonStore implements Store {
   }
 
   private read(): FileShape {
-    if (!existsSync(this.path)) return { cursors: {}, merchants: {}, deliveries: {}, sessions: {}, nonces: {}, links: {}, claims: {}, orderMeta: {}, qiOrders: {}, apiKeys: {} };
+    if (!existsSync(this.path)) return { cursors: {}, merchants: {}, deliveries: {}, sessions: {}, nonces: {}, links: {}, claims: {}, orderMeta: {}, qiOrders: {}, apiKeys: {}, payoutAddresses: {} };
     try {
       const parsed = JSON.parse(readFileSync(this.path, 'utf8')) as {
         cursor?: number | null;
@@ -159,6 +166,9 @@ export class JsonStore implements Store {
         qiOrders: (parsed as Partial<FileShape>).qiOrders ?? {},
         apiKeys: apiKeys,
         legacyApiKeys: legacyApiKeys,
+        // Absent on every file written before per-chain payouts existed — the settlement resolver
+        // falls back to the merchant's identity address, so those merchants keep working untouched.
+        payoutAddresses: (parsed as Partial<FileShape>).payoutAddresses ?? {},
       };
     } catch (err) {
       throw new Error(`Failed to read store at ${this.path}: ${(err as Error).message}`);
@@ -223,6 +233,46 @@ export class JsonStore implements Store {
 
   async getMerchantByAddress(address: string): Promise<Merchant | undefined> {
     return this.data.merchants[address.toLowerCase()];
+  }
+
+  async getMerchantByPayoutAddress(chainId: number, address: string): Promise<Merchant | undefined> {
+    const addr = address.toLowerCase();
+    for (const m of Object.values(this.data.merchants)) {
+      const rows = await this.listPayoutAddresses(m.merchantId);
+      const hit = rows.find((r) => r.chainId === chainId && r.address === addr);
+      if (hit) return m;
+      // Legacy fallback: a merchant with no configured row for this chain still receives at their
+      // identity address. The chain-kind check lives in the resolver, not here, so the store stays
+      // a dumb lookup and cannot disagree with it about which chains an address serves.
+      if (!rows.some((r) => r.chainId === chainId) && m.address === addr) return m;
+    }
+    return undefined;
+  }
+
+  async listPayoutAddresses(merchantId: string): Promise<MerchantPayoutAddress[]> {
+    return Object.values(this.data.payoutAddresses).filter((r) => r.merchantId === merchantId);
+  }
+
+  async setPayoutAddress(p: {
+    merchantId: string;
+    chainId: number;
+    address: string;
+    source: PayoutAddressSource;
+    createdAt: number;
+  }): Promise<void> {
+    this.data.payoutAddresses[payoutKey(p.merchantId, p.chainId)] = {
+      merchantId: p.merchantId,
+      chainId: p.chainId,
+      address: p.address.toLowerCase(),
+      source: p.source,
+      createdAt: p.createdAt,
+    };
+    this.flush();
+  }
+
+  async clearPayoutAddress(merchantId: string, chainId: number): Promise<void> {
+    delete this.data.payoutAddresses[payoutKey(merchantId, chainId)];
+    this.flush();
   }
 
   async getMerchantById(merchantId: string): Promise<Merchant | undefined> {
