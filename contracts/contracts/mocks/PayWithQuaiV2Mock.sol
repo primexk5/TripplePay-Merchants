@@ -40,4 +40,15 @@ contract PayWithQuaiV2Mock is PayWithQuai {
     function note() external view returns (string memory) {
         return _v2().note;
     }
+
+    // --- signed-order module, mirroring what the real upgrade ships -----------------------
+
+    /// @notice The real signed-order module initializes its EIP-712 domain at reinitializer(3).
+    ///         Exposed here so the upgrade-safety tests can drive the exact same path, including
+    ///         the guarantee that the domain cannot be initialized twice or by a non-owner.
+    ///         No `reinitializer` modifier here: it is enforced by the inner `initializeSigning`,
+    ///         and stacking two would make the inner call revert on the version bump.
+    function initializeSigningV2(string calldata name, string calldata version) external onlyOwner {
+        initializeSigning(name, version);
+    }
 }

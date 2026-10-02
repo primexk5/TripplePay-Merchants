@@ -23,10 +23,9 @@ import { Logo } from "@/components/logo";
 import { WalletSelector } from "@/components/ui/wallet-selector";
 import {
   ZERO_ADDRESS,
-  getOrderOnChain,
-  orderPaymentError,
   payOrder,
   payOrderNative,
+  paySignedOrder,
   requestBlipAppWalletTopUp,
   waitForOnChainConfirmation,
   fetchLink,
@@ -264,7 +263,9 @@ export default function PayPage({ params }: { params: Params }) {
         await ensureNetwork(wallet, chain);
       }
 
-      // Step 1: Claim an orderId from the pool
+      // Step 1: Claim an order. This mints a fresh orderId and returns the server's signature
+      // authorizing exactly that order for exactly this wallet. Nothing exists on-chain yet, so
+      // there is nothing to pre-check: the merchant never paid to register it.
       phase = "claim";
       setStage({ name: "claiming" });
       const linkProblem = await linkPaymentProblem(link, chain);
@@ -275,25 +276,18 @@ export default function PayPage({ params }: { params: Params }) {
       setClaimedOrderId(orderId);
       setClaimedMerchant(merchant);
 
-      // Step 2: Sanity-check the order on-chain BEFORE the wallet popup, so a call that would
-      // certainly revert never wastes the customer's approval.
-      setStage({ name: "paying", step: "Checking order…" });
-      const amount = BigInt(link.amount);
-      const onChainOrder = await getOrderOnChain(merchant, orderId, chain);
-      const precheckError = orderPaymentError(
-        onChainOrder,
-        connected,
-        amount,
-        isNative(link),
-      );
-      if (precheckError) throw new Error(precheckError);
-
-      // Step 3: Pay the order — one wallet popup
+      // Step 2: One wallet popup creates AND settles the order. The customer pays the gas — that
+      // is the whole point: no merchant or platform transaction is needed to publish a link.
       phase = "send";
       setStage({ name: "paying", step: "Awaiting wallet approval…" });
-      const hash = isNative(link)
-        ? await payOrderNative(merchant, orderId, amount, chain)
-        : await payOrder(merchant, orderId, link.tokenAddress, amount, chain);
+      const amount = BigInt(link.amount);
+      const hash = claim.authorization
+        ? await paySignedOrder(claim.authorization, amount, chain)
+        : // Legacy link: the order was pre-registered on-chain by the merchant, so it can only
+          // be settled, not created.
+          isNative(link)
+          ? await payOrderNative(merchant, orderId, amount, chain)
+          : await payOrder(merchant, orderId, link.tokenAddress, amount, chain);
 
 
       // Step 4: Wait for on-chain confirmation (instant — no webhook wait)
@@ -520,7 +514,9 @@ export default function PayPage({ params }: { params: Params }) {
                   <p className="mt-1 break-all font-mono text-xs text-white">
                     {link.merchantAddress}
                   </p>
-                  {link.poolSize <= 3 && link.multiPay && (
+                  {/* Legacy links still advertise a shrinking pool. New links have none: their
+                      only limit is the merchant's customer cap, enforced server-side. */}
+                  {link.multiPay && link.poolSize !== undefined && link.poolSize <= 3 && (
                     <p className="mt-1 text-xs text-amber-300">
                       ⚠ Only {link.poolSize} payment slot
                       {link.poolSize !== 1 ? "s" : ""} remaining

@@ -170,6 +170,32 @@ async function main() {
   // Bind the implementation ABI to the proxy address for all further calls.
   const pay = new quais.Contract(proxy.address, implArtifact.abi, wallet);
 
+  // Customer-paid signed orders: initialize the EIP-712 domain and allowlist the platform signer
+  // BEFORE the ownership hand-off below, so the new owner never has to make a follow-up tx.
+  const SIGNING_DOMAIN_NAME = 'PayWithQuai';
+  const SIGNING_DOMAIN_VERSION = '1';
+  await withRetry(async () => {
+    await (await pay.initializeSigning(SIGNING_DOMAIN_NAME, SIGNING_DOMAIN_VERSION)).wait();
+    console.log(`Signing domain:     ${SIGNING_DOMAIN_NAME} v${SIGNING_DOMAIN_VERSION}`);
+  }, 'initializeSigning');
+
+  const orderSigner = (process.env.ORDER_SIGNER_ADDRESS || '').trim();
+  if (orderSigner) {
+    if (!quais.isAddress(orderSigner)) {
+      throw new Error(`ORDER_SIGNER_ADDRESS="${orderSigner}" is not a valid address.`);
+    }
+    await withRetry(async () => {
+      await (await pay.setSigner(orderSigner, true)).wait();
+      console.log(`Order signer:       ${orderSigner} (allowlisted)`);
+    }, 'setSigner');
+  } else {
+    console.warn(
+      '\n⚠️  ORDER_SIGNER_ADDRESS not set — no signer is allowlisted, so paySignedOrder will reject ' +
+        'every customer payment until the owner runs setSigner(<platformSigner>, true).\n' +
+        '    Legacy payOrder / payOrderNative still work.',
+    );
+  }
+
   // Allowlist the settlement assets merchants may price orders in.
   await withRetry(async () => {
     await (await pay.setTokenAccepted(ZERO, true)).wait();
@@ -207,6 +233,25 @@ async function main() {
   console.log(`\nFee routing verified on-chain:`);
   console.log(`  FEE_RECIPIENT → ${onChainFeeRecipient} (all platform fees land here)`);
   console.log(`  FEE_BPS       → ${Number(onChainFeeBps)} (${Number(onChainFeeBps) / 100}% of every settlement)`);
+
+  // Signed-order state must match what the backend signs against, or every customer payment is
+  // rejected with InvalidSignature. Fail the deploy rather than ship a broken checkout.
+  if (!(await pay.signingInitialized())) {
+    throw new Error('signingInitialized() is false — the EIP-712 domain was not set up.');
+  }
+  const domain = await pay.eip712Domain();
+  if (domain.name !== SIGNING_DOMAIN_NAME || domain.version !== SIGNING_DOMAIN_VERSION) {
+    throw new Error(
+      `EIP-712 domain mismatch: got ${domain.name}/${domain.version}, expected ` +
+        `${SIGNING_DOMAIN_NAME}/${SIGNING_DOMAIN_VERSION}. DO NOT USE this deployment.`,
+    );
+  }
+  if (orderSigner && !(await pay.isSigner(orderSigner))) {
+    throw new Error(`Signer ${orderSigner} is not allowlisted after setSigner. DO NOT USE this deployment.`);
+  }
+  console.log('\nSigned orders verified on-chain:');
+  console.log(`  domain  → ${domain.name} v${domain.version}`);
+  console.log(`  signer  → ${orderSigner || '(none — customer-paid orders disabled)'}`);
 
   // 4) Governance: hand upgrade authority to a Timelock owned by the multisig (if configured).
   let timelockAddress = null;
@@ -250,18 +295,20 @@ async function main() {
   const record = {
     network: hre.network.name,
     chainId,
-    payWithQuai: proxy.address, // the address the relayer + checkout SDK use
+    payWithQuai: proxy.address, // the address the backend indexer + checkout SDK use
     payWithQuaiImpl: impl.address,
     timelock: timelockAddress,
     mockStablecoin: mockAddress ?? null,
     feeRecipient,
     feeBps: String(feeBps),
+    signingDomain: { name: SIGNING_DOMAIN_NAME, version: SIGNING_DOMAIN_VERSION },
+    orderSigner: orderSigner || null,
     deployer: wallet.address,
   };
   const outFile = path.join(outDir, `${hre.network.name}.json`);
   fs.writeFileSync(outFile, JSON.stringify(record, null, 2));
   console.log(`\nWrote ${path.relative(process.cwd(), outFile)}`);
-  console.log('The relayer and checkout SDK read PayWithQuai (proxy) from this file.');
+  console.log('The backend indexer and checkout SDK read PayWithQuai (proxy) from this file.');
 }
 
 main().catch((err) => {

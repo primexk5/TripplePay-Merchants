@@ -230,3 +230,62 @@ describe('JsonStore', () => {
     expect((await s2.getDeliveryByOrder('0x00000000000000000000000000000000000000a1', '0x' + '11'.repeat(32)))?.id).toBe('x:0');
   });
 });
+
+describe('claimFixedOrder: one fixed gateway order id, one owner', () => {
+  const SLUG = 'fixd1rst';
+  const ORDER_ID = '0x' + 'ab'.repeat(32);
+  const A = '0x00000000000000000000000000000000000000a1';
+  const B = '0x00000000000000000000000000000000000000b2';
+  const STALE_MS = 15 * 60 * 1000;
+
+  function store(): JsonStore {
+    return freshStore();
+  }
+
+  it('gives the id to the first wallet and refuses the second while it is live', async () => {
+    const s = store();
+    expect(await s.claimFixedOrder(SLUG, ORDER_ID, A, STALE_MS)).toEqual({ status: 'claimed' });
+    // Not a duplicate row, and not an overwrite: the loser gets a refusal, not a claim.
+    expect(await s.claimFixedOrder(SLUG, ORDER_ID, B, STALE_MS)).toEqual({ status: 'taken' });
+    const claims = await s.listClaims(SLUG);
+    expect(claims).toHaveLength(1);
+    expect(claims[0]!.payerAddress).toBe(A);
+  });
+
+  it('is idempotent for the owner and refreshes the timestamp', async () => {
+    const s = store();
+    await s.claimFixedOrder(SLUG, ORDER_ID, A, STALE_MS);
+    const [first] = await s.listClaims(SLUG);
+    // Age the row to the very edge of the stale window: the owner must still be allowed back in,
+    // and doing so must reset the clock or their own attempt gets recycled mid-payment.
+    await s.upsertClaim({ ...first!, claimedAt: Date.now() - (STALE_MS - 1000) });
+    expect(await s.claimFixedOrder(SLUG, ORDER_ID, A, STALE_MS)).toEqual({ status: 'claimed' });
+    const [after] = await s.listClaims(SLUG);
+    expect(Date.now() - after!.claimedAt).toBeLessThan(1000);
+  });
+
+  it('hands an abandoned claim over once it goes stale', async () => {
+    const s = store();
+    await s.claimFixedOrder(SLUG, ORDER_ID, A, STALE_MS);
+    const [first] = await s.listClaims(SLUG);
+    await s.upsertClaim({ ...first!, claimedAt: Date.now() - (STALE_MS + 1000) });
+    expect(await s.claimFixedOrder(SLUG, ORDER_ID, B, STALE_MS)).toEqual({ status: 'claimed' });
+    const claims = await s.listClaims(SLUG);
+    expect(claims).toHaveLength(1);
+    expect(claims[0]!.payerAddress).toBe(B);
+  });
+
+  it('never re-opens a settled order', async () => {
+    const s = store();
+    await s.claimFixedOrder(SLUG, ORDER_ID, A, STALE_MS);
+    await s.settleClaimedOrder(SLUG, ORDER_ID);
+    expect(await s.claimFixedOrder(SLUG, ORDER_ID, A, STALE_MS)).toEqual({ status: 'settled' });
+    expect(await s.claimFixedOrder(SLUG, ORDER_ID, B, STALE_MS)).toEqual({ status: 'settled' });
+  });
+
+  it('normalizes the payer address so checksummed and lowercase wallets are the same owner', async () => {
+    const s = store();
+    await s.claimFixedOrder(SLUG, ORDER_ID, A.toUpperCase().replace('0X', '0x'), STALE_MS);
+    expect(await s.claimFixedOrder(SLUG, ORDER_ID, A, STALE_MS)).toEqual({ status: 'claimed' });
+  });
+});

@@ -1,7 +1,8 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSync, closeSync, fsyncSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import type { Store } from './index.js';
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey, MerchantApiKeyMeta } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey, MerchantApiKeyMeta, FixedOrderClaimResult } from '../types.js';
 import { hashApiKey, apiKeyRef, constantTimeEqual, DEV_API_KEY_PEPPER } from '../util/apikey.js';
 import { log } from '../logger.js';
 
@@ -497,6 +498,35 @@ export class JsonStore implements Store {
     return orderId;
   }
 
+  async mintClaimedOrder(
+    slug: string,
+    payerAddress: string,
+    maxRedemptions: number,
+  ): Promise<string | undefined> {
+    const link = this.data.links[slug];
+    if (!link) return undefined;
+    const existing = this.data.claims[slug] ?? [];
+    if (maxRedemptions > 0 && existing.length >= maxRedemptions) return undefined;
+    // Random rather than sequential: orderIds are unguessable ledger keys, and a customer must
+    // never be able to predict the next one and pre-emptively claim it.
+    const orderId = '0x' + randomBytes(32).toString('hex');
+    const claim: LinkClaim = {
+      slug,
+      orderId,
+      payerAddress: payerAddress.toLowerCase(),
+      claimedAt: Date.now(),
+      settled: false,
+    };
+    if (!this.data.claims[slug]) this.data.claims[slug] = [];
+    this.data.claims[slug]!.push(claim);
+    this.flush();
+    return orderId;
+  }
+
+  async listClaims(slug: string): Promise<LinkClaim[]> {
+    return [...(this.data.claims[slug] ?? [])].sort((a, b) => a.claimedAt - b.claimedAt);
+  }
+
   async reclaimStaleClaim(slug: string, payerAddress: string, olderThanMs: number): Promise<string | undefined> {
     const claims = this.data.claims[slug];
     if (!claims) return undefined;
@@ -526,6 +556,34 @@ export class JsonStore implements Store {
     if (idx !== -1) list[idx] = claim;
     else list.push(claim);
     this.flush();
+  }
+
+  async claimFixedOrder(
+    slug: string,
+    orderId: string,
+    payerAddress: string,
+    staleAfterMs: number,
+  ): Promise<FixedOrderClaimResult> {
+    if (!this.data.claims[slug]) this.data.claims[slug] = [];
+    const list = this.data.claims[slug]!;
+    const idx = list.findIndex((c) => c.orderId === orderId);
+    const payer = payerAddress.toLowerCase();
+    if (idx === -1) {
+      list.push({ slug, orderId, payerAddress: payer, claimedAt: Date.now(), settled: false });
+      this.flush();
+      return { status: 'claimed' };
+    }
+    const existing = list[idx]!;
+    if (existing.settled) return { status: 'settled' };
+    const age = Date.now() - existing.claimedAt;
+    // Same wallet re-claiming, or a claim abandoned long enough ago: both hand the id over and
+    // refresh the timestamp so the current attempt isn't recycled out from under the customer.
+    if (existing.payerAddress === payer || age >= staleAfterMs) {
+      list[idx] = { ...existing, payerAddress: payer, claimedAt: Date.now() };
+      this.flush();
+      return { status: 'claimed' };
+    }
+    return { status: 'taken' };
   }
 
   async getLatestClaim(slug: string, payerAddress: string): Promise<LinkClaim | undefined> {

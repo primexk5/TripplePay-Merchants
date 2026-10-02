@@ -10,7 +10,7 @@ import { JsonStore } from '../src/store/json.js';
 import type { Config } from '../src/config.js';
 import type { QuaiClient } from '../src/chain/client.js';
 import { FixedRateProvider, type RateProvider } from '../src/gateway/rate-provider.js';
-import type { OrderRegistrar } from '../src/chain/relayer.js';
+import type { OrderSigner, SignedOrderAuthorization, SignedAuthorizationJson } from '../src/chain/signer.js';
 import type { QiService } from '../src/chain/qi.js';
 import type { QiOrder } from '../src/types.js';
 
@@ -37,6 +37,8 @@ function makeCfg(): Config {
 function fakeClient(exists = true): QuaiClient {
   return {
     address: CONTRACT,
+    feeBps: async () => 50,
+    feeRecipient: async () => getAddress('0x000000000000000000000000000000000000dEaD'),
     getOrder: async () => ({
       merchant: wallet.address.toLowerCase(),
       settled: false,
@@ -53,15 +55,24 @@ function fakeClient(exists = true): QuaiClient {
   } as unknown as QuaiClient;
 }
 
-class FakeRegistrar implements OrderRegistrar {
+/**
+ * Records every authorization the API asks for. The gateway flow must never register anything
+ * on-chain any more, so there is deliberately no transaction method here — if the server ever
+ * tried to broadcast, it would not compile.
+ */
+class FakeSigner implements OrderSigner {
   readonly enabled: boolean;
-  readonly calls: Array<{ merchant: string; orderId: string; amount: bigint; expiry: number }> = [];
+  readonly address = getAddress('0x0000000000000000000000000000000000005161');
+  readonly calls: SignedOrderAuthorization[] = [];
   constructor(enabled: boolean) {
     this.enabled = enabled;
   }
-  async registerOrderFor(p: { merchant: string; orderId: string; amount: bigint; expiry: number }): Promise<string> {
-    this.calls.push(p);
-    return '0x' + 'ab'.repeat(32);
+  async sign(
+    order: SignedOrderAuthorization,
+    _deployment: { chainId: number; contractAddress: string },
+  ): Promise<SignedOrderAuthorization & { signature: string }> {
+    this.calls.push(order);
+    return { ...order, signature: '0x' + 'cd'.repeat(65) };
   }
 }
 
@@ -103,7 +114,7 @@ function freshStore(): JsonStore {
   return new JsonStore(join(dir, 'relayer.db'));
 }
 
-async function startApp(opts?: { rate?: RateProvider; registrar?: OrderRegistrar; client?: QuaiClient; qi?: QiService; storeOverride?: JsonStore }): Promise<{ base: string; store: JsonStore }> {
+async function startApp(opts?: { rate?: RateProvider; signer?: OrderSigner; client?: QuaiClient; qi?: QiService; storeOverride?: JsonStore }): Promise<{ base: string; store: JsonStore }> {
   const store = opts?.storeOverride ?? freshStore();
   const app = createServer(
     store,
@@ -113,7 +124,7 @@ async function startApp(opts?: { rate?: RateProvider; registrar?: OrderRegistrar
     undefined, // no registry: single-chain legacy path
     undefined, // no indexers
     opts?.rate ?? new FixedRateProvider({ usd: 10 }),
-    opts?.registrar ?? new FakeRegistrar(false),
+    opts?.signer ?? new FakeSigner(false),
   );
   const server = app.listen(0);
   servers.push(server);
@@ -281,7 +292,7 @@ describe('POST /v1/gateway/orders (QUAI method)', () => {
     expect(res.status).toBe(400);
   });
 
-  it('asks for a pre-registered orderId when the relayer is disabled', async () => {
+  it('reports a configuration error when no order signer is configured', async () => {
     const { base } = await startApp({ client: fakeClient(true) });
     const key = await issueApiKey(base);
     const res = await req(base, '/v1/gateway/orders', {
@@ -289,13 +300,13 @@ describe('POST /v1/gateway/orders (QUAI method)', () => {
       headers: { 'x-merchant-key': key, ...jsonHeaders },
       body: JSON.stringify({ amount: '25.00', fiatCurrency: 'USD', token: 'quai' }),
     });
-    expect(res.status).toBe(400);
-    expect(String(res.body.error)).toMatch(/orderId/);
+    expect(res.status).toBe(503);
+    expect(String(res.body.error)).toMatch(/signer is not configured/i);
   });
 
-  it('auto-registers via the relayer when it is enabled (no orderId needed)', async () => {
-    const registrar = new FakeRegistrar(true);
-    const { base, store } = await startApp({ client: fakeClient(true), registrar });
+  it('creates a QUAI order off-chain (no on-chain registration, no platform gas)', async () => {
+    const signer = new FakeSigner(true);
+    const { base, store } = await startApp({ client: fakeClient(true), signer });
     const key = await issueApiKey(base);
     const res = await req(base, '/v1/gateway/orders', {
       method: 'POST',
@@ -303,9 +314,9 @@ describe('POST /v1/gateway/orders (QUAI method)', () => {
       body: JSON.stringify({ amount: '25.00', fiatCurrency: 'USD', token: 'quai', reference: 'ORD-55' }),
     });
     expect(res.status).toBe(201);
-    expect(registrar.calls).toHaveLength(1);
-    expect(registrar.calls[0]!.amount).toBe(2500000000000000000n);
-    expect(registrar.calls[0]!.merchant.toLowerCase()).toBe(wallet.address.toLowerCase());
+    // Nothing was signed or broadcast at creation time — the order does not exist on-chain yet.
+    expect(signer.calls).toHaveLength(0);
+
     const orderId = res.body.orderId as string;
     // the order was persisted as a gateway link
     expect((await req(base, `/v1/gateway/orders/${res.body.gatewayId}`, {
@@ -314,6 +325,170 @@ describe('POST /v1/gateway/orders (QUAI method)', () => {
     // order meta holds the shop reference
     const link = await store.getLink(res.body.gatewayId as string);
     expect(link?.gatewayOrderId).toBe(orderId);
+
+    // The customer's claim is what creates it — authorized off-chain, paid for by the customer.
+    const claim = await req(base, `/v1/links/${res.body.gatewayId}/claim`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({ payerAddress: wallet.address }),
+    });
+    expect(claim.status, JSON.stringify(claim.body)).toBe(200);
+    expect(claim.body.orderId).toBe(orderId);
+    expect(signer.calls).toHaveLength(1);
+    expect(signer.calls[0]!.amount).toBe(2500000000000000000n);
+    expect(signer.calls[0]!.merchant.toLowerCase()).toBe(wallet.address.toLowerCase());
+    expect(signer.calls[0]!.feeBps).toBe(50);
+    expect(signer.calls[0]!.expectedPayer.toLowerCase()).toBe(wallet.address.toLowerCase());
+    const auth = claim.body.authorization as SignedAuthorizationJson;
+    expect(auth.signature).toBeTruthy();
+    expect(auth.orderId).toBe(orderId);
+  });
+
+  it('refuses to hand the SAME fixed order id to a second wallet', async () => {
+    const signer = new FakeSigner(true);
+    const { base, store } = await startApp({ client: fakeClient(true), signer });
+    const key = await issueApiKey(base);
+    const res = await req(base, '/v1/gateway/orders', {
+      method: 'POST',
+      headers: { 'x-merchant-key': key, ...jsonHeaders },
+      body: JSON.stringify({ amount: '25.00', fiatCurrency: 'USD', token: 'quai' }),
+    });
+    const gatewayId = res.body.gatewayId as string;
+    const orderId = res.body.orderId as string;
+    const first = new Wallet('0x' + randomBytes(32).toString('hex'));
+    const second = new Wallet('0x' + randomBytes(32).toString('hex'));
+
+    const claimAs = (payer: Wallet) =>
+      req(base, `/v1/links/${gatewayId}/claim`, {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: JSON.stringify({ payerAddress: payer.address }),
+      });
+
+    const mine = await claimAs(first);
+    expect(mine.status, JSON.stringify(mine.body)).toBe(200);
+    expect(mine.body.orderId).toBe(orderId);
+
+    // The gateway order is one purchase: a second wallet must be told so instead of being handed
+    // its own valid signature for an id the first wallet is already paying. Both settling is
+    // impossible on-chain, so the alternative is a signature that can only ever revert.
+    const theft = await claimAs(second);
+    expect(theft.status).toBe(409);
+    expect(String(theft.body.error)).toMatch(/another wallet/i);
+    expect(theft.body.authorization).toBeUndefined();
+    expect(signer.calls).toHaveLength(1);
+    expect(signer.calls[0]!.expectedPayer.toLowerCase()).toBe(first.address.toLowerCase());
+    // The owner's claim row was not overwritten by the rejected attempt.
+    const claims = await store.listClaims(gatewayId);
+    expect(claims).toHaveLength(1);
+    expect(claims[0]!.payerAddress).toBe(first.address.toLowerCase());
+  });
+
+  it('lets the SAME wallet re-claim its gateway order with a fresh authorization', async () => {
+    const signer = new FakeSigner(true);
+    const { base } = await startApp({ client: fakeClient(true), signer });
+    const key = await issueApiKey(base);
+    const res = await req(base, '/v1/gateway/orders', {
+      method: 'POST',
+      headers: { 'x-merchant-key': key, ...jsonHeaders },
+      body: JSON.stringify({ amount: '25.00', fiatCurrency: 'USD', token: 'quai' }),
+    });
+    const gatewayId = res.body.gatewayId as string;
+    const payer = new Wallet('0x' + randomBytes(32).toString('hex'));
+    const claimAs = () =>
+      req(base, `/v1/links/${gatewayId}/claim`, {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: JSON.stringify({ payerAddress: payer.address }),
+      });
+
+    expect((await claimAs()).status).toBe(200);
+    // Re-opening the checkout (refresh, flaky wallet) must not fail — and must re-sign, since the
+    // previous signature may be near expiry.
+    const again = await claimAs();
+    expect(again.status, JSON.stringify(again.body)).toBe(200);
+    expect(signer.calls).toHaveLength(2);
+    expect((again.body.authorization as SignedAuthorizationJson).orderId).toBe(
+      res.body.orderId as string,
+    );
+  });
+
+  it('refuses to authorize a gateway order that is already paid', async () => {
+    const signer = new FakeSigner(true);
+    const { base, store } = await startApp({ client: fakeClient(true), signer });
+    const key = await issueApiKey(base);
+    const res = await req(base, '/v1/gateway/orders', {
+      method: 'POST',
+      headers: { 'x-merchant-key': key, ...jsonHeaders },
+      body: JSON.stringify({ amount: '25.00', fiatCurrency: 'USD', token: 'quai' }),
+    });
+    const gatewayId = res.body.gatewayId as string;
+    const orderId = res.body.orderId as string;
+    const payer = new Wallet('0x' + randomBytes(32).toString('hex'));
+    const claimAs = (p: Wallet) =>
+      req(base, `/v1/links/${gatewayId}/claim`, {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: JSON.stringify({ payerAddress: p.address }),
+      });
+
+    expect((await claimAs(payer)).status).toBe(200);
+    // The indexer marks the claim settled when it sees PaymentReceived.
+    await store.settleClaimedOrder(gatewayId, orderId);
+
+    const late = await claimAs(payer);
+    expect(late.status).toBe(409);
+    expect(String(late.body.error)).toMatch(/already been paid/i);
+    expect(late.body.authorization).toBeUndefined();
+    expect(signer.calls).toHaveLength(1);
+  });
+
+  it('hands an abandoned gateway claim to a new wallet once it goes stale', async () => {
+    const signer = new FakeSigner(true);
+    const { base, store } = await startApp({ client: fakeClient(true), signer });
+    const key = await issueApiKey(base);
+    const res = await req(base, '/v1/gateway/orders', {
+      method: 'POST',
+      headers: { 'x-merchant-key': key, ...jsonHeaders },
+      body: JSON.stringify({ amount: '25.00', fiatCurrency: 'USD', token: 'quai' }),
+    });
+    const gatewayId = res.body.gatewayId as string;
+    const first = new Wallet('0x' + randomBytes(32).toString('hex'));
+    const second = new Wallet('0x' + randomBytes(32).toString('hex'));
+    const claimAs = (p: Wallet) =>
+      req(base, `/v1/links/${gatewayId}/claim`, {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: JSON.stringify({ payerAddress: p.address }),
+      });
+
+    expect((await claimAs(first)).status).toBe(200);
+    expect((await claimAs(second)).status).toBe(409);
+
+    // First wallet walked away without paying. Refusing everyone forever would strand the order,
+    // so the claim ages out (same window the multi-pay path uses) and the id moves on.
+    const claims = await store.listClaims(gatewayId);
+    const row = claims[0]!;
+    await store.upsertClaim({ ...row, claimedAt: Date.now() - 20 * 60 * 1000 });
+
+    const handover = await claimAs(second);
+    expect(handover.status, JSON.stringify(handover.body)).toBe(200);
+    expect(signer.calls).toHaveLength(2);
+    // Re-signed for the NEW payer: the first wallet's signature was bound to its address.
+    expect(signer.calls[1]!.expectedPayer.toLowerCase()).toBe(second.address.toLowerCase());
+  });
+
+  it('refuses QUAI orders when no signer is configured, rather than registering on-chain', async () => {
+    const signer = new FakeSigner(false);
+    const { base } = await startApp({ client: fakeClient(true), signer });
+    const key = await issueApiKey(base);
+    const res = await req(base, '/v1/gateway/orders', {
+      method: 'POST',
+      headers: { 'x-merchant-key': key, ...jsonHeaders },
+      body: JSON.stringify({ amount: '25.00', fiatCurrency: 'USD', token: 'quai' }),
+    });
+    expect(res.status).toBe(503);
+    expect(signer.calls).toHaveLength(0);
   });
 });
 

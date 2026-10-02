@@ -1,0 +1,28 @@
+{
+  "network": "cyprus1",
+  "chainId": 9,
+  "payWithQuai": "0x0072174EF6d0C2EB605449b0014169D104c42BbC",
+  "payWithQuaiImpl": "0x002dB0fBCA5a3DC1336e5D00ABCbCd9daac9cFF6",
+  "timelock": "0x005271b466765176a8a79b3f9A621c40abA1bffC",
+  "mockStablecoin": null,
+  "feeRecipient": "0x000E25274329cCa64Cf76b87Edd6A1f158952582",
+  "feeBps": "30",
+  "deployer": "0x000E25274329cCa64Cf76b87Edd6A1f158952582",
+  "verified": {
+    "at": "2026-10-02",
+    "method": "read-only eth_call/eth_getCode/eth_getStorageAt against https://rpc.quai.network/cyprus1 (the /cyprus1 path suffix is required; the bare host answers eth_chainId but fails every eth_call)",
+    "proxyBytecode": "183 bytes, EIP-1967 proxy confirmed",
+    "eip1967ImplSlot": "0x000000000000000000000000002db0fbca5a3dc1336e5d00abcbcd9daac9cff6",
+    "owner": "0x000E25274329cCa64Cf76b87Edd6A1f158952582",
+    "ownerIsContract": false,
+    "paused": false,
+    "upgradeInterfaceVersion": "5.0.0",
+    "maxFeeBps": 500,
+    "purgeDelay": 86400,
+    "signingInitialized": "call reverts \u2014 signed orders are NOT live on mainnet",
+    "eip712Domain": "call reverts \u2014 signed orders not initialized",
+    "signedOrdersLive": false,
+    "ownershipNote": "owner() is a plain EOA (no code on-chain), NOT the TimelockController recorded in the `timelock` field. That timelock IS deployed and live at 0x005271b466765176a8a79b3f9A621c40abA1bffC with getMinDelay() = 172800 (48h), but the proxy was never handed over to it (acceptOwnership() not run) and the owner EOA does not even hold PROPOSER_ROLE on it. The live mainnet upgrade is therefore a DIRECT single-EOA upgrade with no timelock delay \u2014 see docs/SIGNED_ORDERS_AUDIT_BRIEF.md R12.",
+    "upgradeNote": "Owner key IS present in contracts/.env as CYPRUS1_PK, so `npm run upgrade -- --network cyprus1` would upgrade live production. It is deliberately NOT run without explicit approval; it also cannot complete a usable upgrade while ORDER_SIGNER_ADDRESS is unset (paySignedOrder would reject every payment)."
+  }
+}

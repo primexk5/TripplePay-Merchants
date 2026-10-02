@@ -133,8 +133,21 @@ export interface PaymentLink {
   symbol: string;             // "QUAI" | "mUSDQ"
   expiryDurationSecs: number; // 0 = no expiry on orders
   multiPay: boolean;          // true = many customers can pay
-  /** Pre-registered orderIds available for customers to claim (multiPay only). */
+  /**
+   * Pre-registered orderIds available for customers to claim. Retained only for links created
+   * before signed orders existed (legacy `registerOrderBatch` links). New links leave this empty
+   * and mint a fresh orderId per claim instead — see the signer's per-claim authorization.
+   */
   orderPool: string[];        // bytes32 hex strings
+  /**
+   * Cap on how many customers a multi-pay link serves (multiPay only). 0 = unlimited. This
+   * replaces the old "pool size" as the merchant-facing limit: there is no pre-registered pool to
+   * exhaust, so redemption count is the only thing that can run out.
+   *
+   * Optional so links persisted before this field existed still typecheck and load; readers treat
+   * `undefined` as unlimited, matching the Postgres column default of 0.
+   */
+  maxRedemptions?: number;    // 0 or undefined = unlimited
   /** Gateway (shop-plugin) links only: the fixed orderId minted at creation time. Single-pay
    *  prefilled orders that never consume a pool slot — Qi is derived up front, and the checkout
    *  resolves the pre-minted Qi order instead of popping the pool. */
@@ -142,7 +155,19 @@ export interface PaymentLink {
   createdAt: number;          // unix ms
 }
 
-/** Tracks one customer claim of an orderId from a multi-pay link pool. */
+/**
+ * Outcome of trying to take ownership of a FIXED order id (a gateway order id, which is minted once
+ * at gateway-order-creation time and therefore cannot be handed out per-redemption).
+ */
+export type FixedOrderClaimResult =
+  /** This payer owns the order now — either a fresh take-over or a re-claim of its own. */
+  | { status: 'claimed' }
+  /** Another wallet holds an unsettled claim and is still inside the reuse window. */
+  | { status: 'taken' }
+  /** The order has already been paid. Signing anything for it could only revert on-chain. */
+  | { status: 'settled' };
+
+/** Tracks one customer claim of an orderId from a link (minted, pooled, or fixed gateway id). */
 export interface LinkClaim {
   slug: string;
   orderId: string;            // claimed from the pool

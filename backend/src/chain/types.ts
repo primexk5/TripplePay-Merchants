@@ -26,4 +26,13 @@ export interface ChainClient {
 
   /** Full on-chain order record (includes settlement state) for (merchant, orderId). */
   getOrder(merchant: string, orderId: string): Promise<OnChainOrder>;
+
+  /**
+   * Current platform fee rate in bps. Read when signing an order authorization so the rate locked
+   * into a signature is always the one in force on-chain at signing time.
+   */
+  feeBps(): Promise<number>;
+
+  /** Address that receives the platform fee — committed into every signed authorization. */
+  feeRecipient(): Promise<string>;
 }

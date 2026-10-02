@@ -1,0 +1,27 @@
+{
+  "network": "robinhoodTestnet",
+  "chainId": 46630,
+  "payWithQuai": "0xe2C0d033102B7ad963deC4b44B5e1e94bca1385f",
+  "payWithQuaiImpl": "0x00E9942a535f6F52f3812fef591c4B14b3095c79cF",
+  "timelock": null,
+  "mockStablecoin": null,
+  "feeRecipient": "0x4932F000db0BC48f9dd15Ee17560E37237351B12",
+  "feeBps": "30",
+  "deployer": "0x4932F000db0BC48f9dd15Ee17560E37237351B12",
+  "verified": {
+    "at": "2026-10-02",
+    "method": "read-only eth_call/eth_getCode/eth_getStorageAt against https://rpc.testnet.chain.robinhood.com/rpc",
+    "proxyBytecode": "183 bytes, EIP-1967 proxy confirmed (0x360894a13b… marker in code)",
+    "eip1967ImplSlot": "0x000000000000000000000000e9942a535f6f52f3812fef591c4b14b3095c79cf",
+    "owner": "0x4932F000db0BC48f9dd15Ee17560E37237351B12",
+    "ownerIsContract": false,
+    "paused": false,
+    "upgradeInterfaceVersion": "5.0.0",
+    "maxFeeBps": 500,
+    "purgeDelay": 86400,
+    "signingInitialized": "call reverts — this deployment predates signed orders",
+    "eip712Domain": "call reverts — signed orders not initialized",
+    "signedOrdersLive": false,
+    "upgradeNote": "Owner is a plain EOA, so `npm run upgrade -- --network robinhoodTestnet` works directly once EVM_DEPLOYER_PK for 0x4932F000db0BC48f9dd15Ee17560E37237351B12 is available. That key is NOT in contracts/.env."
+  }
+}

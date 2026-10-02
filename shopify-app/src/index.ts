@@ -6,7 +6,7 @@ import { createStore } from './store/factory.js';
 import { FileStore } from './store/file.js';
 import { CredentialResolver } from './store/credentials.js';
 import type { ConnectorStore } from './store/index.js';
-import { AdminApi, buildInstallUrl, exchangeCodeForToken, isShopDomain, verifyOAuthCallback, verifyShopifyWebhook, type ShopifyOrder } from './shopify.js';
+import { AdminApi, buildInstallUrl, exchangeCodeForToken, isShopDomain, verifyOAuthCallback, verifySessionToken, verifyShopifyWebhook, type ShopifyOrder } from './shopify.js';
 import { verifyGatewayWebhook, type PaymentWebhook } from './gateway.js';
 import { log } from './logger.js';
 
@@ -47,18 +47,50 @@ export function createApp(cfg: ReturnType<typeof loadConfig>, deps: AppDeps = {}
   // Without this, every store on the connector bills to the one GATEWAY_MERCHANT_KEY in the
   // environment. The merchant pastes the API key and webhook secret issued to them by the backend
   // (POST /v1/me/apikeys), and they are sealed with AES-256-GCM before they touch storage.
+  //
+  // AUTH: both writes below require a Shopify session token whose `dest` is the shop being changed.
+  // The install-session check alone is NOT enough — it only proves the app is installed on that
+  // shop, and shop domains are public, so anyone who learned the app URL could otherwise repoint a
+  // real store's orders at a merchant account they control.
 
   app.get('/settings', (_req, res) => {
+    // App Bridge is what can mint a session token; it only runs inside the Shopify admin iframe.
     res.type('html').send(
-      `<h1>Connect your Pay with Quai account</h1>
+      `<!doctype html><html><head><meta charset="utf-8"><title>Connect your Pay with Quai account</title>
+       <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script></head>
+       <body>
+       <h1>Connect your Pay with Quai account</h1>
        <p>Issue an API key from your Pay with Quai dashboard (<code>POST /v1/me/apikeys</code>) and
           paste it below. It is shown only once, and is stored encrypted.</p>
-       <form method="post" action="/settings">
-         <label>Store domain <input name="shop" placeholder="my-store.myshopify.com" required></label>
+       <form id="f" method="post" action="/settings">
+         <input type="hidden" name="sessionToken" id="st">
+         <label>Store domain <input name="shop" id="shop" placeholder="my-store.myshopify.com" required></label>
          <label>Merchant API key <input name="merchantKey" type="password" required></label>
          <label>Webhook secret <input name="webhookSecret" type="password" required></label>
          <button type="submit">Save</button>
-       </form>`,
+       </form>
+       <p id="msg"></p>
+       <script>
+         // The shop domain travels in the admin origin; App Bridge hands us the session token that
+         // proves the caller is an authenticated admin of exactly that shop.
+         document.getElementById('shop').value = new URLSearchParams(location.search).get('shop') || '';
+         (async () => {
+           const msg = document.getElementById('msg');
+           try {
+             const token = await window.shopify.getSessionToken();
+             document.getElementById('st').value = token;
+           } catch (e) {
+             msg.textContent = 'Open this page from your Shopify admin — a session token is required.';
+           }
+           document.getElementById('f').addEventListener('submit', (e) => {
+             if (!document.getElementById('st').value) {
+               e.preventDefault();
+               msg.textContent = 'Open this page from your Shopify admin — a session token is required.';
+             }
+           });
+         })();
+       </script>
+       </body></html>`,
     );
   });
 
@@ -69,6 +101,12 @@ export function createApp(cfg: ReturnType<typeof loadConfig>, deps: AppDeps = {}
     const webhookSecret = String(body.webhookSecret ?? '').trim();
     if (!isShopDomain(shop)) return res.status(400).send('invalid shop domain');
     if (!merchantKey || !webhookSecret) return res.status(400).send('both credentials are required');
+
+    // The caller must be an authenticated admin of THIS shop.
+    if (!verifySessionToken(body.sessionToken, shop, cfg.SHOPIFY_API_KEY, cfg.SHOPIFY_API_SECRET)) {
+      logger.warn({ shop }, 'settings write rejected — missing or invalid session token');
+      return res.status(401).send('invalid or missing Shopify session token — open this page from your Shopify admin');
+    }
 
     // Refuse credentials for a store that has not installed the app. Otherwise anyone who can reach
     // this endpoint could bind an arbitrary shop's orders to a merchant account they control.
@@ -87,6 +125,10 @@ export function createApp(cfg: ReturnType<typeof loadConfig>, deps: AppDeps = {}
   app.post('/settings/clear', express.urlencoded({ extended: false }), asyncHandler(async (req, res) => {
     const shop = String((req.body as Record<string, string>).shop ?? '').trim().toLowerCase();
     if (!isShopDomain(shop)) return res.status(400).send('invalid shop domain');
+    if (!verifySessionToken((req.body as Record<string, string>).sessionToken, shop, cfg.SHOPIFY_API_KEY, cfg.SHOPIFY_API_SECRET)) {
+      logger.warn({ shop }, 'settings clear rejected — missing or invalid session token');
+      return res.status(401).send('invalid or missing Shopify session token — open this page from your Shopify admin');
+    }
     const session = await store.getSession(shop);
     if (!session) return res.status(403).send('install the app on this store first');
     await store.clearSettings(shop);

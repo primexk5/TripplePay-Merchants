@@ -58,6 +58,95 @@ export function verifyShopifyWebhook(rawBody: string, header: string | undefined
   return received.length === want.length && timingSafeEqual(received, want);
 }
 
+const b64u = (input: Buffer | string): string => Buffer.from(input).toString('base64url');
+const fromB64u = (input: string): Buffer => Buffer.from(input, 'base64url');
+
+/** Clock skew tolerated when checking a session token's nbf/exp, in seconds. */
+const SESSION_TOKEN_SKEW_SEC = 60;
+
+/**
+ * Verify a Shopify **session token** — the JWT App Bridge mints for every embedded-app request,
+ * signed with the app's client secret.
+ *
+ * Why this exists: `/settings` writes (and clears) the gateway credentials that decide which
+ * merchant account a shop's orders bill to. The install-session check alone only proves the app is
+ * installed on that shop — not that the caller is that shop's admin. Since shop domains are public
+ * and the app URL is public, anyone could POST to it and repoint a real store's payments at an
+ * account they control. A session token is the only thing that ties the request to an authenticated
+ * admin of that specific shop.
+ *
+ * Checks, all of which must pass: HS256 signature (constant-time), `dest` host === the shop being
+ * modified, `iss`/`aud` === the app API key, and `exp`/`nbf` within skew. Returns false rather than
+ * throwing on anything malformed — callers treat false as "reject the request".
+ */
+export function verifySessionToken(
+  token: unknown,
+  shop: string,
+  apiKey: string,
+  secret: string,
+  nowMs: number = Date.now(),
+): boolean {
+  if (typeof token !== 'string' || !token) return false;
+  const parts = token.split('.');
+  if (parts.length !== 3) return false;
+  const [headerB64, payloadB64, sigB64] = parts as [string, string, string];
+
+  let header: { alg?: string; typ?: string };
+  try {
+    header = JSON.parse(fromB64u(headerB64).toString('utf8')) as { alg?: string };
+  } catch {
+    return false;
+  }
+  // Pinning alg is what stops an attacker swapping in "alg": "none" and shipping an unsigned token.
+  if (header.alg !== 'HS256') return false;
+
+  const want = createHmac('sha256', secret).update(`${headerB64}.${payloadB64}`).digest();
+  let received: Buffer;
+  try {
+    received = fromB64u(sigB64);
+  } catch {
+    return false;
+  }
+  if (received.length !== want.length || !timingSafeEqual(received, want)) return false;
+
+  let claims: { dest?: string; iss?: string; aud?: string | string[]; exp?: number; nbf?: number };
+  try {
+    claims = JSON.parse(fromB64u(payloadB64).toString('utf8')) as typeof claims;
+  } catch {
+    return false;
+  }
+
+  // dest is the admin origin the token was minted for, e.g. https://my-store.myshopify.com.
+  // Compare hosts only: the scheme is Shopify's, not ours to assert.
+  let destHost = '';
+  try {
+    destHost = new URL(String(claims.dest ?? '')).host.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (destHost !== shop.toLowerCase()) return false;
+
+  const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+  if (claims.iss !== apiKey || !aud.includes(apiKey)) return false;
+
+  const nowSec = Math.floor(nowMs / 1000);
+  if (typeof claims.exp === 'number' && nowSec > claims.exp + SESSION_TOKEN_SKEW_SEC) return false;
+  if (typeof claims.nbf === 'number' && nowSec + SESSION_TOKEN_SKEW_SEC < claims.nbf) return false;
+  return true;
+}
+
+/** Mint a session token. Only used by tests and by the embedded settings page's own test path. */
+export function signSessionToken(
+  claims: Record<string, unknown>,
+  secret: string,
+  header: Record<string, unknown> = { alg: 'HS256', typ: 'JWT' },
+): string {
+  const h = b64u(JSON.stringify(header));
+  const p = b64u(JSON.stringify(claims));
+  const sig = createHmac('sha256', secret).update(`${h}.${p}`).digest();
+  return `${h}.${p}.${sig.toString('base64url')}`;
+}
+
 export class AdminApi {
   constructor(
     private readonly shop: string,

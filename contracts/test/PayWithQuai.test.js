@@ -14,7 +14,7 @@ describe('PayWithQuai', function () {
   // Deploy the router behind a UUPS proxy, fund a payer, and allowlist both the stablecoin and
   // native QUAI. Mirrors the production deploy path (impl -> ERC1967Proxy(initialize)).
   async function setup(feeBps) {
-    const [owner, merchant, payer, feeRecipient, other] = await ethers.getSigners();
+    const [owner, merchant, payer, feeRecipient, other, signer] = await ethers.getSigners();
 
     const token = await ethers.deployContract('MockStablecoin');
     await token.mint(payer.address, usdq(1000));
@@ -23,7 +23,7 @@ describe('PayWithQuai', function () {
     await pay.setTokenAccepted(await token.getAddress(), true);
     await pay.setTokenAccepted(ethers.ZeroAddress, true); // enable native QUAI
 
-    return { owner, merchant, payer, feeRecipient, other, token, pay };
+    return { owner, merchant, payer, feeRecipient, other, signer, token, pay };
   }
 
   // Deploy the PayWithQuai implementation, wrap it in an ERC1967Proxy initialized with `initArgs`,
@@ -893,6 +893,86 @@ describe('PayWithQuai', function () {
       expect(kept.exists).to.equal(true);
       expect(kept.settled).to.equal(false);
       expect(kept.amount).to.equal(AMOUNT);
+    });
+
+    it('signed-order module survives the upgrade: pre-existing orders keep paying', async function () {
+      const { pay, owner, merchant, payer, feeRecipient, signer, token } = await loadFixture(deployFixture);
+      // An order registered under v1 must still settle after the signing module lands — this is
+      // the whole backwards-compatibility promise of shipping signed orders as an upgrade.
+      await pay.connect(merchant).registerOrder(oid('ord_before'), await token.getAddress(), AMOUNT, NO_EXPIRY);
+
+      const v2 = await ethers.deployContract('PayWithQuaiV2Mock');
+      const init = v2.interface.encodeFunctionData('initializeSigningV2', ['PayWithQuai', '1']);
+      await pay.connect(owner).upgradeToAndCall(await v2.getAddress(), init);
+      const upgraded = v2.attach(await pay.getAddress());
+
+      // Existing pre-registered order is still payable through the legacy path.
+      await token.connect(payer).approve(await pay.getAddress(), AMOUNT);
+      const { fee, net } = expectedSplit(AMOUNT, FEE_BPS);
+      await expect(
+        upgraded.connect(payer).payOrder(merchant.address, oid('ord_before')),
+      ).to.changeTokenBalances(token, [payer, merchant, feeRecipient], [-AMOUNT, net, fee]);
+
+      // And the new module works on the very same proxy, with signer state written after the upgrade.
+      await upgraded.connect(owner).setSigner(signer.address, true);
+      const o = {
+        merchant: merchant.address,
+        orderId: oid('after_upgrade'),
+        token: await token.getAddress(),
+        amount: AMOUNT,
+        expiry: 0n,
+        feeBps: Number(FEE_BPS),
+        feeRecipient: feeRecipient.address,
+        expectedPayer: payer.address,
+      };
+      const { chainId } = await ethers.provider.getNetwork();
+      const sig = await signer.signTypedData(
+        {
+          name: 'PayWithQuai',
+          version: '1',
+          chainId,
+          verifyingContract: await pay.getAddress(),
+        },
+        {
+          SignedOrder: [
+            { name: 'merchant', type: 'address' },
+            { name: 'orderId', type: 'bytes32' },
+            { name: 'token', type: 'address' },
+            { name: 'amount', type: 'uint256' },
+            { name: 'expiry', type: 'uint256' },
+            { name: 'feeBps', type: 'uint16' },
+            { name: 'feeRecipient', type: 'address' },
+            { name: 'expectedPayer', type: 'address' },
+          ],
+        },
+        o,
+      );
+      await token.connect(payer).approve(await pay.getAddress(), AMOUNT);
+      await expect(upgraded.connect(payer).paySignedOrder(o, sig)).to.changeTokenBalances(
+        token,
+        [payer, merchant, feeRecipient],
+        [-AMOUNT, net, fee],
+      );
+    });
+
+    it('signed-order domain cannot be initialized twice after the upgrade', async function () {
+      const { pay, owner, other } = await loadFixture(deployFixture);
+      const v2 = await ethers.deployContract('PayWithQuaiV2Mock');
+      const init = v2.interface.encodeFunctionData('initializeSigningV2', ['PayWithQuai', '1']);
+      await pay.connect(owner).upgradeToAndCall(await v2.getAddress(), init);
+      const upgraded = v2.attach(await pay.getAddress());
+
+      // Already consumed -> nobody can re-initialize the domain, owner included.
+      await expect(upgraded.initializeSigning('Hijack', '1')).to.be.revertedWithCustomError(
+        upgraded,
+        'InvalidInitialization',
+      );
+      await expect(upgraded.connect(other).initializeSigning('Hijack', '1')).to.be.revertedWithCustomError(
+        upgraded,
+        'InvalidInitialization',
+      );
+      // The domain in force is still the original one, so existing signatures remain valid.
+      expect(await upgraded.eip712Domain()).to.include('PayWithQuai');
     });
 
     it('still processes payments after an upgrade', async function () {

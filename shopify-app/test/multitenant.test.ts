@@ -11,6 +11,7 @@ import { FileStore } from '../src/store/file.js';
 import { CredentialResolver } from '../src/store/credentials.js';
 import { sealSecret, openSecret, deriveKey } from '../src/crypto.js';
 import { verifyGatewayWebhook } from '../src/gateway.js';
+import { signSessionToken } from '../src/shopify.js';
 
 const dirs: string[] = [];
 const servers: Array<{ close: () => void }> = [];
@@ -179,10 +180,28 @@ describe('settings route', () => {
     body: new URLSearchParams(fields).toString(),
   });
 
+  // /settings writes are admin-scoped: the request must carry a session token whose `dest` is the
+  // shop being changed, exactly as App Bridge mints it. Tests that are about sealing/overwrite
+  // behaviour supply one so they still exercise the path past the auth gate; the gate itself is
+  // covered in test/sessionToken.test.ts.
+  const authed = (shop: string, fields: Record<string, string>) => {
+    const now = Math.floor(Date.now() / 1000);
+    return form({
+      ...fields,
+      sessionToken: signSessionToken(
+        { iss: 'key', dest: `https://${shop}`, aud: 'key', iat: now, nbf: now, exp: now + 60 },
+        'secret',
+      ),
+    });
+  };
+
   it('refuses credentials for a store that never installed the app', async () => {
     const store = new FileStore(tempDir());
     const base = await listen(config(), store);
-    const res = await fetch(`${base}/settings`, form({ shop: 'ghost.myshopify.com', merchantKey: 'qmkey_A', webhookSecret: 'whsec_A' }));
+    const res = await fetch(
+      `${base}/settings`,
+      authed('ghost.myshopify.com', { shop: 'ghost.myshopify.com', merchantKey: 'qmkey_A', webhookSecret: 'whsec_A' }),
+    );
     expect(res.status).toBe(403);
     expect(await store.getSettings('ghost.myshopify.com')).toBeUndefined();
   });
@@ -198,6 +217,8 @@ describe('settings route', () => {
     const store = new FileStore(tempDir());
     await store.setSession({ shop: 'a.myshopify.com', accessToken: 't', installedAt: 1, scopes: 'read_orders' });
     const base = await listen(config(), store);
+    // No webhookSecret: the missing-field check runs before the token check, so this 400 is about
+    // the form, not about auth.
     const res = await fetch(`${base}/settings`, form({ shop: 'a.myshopify.com', merchantKey: 'qmkey_A' }));
     expect(res.status).toBe(400);
   });
@@ -208,7 +229,10 @@ describe('settings route', () => {
     const cfg = config();
     const base = await listen(cfg, store);
 
-    const res = await fetch(`${base}/settings`, form({ shop: 'a.myshopify.com', merchantKey: 'qmkey_A', webhookSecret: 'whsec_A' }));
+    const res = await fetch(
+      `${base}/settings`,
+      authed('a.myshopify.com', { shop: 'a.myshopify.com', merchantKey: 'qmkey_A', webhookSecret: 'whsec_A' }),
+    );
     expect(res.status).toBe(200);
 
     const stored = await store.getSettings('a.myshopify.com');
@@ -223,7 +247,11 @@ describe('settings route', () => {
     const store = new FileStore(tempDir());
     await store.setSession({ shop: 'a.myshopify.com', accessToken: 't', installedAt: 1, scopes: 'read_orders' });
     const base = await listen(config(), store);
-    const res = await fetch(`${base}/settings`, form({ shop: 'a.myshopify.com', merchantKey: 'qmkey_A', webhookSecret: 'whsec_A' }));
+    const res = await fetch(
+      `${base}/settings`,
+      authed('a.myshopify.com', { shop: 'a.myshopify.com', merchantKey: 'qmkey_A', webhookSecret: 'whsec_A' }),
+    );
+    expect(res.status).toBe(200);
     const body = await res.text();
     expect(body).not.toContain('qmkey_A');
     expect(body).not.toContain('whsec_A');
@@ -233,8 +261,14 @@ describe('settings route', () => {
     const store = new FileStore(tempDir());
     await store.setSession({ shop: 'a.myshopify.com', accessToken: 't', installedAt: 1, scopes: 'read_orders' });
     const base = await listen(config(), store);
-    await fetch(`${base}/settings`, form({ shop: 'a.myshopify.com', merchantKey: 'qmkey_OLD', webhookSecret: 'whsec_OLD' }));
-    await fetch(`${base}/settings`, form({ shop: 'a.myshopify.com', merchantKey: 'qmkey_NEW', webhookSecret: 'whsec_NEW' }));
+    await fetch(
+      `${base}/settings`,
+      authed('a.myshopify.com', { shop: 'a.myshopify.com', merchantKey: 'qmkey_OLD', webhookSecret: 'whsec_OLD' }),
+    );
+    await fetch(
+      `${base}/settings`,
+      authed('a.myshopify.com', { shop: 'a.myshopify.com', merchantKey: 'qmkey_NEW', webhookSecret: 'whsec_NEW' }),
+    );
     expect((await new CredentialResolver(store, config()).resolve('a.myshopify.com'))?.merchantKey).toBe('qmkey_NEW');
   });
 });

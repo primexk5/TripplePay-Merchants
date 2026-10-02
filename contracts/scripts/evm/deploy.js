@@ -142,6 +142,31 @@ async function main() {
   // Bind the implementation ABI to the proxy address for all further calls.
   const pay = new ethers.Contract(proxyAddress, PayWithQuai.interface, deployer);
 
+  // Customer-paid signed orders: initialize the EIP-712 domain and allowlist the platform
+  // signer BEFORE any ownership hand-off below, so there is no window where the new owner has to
+  // make a second transaction to get signed payments working.
+  const SIGNING_DOMAIN_NAME = 'PayWithQuai';
+  const SIGNING_DOMAIN_VERSION = '1';
+  const initSigningTx = await pay.initializeSigning(SIGNING_DOMAIN_NAME, SIGNING_DOMAIN_VERSION);
+  await initSigningTx.wait();
+  console.log(`Signing domain:      ${SIGNING_DOMAIN_NAME} v${SIGNING_DOMAIN_VERSION}`);
+
+  const orderSigner = (process.env.ORDER_SIGNER_ADDRESS || '').trim();
+  if (orderSigner) {
+    if (!ethers.isAddress(orderSigner)) {
+      throw new Error(`ORDER_SIGNER_ADDRESS="${orderSigner}" is not a valid address.`);
+    }
+    const signerTx = await pay.setSigner(orderSigner, true);
+    await signerTx.wait();
+    console.log(`Order signer:        ${orderSigner} (allowlisted)`);
+  } else {
+    console.log(
+      '\n⚠️  ORDER_SIGNER_ADDRESS not set — no signer is allowlisted, so paySignedOrder will reject\n' +
+        '    every customer payment until the owner runs setSigner(<platformSigner>, true).\n' +
+        '    Legacy payOrder / payOrderNative still work.',
+    );
+  }
+
   // Allowlist the settlement assets merchants may price orders in.
   const acceptNativeTx = await pay.setTokenAccepted(ZERO, true);
   await acceptNativeTx.wait();
@@ -201,6 +226,27 @@ async function main() {
   console.log(`  FEE_RECIPIENT → ${onChainFeeRecipient}`);
   console.log(`  FEE_BPS       → ${Number(onChainFeeBps)} (${Number(onChainFeeBps) / 100}%)`);
 
+  // Signed-order state must match what the backend signs against, or every customer payment is
+  // rejected with InvalidSignature. Fail the deploy rather than ship a broken checkout.
+  const signingReady = await pay.signingInitialized();
+  if (!signingReady) {
+    throw new Error('signingInitialized() is false — the EIP-712 domain was not set up.');
+  }
+  const domain = await pay.eip712Domain();
+  if (domain.name !== SIGNING_DOMAIN_NAME || domain.version !== SIGNING_DOMAIN_VERSION) {
+    throw new Error(
+      `EIP-712 domain mismatch: got ${domain.name}/${domain.version}, expected ` +
+        `${SIGNING_DOMAIN_NAME}/${SIGNING_DOMAIN_VERSION}. DO NOT USE this deployment.`,
+    );
+  }
+  const signerAllowlisted = orderSigner ? await pay.isSigner(orderSigner) : false;
+  if (orderSigner && !signerAllowlisted) {
+    throw new Error(`Signer ${orderSigner} is not allowlisted after setSigner. DO NOT USE this deployment.`);
+  }
+  console.log('\nSigned orders verified on-chain:');
+  console.log(`  domain  → ${domain.name} v${domain.version}`);
+  console.log(`  signer  → ${orderSigner || '(none — customer-paid orders disabled)'}`);
+
   // 4) Governance: hand upgrade authority to a Timelock owned by the multisig (if configured).
   let timelockAddress = null;
   if (process.env.MULTISIG_ADDR) {
@@ -241,12 +287,14 @@ async function main() {
   const record = {
     network: networkName,
     chainId: chainIdNum,
-    payWithQuai: proxyAddress, // the address the relayer + checkout SDK use
+    payWithQuai: proxyAddress, // the address the backend indexer + checkout SDK use
     payWithQuaiImpl: implAddress,
     timelock: timelockAddress,
     mockStablecoin: mockAddress,
     feeRecipient,
     feeBps: String(feeBps),
+    signingDomain: { name: SIGNING_DOMAIN_NAME, version: SIGNING_DOMAIN_VERSION },
+    orderSigner: orderSigner || null,
     deployer: deployer.address,
     deployBlock: proxyReceipt.blockNumber, // used later as the backend's START_BLOCK
     explorer: EXPLORERS[networkName] || null,

@@ -1,6 +1,7 @@
 import { Pool, type PoolClient } from 'pg';
+import { randomBytes } from 'node:crypto';
 import type { Store } from './index.js';
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey, MerchantApiKeyMeta } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey, MerchantApiKeyMeta, FixedOrderClaimResult } from '../types.js';
 import { hashApiKey, apiKeyRef, DEV_API_KEY_PEPPER } from '../util/apikey.js';
 import { log } from '../logger.js';
 
@@ -122,6 +123,7 @@ export class PostgresStore implements Store {
         created_at           BIGINT NOT NULL
       );
       ALTER TABLE links ADD COLUMN IF NOT EXISTS gateway_order_id TEXT;
+      ALTER TABLE links ADD COLUMN IF NOT EXISTS max_redemptions INTEGER NOT NULL DEFAULT 0;
       CREATE INDEX IF NOT EXISTS links_merchant ON links (merchant_address, created_at DESC);
 
       CREATE TABLE IF NOT EXISTS claims (
@@ -558,8 +560,8 @@ export class PostgresStore implements Store {
   async upsertLink(link: PaymentLink): Promise<void> {
     await this.pool.query(
       `INSERT INTO links (slug, merchant_address, merchant_id, merchant_name, shop_name, token_address,
-                          amount, amount_display, symbol, expiry_duration_secs, multi_pay, order_pool, created_at, chain_id, gateway_order_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                          amount, amount_display, symbol, expiry_duration_secs, multi_pay, order_pool, created_at, chain_id, gateway_order_id, max_redemptions)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
        ON CONFLICT (slug) DO UPDATE SET
          merchant_address = EXCLUDED.merchant_address,
          merchant_id = EXCLUDED.merchant_id,
@@ -574,7 +576,8 @@ export class PostgresStore implements Store {
          order_pool = EXCLUDED.order_pool,
          created_at = EXCLUDED.created_at,
          chain_id = EXCLUDED.chain_id,
-         gateway_order_id = EXCLUDED.gateway_order_id`,
+         gateway_order_id = EXCLUDED.gateway_order_id,
+         max_redemptions = EXCLUDED.max_redemptions`,
       [
         link.slug,
         link.merchantAddress,
@@ -591,6 +594,7 @@ export class PostgresStore implements Store {
         link.createdAt,
         link.chainId,
         link.gatewayOrderId ?? null,
+        link.maxRedemptions ?? 0,
       ],
     );
   }
@@ -640,6 +644,107 @@ export class PostgresStore implements Store {
       );
       await client.query('COMMIT');
       return orderId;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Mint a fresh orderId for this claim, honouring `maxRedemptions` inside the same transaction
+   * that counts existing claims. The `SELECT ... FOR UPDATE` on the link row serializes concurrent
+   * claims for one link, so two customers racing for the final redemption cannot both succeed.
+   */
+  async mintClaimedOrder(
+    slug: string,
+    payerAddress: string,
+    maxRedemptions: number,
+  ): Promise<string | undefined> {
+    const client: PoolClient = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const linkRows = await client.query('SELECT slug FROM links WHERE slug = $1 FOR UPDATE', [slug]);
+      if (!linkRows.rows.length) {
+        await client.query('ROLLBACK');
+        return undefined;
+      }
+      if (maxRedemptions > 0) {
+        const { rows: countRows } = await client.query(
+          'SELECT COUNT(*)::int AS n FROM claims WHERE slug = $1',
+          [slug],
+        );
+        if ((countRows[0]!.n as number) >= maxRedemptions) {
+          await client.query('ROLLBACK');
+          return undefined;
+        }
+      }
+      const orderId = '0x' + randomBytes(32).toString('hex');
+      await client.query(
+        `INSERT INTO claims (slug, order_id, payer_address, claimed_at, settled)
+         VALUES ($1, $2, $3, $4, false)
+         ON CONFLICT (slug, order_id) DO NOTHING`,
+        [slug, orderId, payerAddress.toLowerCase(), Date.now()],
+      );
+      await client.query('COMMIT');
+      return orderId;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async claimFixedOrder(
+    slug: string,
+    orderId: string,
+    payerAddress: string,
+    staleAfterMs: number,
+  ): Promise<FixedOrderClaimResult> {
+    const client: PoolClient = await this.pool.connect();
+    try {
+      // Serialize on the link row, exactly like mintClaimedOrder: two wallets racing for the same
+      // gateway order id must not both come away believing they own it.
+      await client.query('BEGIN');
+      const linkRows = await client.query('SELECT slug FROM links WHERE slug = $1 FOR UPDATE', [slug]);
+      if (!linkRows.rows.length) {
+        await client.query('ROLLBACK');
+        return { status: 'taken' };
+      }
+      const payer = payerAddress.toLowerCase();
+      const { rows } = await client.query(
+        'SELECT payer_address, claimed_at, settled FROM claims WHERE slug = $1 AND order_id = $2 FOR UPDATE',
+        [slug, orderId],
+      );
+      const existing = rows[0] as
+        | { payer_address: string; claimed_at: number; settled: boolean }
+        | undefined;
+      if (!existing) {
+        await client.query(
+          `INSERT INTO claims (slug, order_id, payer_address, claimed_at, settled)
+           VALUES ($1, $2, $3, $4, false)`,
+          [slug, orderId, payer, Date.now()],
+        );
+        await client.query('COMMIT');
+        return { status: 'claimed' };
+      }
+      if (existing.settled) {
+        await client.query('ROLLBACK');
+        return { status: 'settled' };
+      }
+      const age = Date.now() - Number(existing.claimed_at);
+      if (existing.payer_address !== payer && age < staleAfterMs) {
+        await client.query('ROLLBACK');
+        return { status: 'taken' };
+      }
+      await client.query(
+        'UPDATE claims SET payer_address = $1, claimed_at = $2 WHERE slug = $3 AND order_id = $4',
+        [payer, Date.now(), slug, orderId],
+      );
+      await client.query('COMMIT');
+      return { status: 'claimed' };
     } catch (err) {
       await client.query('ROLLBACK').catch(() => undefined);
       throw err;
@@ -708,6 +813,14 @@ export class PostgresStore implements Store {
       [slug, payerAddress.toLowerCase()],
     );
     return rows.length ? mapClaim(rows[0]!) : undefined;
+  }
+
+  async listClaims(slug: string): Promise<LinkClaim[]> {
+    const { rows } = await this.pool.query(
+      `SELECT * FROM claims WHERE slug = $1 ORDER BY claimed_at ASC, order_id ASC`,
+      [slug],
+    );
+    return rows.map(mapClaim);
   }
 
   // --- order metadata ---
@@ -914,6 +1027,7 @@ function mapLink(row: Record<string, unknown>, defaultChainId: number): PaymentL
     expiryDurationSecs: toNum(row.expiry_duration_secs),
     multiPay: row.multi_pay as boolean,
     orderPool: (row.order_pool as string[]) ?? [],
+    maxRedemptions: toNum(row.max_redemptions ?? 0),
     ...((row.gateway_order_id as string | null | undefined)
       ? { gatewayOrderId: row.gateway_order_id as string }
       : {}),

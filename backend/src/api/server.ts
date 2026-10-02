@@ -21,7 +21,12 @@ import { cors } from './cors.js';
 import { cursorScope } from '../indexer/indexer.js';
 import type { Indexer } from '../indexer/indexer.js';
 import { createRateProvider, type RateProvider } from '../gateway/rate-provider.js';
-import { createOrderRegistrar, type OrderRegistrar } from '../chain/relayer.js';
+import {
+  createOrderSigner,
+  serializeAuthorization,
+  type OrderSigner,
+  type SignedAuthorizationJson,
+} from '../chain/signer.js';
 import { getAddress as getQuaiAddress } from 'quais';
 import { getAddress as getEvmAddress } from 'ethers';
 import { log } from '../logger.js';
@@ -129,7 +134,7 @@ export function createServer(
   registry?: ChainRegistry,
   indexers?: Map<number, Indexer>,
   rate: RateProvider = createRateProvider(cfg),
-  registrar: OrderRegistrar = createOrderRegistrar(cfg),
+  signer: OrderSigner = createOrderSigner(cfg),
 ): Express {
   // The single implied chain when no registry is configured — reproduces the pre-multi-chain
   // behaviour exactly (same id/kind normalization normalizeAddress/recoverMessageSigner used).
@@ -661,8 +666,14 @@ await store.upsertMerchant(updated);
     symbol: z.string().max(10),
     expiryDurationSecs: z.number().int().min(0).default(0),
     multiPay: z.boolean().default(false),
-    /** Pre-registered orderIds sent by the merchant after signing them on-chain. */
+    /**
+     * Legacy only: pre-registered orderIds from a merchant's on-chain `registerOrderBatch` call.
+     * New links send none — the backend mints and signs a fresh order per claim, so a merchant
+     * never needs a funded wallet to publish a link.
+     */
     orderPool: z.array(z.string().regex(/^0x[0-9a-fA-F]{64}$/)).default([]),
+    /** Cap on customers served by a multi-pay link. 0 = unlimited. */
+    maxRedemptions: z.number().int().min(0).max(100_000).default(0),
     /** Which chain this link is denominated on — a chain slug or numeric chainId. Defaults to
      *  the default chain. A link belongs to exactly ONE chain, fixed at creation. */
     chainId: ChainIdOrSlugSchema,
@@ -684,13 +695,16 @@ await store.upsertMerchant(updated);
       return res.status(400).json({ error: `unknown or disabled chain "${d.chainId}"` });
     }
 
-    // Single-pay links need exactly one orderId in the pool.
-    if (!d.multiPay && d.orderPool.length !== 1) {
-      return res.status(400).json({ error: 'single-pay link requires exactly one orderId in orderPool' });
+    // Without a signed-order signer, a link still needs pre-registered orders to be payable:
+    // there would be nothing to authorize at claim time.
+    if (!signer.enabled && d.orderPool.length === 0) {
+      return res.status(503).json({
+        error: 'link creation is unavailable — the order signer is not configured (ORDER_SIGNER_PRIVATE_KEY)',
+      });
     }
-    // Multi-pay links need at least one pre-registered order to be useful.
-    if (d.multiPay && d.orderPool.length === 0) {
-      return res.status(400).json({ error: 'multi-pay link requires at least one pre-registered orderId' });
+    // A single-pay link serves exactly one customer, so a cap above 1 would be misleading.
+    if (!d.multiPay && d.maxRedemptions > 1) {
+      return res.status(400).json({ error: 'single-pay link cannot allow more than one redemption' });
     }
 
     // Optional ERC-20 allowlist — this chain's own (ACCEPTED_TOKENS in legacy single-chain mode).
@@ -716,11 +730,18 @@ await store.upsertMerchant(updated);
       expiryDurationSecs: d.expiryDurationSecs,
       multiPay: d.multiPay,
       orderPool: d.orderPool,
+      maxRedemptions: d.multiPay ? d.maxRedemptions : 1,
       createdAt: Date.now(),
     };
     await store.upsertLink(link);
     logger.info(
-      { slug, merchantId: merchant.merchantId, chainId: chain.chainId, multiPay: d.multiPay, poolSize: d.orderPool.length },
+      {
+        slug,
+        merchantId: merchant.merchantId,
+        chainId: chain.chainId,
+        multiPay: d.multiPay,
+        maxRedemptions: link.maxRedemptions,
+      },
       'payment link created',
     );
     res.status(201).json(publicLink(link, chain));
@@ -767,6 +788,58 @@ await store.upsertMerchant(updated);
   // An unsettled claim older than this is considered abandoned and its orderId is handed back
   // out — otherwise abandoned checkouts permanently drain the pool until it reads "fully booked".
   const CLAIM_STALE_MS = 15 * 60 * 1000; // 15 minutes
+  // Don't mint an authorization with less life than this: a customer who signs it, waits, and
+  // submits would just lose gas to an OrderExpired revert.
+  const MIN_AUTHORIZATION_LIFE_SECS = 60;
+
+  /** The link's hard deadline, in Unix seconds (0 = never expires). */
+  function linkExpiresAtSecs(link: PaymentLink): number {
+    return link.expiryDurationSecs > 0
+      ? Math.floor(link.createdAt / 1000) + link.expiryDurationSecs
+      : 0;
+  }
+
+  /**
+   * Signs an authorization for one claimed order so the customer can create AND settle it in a
+   * single transaction — this is what removes the merchant's registration gas entirely.
+   *
+   * The fee and expiry are read from the chain at signing time (not taken from the request), so a
+   * link can never be re-quoted to a stale fee or an unbounded expiry. The payout address is the
+   * link's own merchant address, already established when the merchant created the link.
+   *
+   * Binds `expectedPayer` to the claiming wallet: without this, anyone able to see the
+   * authorization could settle the customer's order and deny them the purchase.
+   */
+  async function signClaimedOrder(
+    chain: ResolvedChain,
+    link: PaymentLink,
+    orderId: string,
+    payerAddress: string,
+  ): Promise<SignedAuthorizationJson> {
+    const [feeBps, feeRecipient] = await Promise.all([
+      chain.client.feeBps(),
+      chain.client.feeRecipient(),
+    ]);
+    // Expire at the LINK's deadline, not "now + window": an authorization must never outlive the
+    // checkout window the merchant advertised, or a link would stay payable indefinitely.
+    // 0 (link never expires) is preserved as a non-expiring authorization.
+    const expiry = linkExpiresAtSecs(link);
+    return serializeAuthorization(
+      await signer.sign(
+        {
+          merchant: link.merchantAddress,
+          orderId,
+          token: link.tokenAddress,
+          amount: BigInt(link.amount),
+          expiry,
+          feeBps: Number(feeBps),
+          feeRecipient,
+          expectedPayer: payerAddress,
+        },
+        { chainId: chain.chainId, contractAddress: chain.client.address },
+      ),
+    );
+  }
 
   app.post('/v1/links/:slug/claim', linkLimiter, asyncHandler(async (req, res) => {
     const slug = req.params.slug ?? '';
@@ -789,23 +862,52 @@ await store.upsertMerchant(updated);
       return res.status(400).json({ error: 'payerAddress fails checksum validation' });
     }
 
-    // Gateway links carry a fixed pre-minted orderId from order creation — the customer simply
-    // uses it (the on-chain order is already registered, amount + expiry set). Bind the payer for
-    // the double-pay guard but never touch the (empty) pool.
+    // Expiry has to be enforced HERE now. Previously the on-chain order's expiry did this job;
+    // with lazily created orders the backend is the only place that knows the link is dead, and
+    // it would otherwise keep minting valid authorizations for an expired link forever.
+    const expiresAtSecs = linkExpiresAtSecs(link);
+    if (expiresAtSecs > 0) {
+      const remainingSecs = expiresAtSecs - Math.floor(Date.now() / 1000);
+      if (remainingSecs <= 0) {
+        return res.status(410).json({ error: 'this payment link has expired' });
+      }
+      if (remainingSecs < MIN_AUTHORIZATION_LIFE_SECS) {
+        return res.status(410).json({ error: 'this payment link is about to expire' });
+      }
+    }
+
+    // Gateway links carry a FIXED pre-minted orderId from order creation: that one id is being sold
+    // to exactly one customer, so ownership has to be taken atomically. Unconditionally
+    // upserting here let any second wallet steal the id and walk away with its own signature,
+    // leaving the first wallet holding an authorization that can never settle.
     if (link.gatewayOrderId) {
-      await store.upsertClaim({
-        slug,
-        orderId: link.gatewayOrderId,
-        payerAddress: payerAddress.toLowerCase(),
-        claimedAt: Date.now(),
-        settled: false,
-      });
+      const fixed = await store.claimFixedOrder(slug, link.gatewayOrderId, payerAddress, CLAIM_STALE_MS);
+      if (fixed.status === 'settled') {
+        return res.status(409).json({ error: 'this order has already been paid' });
+      }
+      if (fixed.status === 'taken') {
+        return res.status(409).json({
+          error: 'this checkout is already being paid by another wallet',
+        });
+      }
+      if (!signer.enabled) {
+        // No signer configured: the gateway order was registered the old way and stays payable
+        // through payOrder, so the claim response carries no signature.
+        return res.json({
+          orderId: link.gatewayOrderId,
+          merchant: formatChainAddress(defaultChain().kind, link.merchantAddress),
+          token: link.tokenAddress,
+          amount: link.amount,
+          authorization: null,
+        });
+      }
+      const authorization = await signClaimedOrder(chain, link, link.gatewayOrderId, payerAddress);
       return res.json({
         orderId: link.gatewayOrderId,
-        merchant: formatChainAddress(defaultChain().kind, link.merchantAddress),
+        merchant: formatChainAddress(chain.kind, link.merchantAddress),
         token: link.tokenAddress,
         amount: link.amount,
-        poolRemaining: 0,
+        authorization,
       });
     }
 
@@ -820,13 +922,19 @@ await store.upsertMerchant(updated);
           error: 'already claimed — wait before paying again',
           retryAfterSecs,
           orderId: latest.orderId, // let them reuse their already-claimed orderId
+          // Re-sign for the retry: the original authorization may be close to expiry, and the
+          // customer must still be the bound payer. Same orderId, so no extra redemption is used.
+          ...(signer.enabled
+            ? { authorization: await signClaimedOrder(chain, link, latest.orderId, payerAddress) }
+            : {}),
         });
       }
     }
 
     // Recycle abandoned checkouts first: an unsettled claim older than CLAIM_STALE_MS is
-    // reassigned to this payer instead of consuming a fresh pool slot. The orderId stays valid
-    // on-chain (link orders have no payer binding), so reuse is safe.
+    // reassigned to this payer instead of consuming a fresh redemption. Reuse is safe *only*
+    // because the authorization is re-signed for the new payer below — the old one was bound to
+    // the previous wallet and would correctly be rejected on-chain.
     const recycled = await store.reclaimStaleClaim(slug, payerAddress, CLAIM_STALE_MS);
     if (recycled) {
       logger.info({ slug, payerAddress, orderId: recycled }, 'stale claim recycled');
@@ -836,22 +944,34 @@ await store.upsertMerchant(updated);
         merchant: normalizeAddressForKind(chain.kind, link.merchantAddress),
         token: link.tokenAddress,
         amount: link.amount,
-        poolRemaining: link.orderPool.length,
+        ...(signer.enabled ? { authorization: await signClaimedOrder(chain, link, recycled, payerAddress) } : {}),
       });
     }
 
-    const orderId = await store.claimOrderFromPool(slug, payerAddress);
+    // A legacy link still holds pre-registered orders: use those first so no merchant's
+    // already-paid-for gas is wasted. Once the pool is empty, mint on demand instead.
+    const pooled = link.orderPool.length > 0 ? await store.claimOrderFromPool(slug, payerAddress) : undefined;
+    const orderId = pooled ?? (await store.mintClaimedOrder(slug, payerAddress, link.maxRedemptions ?? 0));
     if (!orderId) {
-      return res.status(503).json({ error: 'no orders available — pool exhausted; ask the merchant to add more' });
+      return res.status(503).json({
+        error: link.multiPay
+          ? 'this link has no remaining payments — ask the merchant for a new link'
+          : 'this link is not available for payment',
+      });
     }
-    logger.info({ slug, payerAddress, orderId }, 'order claimed from pool');
+    logger.info(
+      { slug, payerAddress, orderId, source: pooled ? 'pool' : 'minted' },
+      'order claimed',
+    );
     res.json({
       orderId,
       chainId: link.chainId,
       merchant: normalizeAddressForKind(chain.kind, link.merchantAddress),
       token: link.tokenAddress,
       amount: link.amount,
-      poolRemaining: link.orderPool.length,
+      // Present only when a signer is configured; the customer submits it with their payment so
+      // the order is created and settled in the one transaction they pay gas for.
+      ...(signer.enabled ? { authorization: await signClaimedOrder(chain, link, orderId, payerAddress) } : {}),
     });
   }));
 
@@ -966,8 +1086,8 @@ await store.upsertMerchant(updated);
     customerName: z.string().trim().min(1).max(60).optional(),
     // Settlement asset. 'qi' = gas-free one-time address (default). 'quai' = EVM order.
     token: z.enum(['quai', 'qi']).optional().default('qi'),
-    // EVM method: the merchant's pre-registered on-chain orderId (checked to exist). Omit when
-    // the registerOrderFor relayer is enabled — the backend then registers the order for you.
+    // Legacy EVM method: the merchant's own pre-registered on-chain orderId. Omit it — the
+    // backend mints an id and authorizes it per claim, so no registration (and no gas) is needed.
     orderId: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional(),
     // Checkout-window length; the EVM order (when we register it) expires after this.
     expiresInSecs: z.number().int().min(60).max(7 * 24 * 3600).optional().default(1800),
@@ -1019,24 +1139,20 @@ await store.upsertMerchant(updated);
       // first checkout. orderId is just the ledger key for this shop order.
       orderId = '0x' + randomBytes(32).toString('hex').toLowerCase();
     } else if (d.orderId) {
+      // Legacy: the merchant registered this order themselves and paid its gas up front.
       orderId = d.orderId.toLowerCase();
       const onChain = await client.getOrder(merchant.address, orderId);
       if (!onChain.exists) {
         return res.status(400).json({ error: 'orderId is not registered on-chain for this merchant' });
       }
-    } else if (registrar.enabled) {
+    } else if (signer.enabled) {
+      // Off-chain only: the orderId is minted here and authorized when the customer claims it,
+      // so the platform spends no gas and the merchant needs no funded wallet.
       orderId = '0x' + randomBytes(32).toString('hex').toLowerCase();
-      await registrar.registerOrderFor({
-        merchant: merchant.address,
-        orderId,
-        token: ZERO_ADDRESS,
-        amount: wei,
-        expiry: Math.floor(Date.now() / 1000 + d.expiresInSecs),
-      });
     } else {
-      return res.status(400).json({
+      return res.status(503).json({
         error:
-          'QUAI checkout needs a pre-registered orderId — send one, or enable the registerOrderFor relayer (RELAYER_PRIVATE_KEY)',
+          'QUAI checkout is unavailable — the order signer is not configured (ORDER_SIGNER_PRIVATE_KEY)',
       });
     }
 
@@ -1056,6 +1172,7 @@ await store.upsertMerchant(updated);
       expiryDurationSecs: d.expiresInSecs,
       multiPay: false,
       orderPool: [],
+      maxRedemptions: 1,
       gatewayOrderId: orderId,
       createdAt: now,
     };
@@ -1424,6 +1541,10 @@ function publicLink(l: PaymentLink, chain: ResolvedChain | undefined) {
     symbol: l.symbol,
     expiryDurationSecs: l.expiryDurationSecs,
     multiPay: l.multiPay,
+    /** Customer cap for a multi-pay link (0 = unlimited). Replaces the old pool size, since
+     *  there is no pre-registered pool left to exhaust. */
+    maxRedemptions: l.maxRedemptions ?? 0,
+    /** Legacy only: pre-registered orders still held by links created before signed orders. */
     poolSize: l.orderPool.length,
     createdAt: l.createdAt,
   };

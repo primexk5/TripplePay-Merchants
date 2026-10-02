@@ -55,6 +55,8 @@ function failingClient(): ChainClient {
     getOrder: vi.fn(async () => {
       throw new Error('unreachable');
     }),
+    feeBps: vi.fn(async () => 50),
+    feeRecipient: vi.fn(async () => '0x0000000000000000000000000000000000000009'),
   };
 }
 
@@ -66,6 +68,8 @@ function healthyClient(head: number): ChainClient {
     getOrder: vi.fn(async () => {
       throw new Error('not used in this test');
     }),
+    feeBps: vi.fn(async () => 50),
+    feeRecipient: vi.fn(async () => '0x0000000000000000000000000000000000000009'),
   };
 }
 
@@ -106,6 +110,8 @@ describe('Indexer isolation (multi-chain: one Indexer instance per chain)', () =
         getOrder: vi.fn(async () => {
           throw new Error('not used');
         }),
+        feeBps: vi.fn(async () => 50),
+        feeRecipient: vi.fn(async () => '0x0000000000000000000000000000000000000009'),
       };
       const indexer = withPrivates(
         new Indexer(hangingClient, store, cfgFor(1003, '0x0000000000000000000000000000000000000004'), () => 0),

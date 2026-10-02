@@ -98,7 +98,10 @@ const EnvSchema = z.object({
   // The entire Qi surface is feature-gated: unless BOTH QI_MNEMONIC and QI_RPC_URL are set, the
   // backend never derives Qi addresses, order APIs return `qi: null`, and the Qi indexer is idle.
   //   QI_MNEMONIC: the merchant's Qi HD wallet seed phrase (BIP44, m/44'/969'/0'/0/<n>).
-  //   QI_RPC_URL:  a Quai Qi-chain JSON-RPC endpoint, e.g. https://qi-cyprus1.quai.network.
+  //   QI_RPC_URL:  a JSON-RPC endpoint for the chain Qi addresses live on. Qi derives on
+  //                Cyprus-1 (m/44'/969'/0'/0/<n>), so this is the SAME endpoint as the Quai
+  //                Cyprus-1 RPC: https://rpc.quai.network/cyprus1. The /cyprus1 path suffix is
+  //                required — the bare host answers eth_chainId but fails every eth_call.
   QI_MNEMONIC: z.string().min(1).optional(),
   QI_RPC_URL: z.string().url().optional(),
   // Qi price per 1 QUAI of an order, in qits. 1000 qits = 1 Qi, but the whole rate is tunable so a
@@ -156,13 +159,14 @@ const EnvSchema = z.object({
   // (protocol + host) — set it explicitly behind a proxy/NAT so links stay correct.
   PUBLIC_BASE_URL: z.string().url().optional(),
 
-  // --- relayer-funded EVM order registration --------------------------------------------
-  // When set, the backend can register EVM orders on a merchant's behalf (paid gas from this
-  // key) via PayWithQuai.registerOrderFor, so a plugin merchant needs no QUAI gas balance in
-  // their payout wallet. Requires a PayWithQuai upgrade that exposes registerOrderFor.
-  RELAYER_PRIVATE_KEY: z
+  // --- off-chain order signing (customer pays gas) ---------------------------------------
+  // The backend signs EIP-712 order authorizations instead of broadcasting a registration tx, so
+  // the merchant never needs a funded wallet to publish a link and the platform spends no gas:
+  // the customer's own transaction creates and settles the order. The derived address must be
+  // allowlisted on each deployment with setSigner(address, true).
+  ORDER_SIGNER_PRIVATE_KEY: z
     .string()
-    .regex(/^0x[0-9a-fA-F]{64}$/, 'RELAYER_PRIVATE_KEY must be a 32-byte hex private key')
+    .regex(/^0x[0-9a-fA-F]{64}$/, 'ORDER_SIGNER_PRIVATE_KEY must be a 32-byte hex private key')
     .optional(),
 
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),

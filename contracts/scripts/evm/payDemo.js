@@ -122,7 +122,7 @@ async function main() {
 
   const order = await pay.getOrder(merchantAddr, orderId);
   console.log(`\nOrder settled on-chain: ${order.settled}`);
-  console.log('The relayer would now POST a "payment.confirmed" webhook to the merchant.');
+  console.log('The backend indexer would now POST a "payment.confirmed" webhook to the merchant.');
 
   // --- Native flow -----------------------------------------------------------------------------
   console.log('\n--- Native round ---');

@@ -1,4 +1,4 @@
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKeyMeta } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKeyMeta, FixedOrderClaimResult } from '../types.js';
 
 /**
  * Persistence boundary for the relayer. The default local implementation ({@link JsonStore}) is a
@@ -77,10 +77,41 @@ export interface Store {
   listLinksForMerchant(merchantAddress: string): Promise<PaymentLink[]>;
   /** Remove one orderId from the pool and return it, or undefined if pool is empty. */
   claimOrderFromPool(slug: string, payerAddress: string): Promise<string | undefined>;
-  /** Atomically reassigns the oldest unsettled claim older than `olderThanMs` to `payerAddress`
-   *  and returns its orderId — recycling abandoned checkouts instead of consuming a fresh slot.
-   *  Safe because link orders are pre-registered on-chain with no payer binding. */
+  /**
+   * Mint a brand-new orderId for `payerAddress` and record the claim, atomically honouring
+   * `maxRedemptions` (0 = unlimited). Returns undefined when the link has reached its cap, so a
+   * multi-pay link still has a bounded number of customers without any pre-registered pool.
+   *
+   * This is what lets a merchant publish a link without holding gas: the order does not exist
+   * until the customer spends it, and the authorization for it is signed per claim.
+   */
+  mintClaimedOrder(
+    slug: string,
+    payerAddress: string,
+    maxRedemptions: number,
+  ): Promise<string | undefined>;
+  /**
+   * Atomically reassigns the oldest unsettled claim older than `olderThanMs` to `payerAddress`
+   * and returns its orderId — recycling abandoned checkouts instead of consuming a fresh
+   * redemption. With signed orders the returned id needs a FRESH authorization, because the
+   * previous one was bound to the original payer's address.
+   */
   reclaimStaleClaim(slug: string, payerAddress: string, olderThanMs: number): Promise<string | undefined>;
+  /**
+   * Take exclusive ownership of a fixed orderId (a gateway order), which cannot be duplicated per
+   * payer like a minted claim: the same id is being sold to exactly one customer.
+   *
+   * Idempotent for the owner (re-claims are allowed and re-sign), refuses a DIFFERENT wallet while
+   * the current claim is unsettled and still inside the reuse window, refuses an already-settled
+   * order, and hands an abandoned claim (unsettled, older than `staleAfterMs`) to the new payer.
+   * Implemented as a single atomic operation so two concurrent wallets cannot both win.
+   */
+  claimFixedOrder(
+    slug: string,
+    orderId: string,
+    payerAddress: string,
+    staleAfterMs: number,
+  ): Promise<FixedOrderClaimResult>;
   /** Mark a previously-claimed orderId as settled (payment confirmed on-chain). */
   settleClaimedOrder(slug: string, orderId: string): Promise<void>;
 
@@ -88,6 +119,12 @@ export interface Store {
   upsertClaim(claim: LinkClaim): Promise<void>;
   /** Returns the most recent claim for this (slug, payerAddress), or undefined. */
   getLatestClaim(slug: string, payerAddress: string): Promise<LinkClaim | undefined>;
+  /**
+   * Every claim made against a link, oldest first. This is the redemption ledger for a link: the
+   * number of rows is what `maxRedemptions` is checked against (recycling rewrites a row rather
+   * than adding one), so reconciliation and audit both need to be able to read it.
+   */
+  listClaims(slug: string): Promise<LinkClaim[]>;
 
   // --- order metadata (optional payer-supplied context: who paid + link/checkout source) ---
   saveOrderMeta(meta: OrderMeta): Promise<void>;
