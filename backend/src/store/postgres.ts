@@ -1,7 +1,7 @@
 import { Pool, type PoolClient } from 'pg';
 import { randomBytes } from 'node:crypto';
 import type { Store } from './index.js';
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey, MerchantApiKeyMeta, FixedOrderClaimResult } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey, MerchantApiKeyMeta, MerchantPayoutAddress, PayoutAddressSource, FixedOrderClaimResult } from '../types.js';
 import { hashApiKey, apiKeyRef, DEV_API_KEY_PEPPER } from '../util/apikey.js';
 import { log } from '../logger.js';
 
@@ -167,8 +167,11 @@ export class PostgresStore implements Store {
       -- For the Qi indexer sweep: pending (unsettled) orders, oldest first.
       CREATE INDEX IF NOT EXISTS qi_orders_pending ON qi_orders (settled, created_at);
 
+      -- The legacy plaintext bucket: NULL on every row minted after the hashing migration, so it
+      -- is deliberately nullable and carries no primary key. key_hash is the real identity
+      -- (see the migration below).
       CREATE TABLE IF NOT EXISTS api_keys (
-        key              TEXT PRIMARY KEY,
+        key              TEXT,
         merchant_address TEXT NOT NULL,
         label            TEXT NOT NULL,
         created_at       BIGINT NOT NULL,
@@ -177,18 +180,49 @@ export class PostgresStore implements Store {
       CREATE INDEX IF NOT EXISTS api_keys_merchant ON api_keys (merchant_address, created_at DESC);
     `);
 
+    // Per-chain payout destinations. A merchant's IDENTITY address (merchants.address) is the wallet
+    // they sign in with; this table is where their money actually lands, one row per chain. That is
+    // what lets a single Quai-wallet merchant also take Base payments without a second account.
+    //
+    // Indexed on (address, chain_id) rather than only by merchant_id because the indexer resolves
+    // merchants FROM the on-chain payout address on every settled payment — see
+    // getMerchantByPayoutAddress.
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS merchant_payout_addresses (
+        merchant_id TEXT NOT NULL REFERENCES merchants (merchant_id) ON DELETE CASCADE,
+        chain_id    BIGINT NOT NULL,
+        address     TEXT NOT NULL,
+        source      TEXT NOT NULL DEFAULT 'declared',
+        created_at  BIGINT NOT NULL,
+        PRIMARY KEY (merchant_id, chain_id)
+      );
+      CREATE INDEX IF NOT EXISTS merchant_payout_addresses_lookup
+        ON merchant_payout_addresses (address, chain_id);
+    `);
+
     // API-key hashing migration. The original table stored the bearer credential in `key` as the
     // primary key. Credentials are now stored only as HMAC-SHA256(pepper, key) in `key_hash`,
     // with a short non-secret `key_ref` so keys can be revoked from a URL without ever putting the
     // secret in one. `key` stays (nullable) as the legacy bucket: the pepper is not available to
     // SQL, so we cannot re-hash existing rows here — instead each row is upgraded in place the
-    // first time its owner presents it (see getMerchantByApiKey). Once `legacy` is empty, `key`
-    // can be dropped in a later migration.
+    // first time its owner presents it (see getMerchantByApiKey). Once every row has a key_hash,
+    // `key` can be dropped in a later migration.
+    //
+    // The DROP CONSTRAINT / DROP NOT NULL pair is what makes that documented design actually work:
+    // a fresh database created by the DDL above used to keep `key` as NOT NULL PRIMARY KEY, so
+    // every insert in createMerchantApiKey — which writes only the hash columns — failed with
+    // "null value in column key". That made POST /v1/me/apikeys (how merchants connect their
+    // Shopify store) unusable on any freshly provisioned database. The constraint has to go first:
+    // Postgres refuses to drop NOT NULL on a column that is still part of a primary key. Both
+    // statements are idempotent.
     await this.pool.query(`
       ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_hash TEXT;
       ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_ref  TEXT;
+      ALTER TABLE api_keys DROP CONSTRAINT IF EXISTS api_keys_pkey;
+      ALTER TABLE api_keys ALTER COLUMN key DROP NOT NULL;
       CREATE UNIQUE INDEX IF NOT EXISTS api_keys_key_hash ON api_keys (key_hash) WHERE key_hash IS NOT NULL;
       CREATE UNIQUE INDEX IF NOT EXISTS api_keys_key_ref  ON api_keys (key_ref)  WHERE key_ref  IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS api_keys_key_legacy ON api_keys (key) WHERE key IS NOT NULL;
     `);
     // `key_hash IS NULL` is the legacy marker: it means "this row still holds a plaintext
     // credential in `key`". Nothing else needs a flag column.
@@ -252,8 +286,58 @@ export class PostgresStore implements Store {
     return rows.length ? mapMerchant(rows[0]!) : undefined;
   }
 
-  async getMerchantById(merchantId: string): Promise<Merchant | undefined> {
-    const { rows } = await this.pool.query('SELECT * FROM merchants WHERE merchant_id = $1', [merchantId]);
+  async getMerchantByPayoutAddress(chainId: number, address: string): Promise<Merchant | undefined> {
+    const addr = address.toLowerCase();
+    // Configured destination for this exact chain wins.
+    const mapped = await this.pool.query(
+      `SELECT m.* FROM merchant_payout_addresses p
+       JOIN merchants m ON m.merchant_id = p.merchant_id
+       WHERE p.chain_id = $1 AND p.address = $2`,
+      [chainId, addr],
+    );
+    if (mapped.rows.length) return mapMerchant(mapped.rows[0]!);
+    // Legacy fallback: merchants onboarded before per-chain payouts existed receive at their
+    // identity address. Mirrors JsonStore.getMerchantByPayoutAddress exactly.
+    const legacy = await this.pool.query(
+      'SELECT * FROM merchants WHERE address = $1',
+      [addr],
+    );
+    return legacy.rows.length ? mapMerchant(legacy.rows[0]!) : undefined;
+  }
+
+  async listPayoutAddresses(merchantId: string): Promise<MerchantPayoutAddress[]> {
+    const { rows } = await this.pool.query(
+      `SELECT merchant_id, chain_id, address, source, created_at FROM merchant_payout_addresses
+       WHERE merchant_id = $1 ORDER BY chain_id`,
+      [merchantId],
+    );
+    return rows.map((r) => mapPayoutAddress(r));
+  }
+
+  async setPayoutAddress(p: {
+    merchantId: string;
+    chainId: number;
+    address: string;
+    source: PayoutAddressSource;
+    createdAt: number;
+  }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO merchant_payout_addresses (merchant_id, chain_id, address, source, created_at)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (merchant_id, chain_id)
+       DO UPDATE SET address = EXCLUDED.address, source = EXCLUDED.source`,
+      [p.merchantId, p.chainId, p.address.toLowerCase(), p.source, p.createdAt],
+    );
+  }
+
+  async clearPayoutAddress(merchantId: string, chainId: number): Promise<void> {
+    await this.pool.query(
+      'DELETE FROM merchant_payout_addresses WHERE merchant_id = $1 AND chain_id = $2',
+      [merchantId, chainId],
+    );
+  }
+
+  async getMerchantById(merchantId: string): Promise<Merchant | undefined> {    const { rows } = await this.pool.query('SELECT * FROM merchants WHERE merchant_id = $1', [merchantId]);
     return rows.length ? mapMerchant(rows[0]!) : undefined;
   }
 
@@ -961,8 +1045,17 @@ export class PostgresStore implements Store {
 
 const toNum = (v: unknown): number => Number(v);
 
-function mapMerchant(row: Record<string, unknown>): Merchant {
+function mapPayoutAddress(row: Record<string, unknown>): MerchantPayoutAddress {
   return {
+    merchantId: row.merchant_id as string,
+    chainId: toNum(row.chain_id),
+    address: row.address as string,
+    source: row.source as PayoutAddressSource,
+    createdAt: toNum(row.created_at),
+  };
+}
+
+function mapMerchant(row: Record<string, unknown>): Merchant {  return {
     merchantId: row.merchant_id as string,
     address: row.address as string,
     name: row.name as string,
