@@ -44,6 +44,13 @@ const connectSources = [
   .filter(Boolean)
   .join(" ");
 
+// Images a wallet EXTENSION injects into our own DOM (e.g. Pelagus adds its logo to the page it
+// is injected into). Content injected by an extension is still fetched under *our* CSP, so these
+// origins have to be allowed or the asset is blocked in the console and the wallet's UI renders
+// broken. Kept as explicit origins rather than `img-src https:` — a wildcard would undo the point
+// of a tight policy. Add an origin here when a supported wallet starts injecting one.
+const injectedImageOrigins = ["https://pelaguswallet.io"];
+
 // React's dev-mode debugging (callstack reconstruction) requires eval; production never uses
 // it. CSP headers apply to dev and prod alike, so include 'unsafe-eval' only for dev builds.
 const scriptSrc = ["'self'", "'unsafe-inline'"];
@@ -69,7 +76,7 @@ const nextConfig: NextConfig = {
               "default-src 'self'",
               `script-src ${scriptSrc.join(" ")}`,
               "style-src 'self' 'unsafe-inline'", // React inline styles
-              `img-src 'self' data:`,
+              `img-src 'self' data: ${injectedImageOrigins.join(" ")}`.trim(),
               "font-src 'self' data:",
               `connect-src ${connectSources}`,
               "frame-ancestors 'none'",

@@ -20,7 +20,9 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    // data-scroll-behavior is Next's opt-in for `scroll-behavior: smooth` in globals.css. Without it
+    // Next disables smooth scrolling on every route change and logs a warning on each navigation.
+    <html lang="en" data-scroll-behavior="smooth">
       <body className={`${spaceGrotesk.variable} antialiased`}>
         {children}
       </body>
