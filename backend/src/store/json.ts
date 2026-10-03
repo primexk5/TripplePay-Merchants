@@ -523,10 +523,9 @@ export class JsonStore implements Store {
     return Object.hasOwn(this.data.links, slug) ? this.data.links[slug] : undefined;
   }
 
-  async listLinksForMerchant(merchantAddress: string): Promise<PaymentLink[]> {
-    const addr = merchantAddress.toLowerCase();
+  async listLinksForMerchant(merchantId: string): Promise<PaymentLink[]> {
     return Object.values(this.data.links)
-      .filter((l) => l.merchantAddress === addr)
+      .filter((l) => l.merchantId === merchantId)
       .sort((a, b) => b.createdAt - a.createdAt);
   }
 

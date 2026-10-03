@@ -3,6 +3,7 @@
     "id": "quai",
     "chainId": 9,
     "kind": "quai",
+    "zone": "cyprus1",
     "name": "Quai (Cyprus-1)",
     "rpcUrl": "https://rpc.quai.network/cyprus1",
     "contractAddress": "0x0072174EF6d0C2EB605449b0014169D104c42BbC",

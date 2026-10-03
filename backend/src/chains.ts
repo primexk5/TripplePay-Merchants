@@ -15,6 +15,11 @@ const ChainConfigSchema = z.object({
   id: z.string().min(1).regex(/^[a-z0-9][a-z0-9-]*$/, 'id must be a lowercase slug, e.g. "robinhood-testnet"'),
   chainId: z.number().int().positive(),
   kind: z.enum(['quai', 'evm']),
+  /** Quai only: the zone this chain serves, e.g. "cyprus1". Quai addresses encode their zone in
+   *  the prefix, so a payout address is only receivable on the chain whose zone matches. Declared
+   *  here rather than inferred, for the same reason KNOWN_QUAI_CHAIN_IDS exists: a typo must not
+   *  silently accept the wrong shard. Ignored for kind "evm". */
+  zone: z.string().regex(/^[a-z][a-z0-9]*[0-9]$/).optional(),
   name: z.string().min(1),
   rpcUrl: z.string().url(),
   contractAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/, 'contractAddress must be a 20-byte hex address'),
