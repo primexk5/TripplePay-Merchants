@@ -25,6 +25,7 @@ import {
 import { listCurrencies, findCurrency, NATIVE_CURRENCY } from "@/lib/currencies";
 import { listChains, type ChainInfo } from "@/lib/chains";
 import { useChainSelector } from "@/lib/relayer";
+import { usePayouts } from "@/lib/payouts";
 
 /** Exact decimal-string → smallest-unit conversion (no float math). */
 function toUnits(decimal: string, decimals: number): bigint {
@@ -94,6 +95,10 @@ export default function LinksPage() {
   const [busy, setBusy] = useState(false);
   const [link, setLink] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Where this link's money would actually go. Shown before creation so a merchant is never
+  // surprised by the destination, and used to explain up front why a chain is refusing links.
+  const payouts = usePayouts();
+  const payoutForChain = payouts.find((p) => p.chainId === chain.chainId);
   const [links, setLinks] = useState<LinkInfo[]>([]);
   const [copied, setCopied] = useState<string | null>(null);
   const [loadingLinks, setLoadingLinks] = useState(false);
@@ -432,6 +437,34 @@ export default function LinksPage() {
                     {error}
                   </p>
                 )}
+
+                {/* Where this link pays out. Shown before creation so the destination is never a
+                    surprise, and a chain with no address is called out here rather than surfacing
+                    as a failure after the merchant has filled in the form. */}
+                <div className="rounded-xl border border-white/7 bg-[#171717] p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-xs text-[#8b93a7]">Pays out to</p>
+                    {payoutForChain && (
+                      <span className="shrink-0 rounded-full bg-emerald-400/10 px-2.5 py-1 text-xs text-emerald-300">
+                        {payoutForChain.source === "login" ? "Your sign-in wallet" : "Custom address"}
+                      </span>
+                    )}
+                  </div>
+                  {payoutForChain ? (
+                    <p className="mt-2 break-all font-mono text-xs text-white">
+                      {payoutForChain.address}
+                    </p>
+                  ) : (
+                    <p className="mt-2 text-xs text-amber-300">
+                      No payout address set for {chain.name} — links on this network can&apos;t be
+                      created until you add one in{" "}
+                      <a href="/dashboard/settings" className="underline underline-offset-2">
+                        Settings
+                      </a>
+                      .
+                    </p>
+                  )}
+                </div>
 
                 <button
                   onClick={() => void create()}

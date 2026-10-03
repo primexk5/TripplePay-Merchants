@@ -64,6 +64,25 @@ export interface Merchant {
   webhookUrl: string;
   active: boolean;
   createdAt: number;
+  /**
+   * Where this merchant's money is paid on each chain, as returned by /v1/me.
+   *
+   * Distinct from `address`, which is the wallet the merchant SIGNS IN with. A link pays out to
+   * the payout row for its chain, so a merchant can be one identity across several destinations.
+   * Absent on demo/admin responses, which carry no payout map.
+   */
+  payouts?: PayoutAddress[];
+}
+
+export interface PayoutAddress {
+  chainId: number;
+  /** Null when the backend no longer serves this chain. */
+  chainName: string | null;
+  chainKind: ChainKind | null;
+  address: string;
+  /** `declared` = the merchant chose it; `login` = seeded from their sign-in wallet. */
+  source: "declared" | "login";
+  createdAt: number;
 }
 
 /** Session bearer token when available in memory; the HttpOnly cookie covers the rest. */
@@ -95,6 +114,25 @@ async function adminGet<T>(path: string): Promise<T> {
     signal: AbortSignal.timeout(10_000),
   });
   if (!res.ok) throw new HttpError(res.status, `backend error ${res.status}`);
+  return (await res.json()) as T;
+}
+
+/** PUT/DELETE for the self-service payout endpoints, which have no admin proxy equivalent. */
+export async function adminWrite<T>(path: string, method: "PUT" | "DELETE", body?: unknown): Promise<T> {
+  const res = await relayerFetch(path, {
+    method,
+    headers: {
+      ...adminHeaders(),
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) {
+    const detail = (await res.json().catch(() => null)) as { error?: string } | null;
+    throw new HttpError(res.status, detail?.error ?? `backend error ${res.status}`);
+  }
+  if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
 
