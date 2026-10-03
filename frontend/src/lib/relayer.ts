@@ -230,7 +230,7 @@ export function useConnectedChain(): ChainInfo {
         return;
       }
       void (async () => {
-        const hex = await getWalletChainId(wallet.provider);
+        const hex = await getWalletChainId(wallet.provider, { quaiNative: wallet.brand === "pelagus" });
         const numeric = hex ? parseInt(hex, 16) : NaN;
         const resolved = Number.isFinite(numeric) ? getChainById(numeric) : undefined;
         // Only ever resolve to a LIVE chain — a wallet reporting a chain we configure but that

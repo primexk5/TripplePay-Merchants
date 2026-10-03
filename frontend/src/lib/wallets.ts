@@ -416,16 +416,29 @@ export function normalizeChainId(id: unknown): string | null {
   return null;
 }
 
-/** Asks the wallet for its current chain id (normalized hex). */
+/** Asks the wallet for its current chain id (normalized hex).
+ *
+ *  Probe order is chosen from `opts.quaiNative` rather than always trying Quai's namespaced
+ *  method first. An EVM-only wallet answers `quai_chainId` with -32601 "method does not
+ *  exist"; that rejection is caught, so it was only ever cosmetic — but MetaMask logs it as an
+ *  unhandled-looking RPC error in the page console on every connect, which reads like a broken
+ *  integration to anyone testing login. EIP-1193 wallets that don't implement the Quai
+ *  namespace are asked `eth_chainId` first and keep `quai_chainId` as the fallback, so a wallet
+ *  that only speaks the Quai namespace still resolves. Pelagus is passed `quaiNative` and is
+ *  asked `quai_chainId` first. */
 export async function getWalletChainId(
   provider: Eip1193Provider,
+  opts?: { quaiNative?: boolean },
 ): Promise<string | null> {
+  const methods = opts?.quaiNative
+    ? ["quai_chainId", "eth_chainId"]
+    : ["eth_chainId", "quai_chainId"];
   try {
-    let chainId = await provider.request({ method: "quai_chainId" }).catch(() => null);
-    if (!chainId) {
-      chainId = await provider.request({ method: "eth_chainId" }).catch(() => null);
+    for (const method of methods) {
+      const chainId = await provider.request({ method }).catch(() => null);
+      if (chainId) return normalizeChainId(chainId);
     }
-    return normalizeChainId(chainId);
+    return null;
   } catch {
     return null;
   }
@@ -475,7 +488,7 @@ async function ensureNetworkConfig(
   if (opts?.quaiNative) return "ok";
 
   // Fast path: already on the target chain — no popups, no writes.
-  const before = await getWalletChainId(provider);
+  const before = await getWalletChainId(provider, { quaiNative: opts?.quaiNative });
   if (before === targetId) return "ok";
 
   try {
@@ -483,7 +496,7 @@ async function ensureNetworkConfig(
       method: "wallet_switchEthereumChain",
       params: [{ chainId: target.chainId }],
     });
-    const after = await getWalletChainId(provider);
+    const after = await getWalletChainId(provider, { quaiNative: opts?.quaiNative });
     if (after && after === targetId) return "ok";
   } catch (err) {
     const code = (err as { code?: number })?.code;
@@ -502,7 +515,7 @@ async function ensureNetworkConfig(
       method: "wallet_addEthereumChain",
       params: [target],
     });
-    const after = await getWalletChainId(provider);
+    const after = await getWalletChainId(provider, { quaiNative: opts?.quaiNative });
     if (after && after === targetId) return "ok";
   } catch {
     // fall through — wallet can't reach the target chain

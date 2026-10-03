@@ -132,7 +132,7 @@ export async function loginWithWallet(
         `Make sure your wallet is connected to a supported network.`,
     );
   }
-  const currentHex = await getWalletChainId(wallet.provider);
+  const currentHex = await getWalletChainId(wallet.provider, { quaiNative: wallet.brand === "pelagus" });
   const currentChainId = currentHex ? parseInt(currentHex, 16) : NaN;
   // Prefer whatever chain the wallet already reports, but only among chains it can actually
   // reach — otherwise fall back to the first chain it supports, not the app's global default.
