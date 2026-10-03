@@ -132,14 +132,16 @@ function logMisconfiguredChains(chains: ChainInfo[]): void {
 const QUAI_MAINNET: ChainInfoInput = {
   chainId: 9,
   slug: "quai",
-  name: "Quai",
+  name: "Quai (mainnet)",
   kind: "quai",
-  rpcUrl: process.env.NEXT_PUBLIC_RPC_URL ?? "https://rpc.quai.network/cyprus1",
-  contractAddress: process.env.NEXT_PUBLIC_PAYWITHQUAI_ADDRESS ?? "",
-  addressEnvVar: "NEXT_PUBLIC_PAYWITHQUAI_ADDRESS",
+  rpcUrl: process.env.NEXT_PUBLIC_QUAI_MAINNET_RPC_URL ?? "https://rpc.quai.network/cyprus1",
+  contractAddress: process.env.NEXT_PUBLIC_QUAI_MAINNET_PAYWITHQUAI_ADDRESS ?? "",
+  addressEnvVar: "NEXT_PUBLIC_QUAI_MAINNET_PAYWITHQUAI_ADDRESS",
   explorerUrl: "https://quaiscan.io",
   nativeCurrency: { name: "Quai", symbol: "QUAI", decimals: 18 },
-  default: true,
+  // When no mainnet address is configured this is intentionally "not yet launched" for this
+  // deployment (testnet setup), not a misconfiguration — suppress the startup console.error.
+  launched: !!process.env.NEXT_PUBLIC_QUAI_MAINNET_PAYWITHQUAI_ADDRESS && process.env.NEXT_PUBLIC_QUAI_MAINNET_PAYWITHQUAI_ADDRESS !== "undefined" && process.env.NEXT_PUBLIC_QUAI_MAINNET_PAYWITHQUAI_ADDRESS !== "false",
 };
 
 // Native-currency assumption: Robinhood Chain testnet's RPC/explorer are standard EVM tooling

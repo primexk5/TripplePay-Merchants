@@ -492,46 +492,43 @@ export default function CheckoutPage({
 
           {["ready", "paying", "awaiting"].includes(stage.name) && order && (
             <>
-              <div className="text-center">
-                <p className="text-sm text-[#8b93a7]">Total to pay</p>
-                <p className="mt-2 text-5xl font-semibold tracking-tight">
-                  {formatAmount(order, order.amount)}
-                </p>
-                <p className="mt-1 text-sm text-[#38bdf8]">{symbol(order)}</p>
+              <div className="text-center mt-4">
+                <p className="text-xs text-[#8b93a7] font-medium tracking-wider uppercase">Total to pay</p>
+                <div className="mt-1 flex items-end justify-center gap-2">
+                  <p className="text-4xl font-bold tracking-tight text-white leading-none">
+                    {formatAmount(order, order.amount)}
+                  </p>
+                  <p className="text-lg font-medium text-[#38bdf8] mb-0.5">{symbol(order)}</p>
+                </div>
                 {order.feeBps > 0 && (
-                  <p className="mt-2 text-xs text-[#8b93a7]">
-                    includes {(order.feeBps / 100).toFixed(1)}% platform fee ·
-                    merchant receives{" "}
-                    <span className="text-white">
-                      {formatAmount(order, netAmount(order))} {symbol(order)}
-                    </span>
+                  <p className="mt-2 text-[11px] text-[#8b93a7]">
+                    includes {(order.feeBps / 100).toFixed(1)}% platform fee
                   </p>
                 )}
                 {order.expiry > 0n && (
-                  <p className="mt-1 flex items-center justify-center gap-1.5 text-xs text-[#8b93a7]">
-                    <Clock size={12} />
-                    expires{" "}
-                    {new Date(Number(order.expiry) * 1000).toLocaleString()}
+                  <p className="mt-2 flex items-center justify-center gap-1.5 text-xs text-[#8b93a7]">
+                    <Clock size={12} className="text-[#38bdf8]" />
+                    Expires {new Date(Number(order.expiry) * 1000).toLocaleString(undefined, { hour: 'numeric', minute: '2-digit' })}
                   </p>
                 )}
               </div>
 
-              <div className="mt-5 rounded-xl border border-white/7 bg-[#171717] px-4 py-3">
-                <p className="text-xs text-[#8b93a7]">Pay to merchant</p>
-                <p className="mt-1 break-all font-mono text-xs text-white">
-                  {order.merchant}
-                </p>
-              </div>
-
-              <div className="mt-8 rounded-2xl border border-white/7 bg-[#171717] p-4">
-                <div className="flex items-center justify-between">
+              {/* Compact Merchant & Network Info */}
+              <div className="mt-8 flex flex-col sm:flex-row gap-3">
+                <div className="flex-1 rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3">
+                  <p className="text-[10px] uppercase tracking-wider text-[#8b93a7] mb-1">Merchant Address</p>
+                  <p className="font-mono text-xs text-white truncate" title={order.merchant}>
+                    {order.merchant.slice(0, 10)}...{order.merchant.slice(-8)}
+                  </p>
+                </div>
+                <div className="flex-1 rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3 flex items-center justify-between">
                   <div>
-                    <p className="text-sm font-medium">{chain.name}</p>
-                    <p className="mt-1 text-xs text-[#8b93a7]">
-                      Settlement network
-                    </p>
+                    <p className="text-[10px] uppercase tracking-wider text-[#8b93a7] mb-1">Network</p>
+                    <p className="text-xs font-medium text-white">{chain.name}</p>
                   </div>
-                  <Check size={17} className="text-emerald-300" />
+                  <div className="flex h-6 w-6 items-center justify-center rounded-full bg-emerald-400/10">
+                    <Check size={12} className="text-emerald-400" />
+                  </div>
                 </div>
               </div>
 
@@ -602,28 +599,7 @@ export default function CheckoutPage({
                     </div>
                   ) : (
                     <>
-                      {checkoutUrl && (
-                        <div className="mt-6 flex flex-col items-center rounded-2xl border border-white/7 bg-[#171717] p-6">
-                          <div className="rounded-2xl bg-white p-3 shadow-md ring-4 ring-white/10">
-                            <QRCode
-                              value={checkoutUrl}
-                              size={160}
-                              level="M"
-                              fgColor="#0F1116"
-                            />
-                          </div>
-                          <p className="mt-4 text-sm font-medium text-white">
-                            Scan to pay
-                          </p>
-                          <p className="mt-2 max-w-xs text-center text-xs leading-5 text-[#8b93a7]">
-                            Opens this checkout on your phone — pay with Blip
-                            (in-app browser) or any browser wallet (Pelagus,
-                            MetaMask).
-                          </p>
-                        </div>
-                      )}
-
-                      <div className="mt-6 overflow-hidden rounded-2xl border border-white/7 bg-[#171717]">
+                      <div className="mt-8 overflow-hidden rounded-2xl border border-white/10 bg-[#0a0a0a] shadow-xl">
                         <PaymentMethodSelector
                           payTab={payTab}
                           setPayTab={setPayTab}
@@ -631,12 +607,17 @@ export default function CheckoutPage({
                         />
 
                         {payTab === "blip" && checkoutUrl && (
-                          <div className="flex flex-col items-center p-6">
-                            <p className="mb-5 text-center text-xs leading-5 text-[#8b93a7]">
-                              Opens this checkout inside the Blip app. Tap Pay
-                              there to settle the order on-chain — the merchant
-                              dashboard updates via webhook, same as wallet
-                              connect.
+                          <div className="flex flex-col items-center p-6 bg-[#121212]">
+                            <div className="rounded-2xl bg-white p-3 shadow-lg mb-5 ring-4 ring-white/5">
+                              <QRCode
+                                value={checkoutUrl}
+                                size={140}
+                                level="M"
+                                fgColor="#0F1116"
+                              />
+                            </div>
+                            <p className="mb-4 text-center text-xs leading-5 text-[#8b93a7] max-w-[250px]">
+                              Scan this QR with your phone to pay instantly via Blip, Pelagus, or MetaMask mobile.
                             </p>
                             <a
                               href={
@@ -644,30 +625,12 @@ export default function CheckoutPage({
                                   ? blipDeepLink(checkoutUrl)
                                   : blipBrowserLink(checkoutUrl)
                               }
-                              className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#C1ED00] py-3 text-sm font-semibold text-[#0F1116] transition hover:bg-[#d4ff00]"
+                              className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#C1ED00] py-3.5 text-sm font-semibold text-[#0F1116] transition hover:bg-[#d4ff00] shadow-[0_0_20px_rgba(193,237,0,0.2)]"
                             >
-                              <Smartphone size={15} />
-                              Open in Blip app
+                              <Smartphone size={16} />
+                              Open in Mobile App
                             </a>
-                            <p className="mt-3 text-center text-xs text-[#4f5868]">
-                              {isMobileViewport() ? (
-                                <>
-                                  Not opening?{" "}
-                                  <a
-                                    href={blipBrowserLink(checkoutUrl)}
-                                    className="text-[#C1ED00] hover:underline"
-                                  >
-                                    Use the web link
-                                  </a>
-                                </>
-                              ) : (
-                                <>
-                                  Scan the QR above with your phone to pay in
-                                  Blip.
-                                </>
-                              )}
-                            </p>
-                            <p className="mt-3 text-center text-xs text-[#4f5868]">
+                            <p className="mt-4 text-center text-[11px] text-[#4f5868]">
                               Don&apos;t have Blip?{" "}
                               <a
                                 href="https://blippay.me"
@@ -675,42 +638,36 @@ export default function CheckoutPage({
                                 rel="noreferrer"
                                 className="text-[#C1ED00] hover:underline"
                               >
-                                Download Blip (iOS & Android)
+                                Download iOS/Android
                               </a>
                             </p>
                           </div>
                         )}
 
                         {payTab === "wallet" && (
-                          <div className="p-6">
-                            <p className="mb-4 text-center text-xs text-[#8b93a7]">
-                              {chain.kind === "quai"
-                                ? "Connect any Quai-compatible browser wallet (Pelagus, Blip in-app browser, or MetaMask)."
-                                : `Connect any browser wallet to pay on ${chain.name}.`}
-                            </p>
+                          <div className="p-6 bg-[#121212]">
                             {connected ? (
-                              <div className="space-y-3">
-                                <div className="rounded-xl border border-white/7 bg-[#171717] px-4 py-3 text-center">
-                                  <p className="text-xs text-[#8b93a7]">
-                                    Paying as
-                                  </p>
-                                  <p className="mt-1 break-all font-mono text-xs text-white">
-                                    {connected}
-                                  </p>
+                              <div className="space-y-4">
+                                <div className="rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3 flex items-center justify-between">
+                                  <span className="text-xs text-[#8b93a7]">Connected</span>
+                                  <span className="font-mono text-xs text-white bg-white/10 px-2 py-1 rounded-md">
+                                    {connected.slice(0, 6)}...{connected.slice(-4)}
+                                  </span>
                                 </div>
                                 {!payerAllowed(order) && (
-                                  <p className="rounded-xl border border-amber-400/20 bg-amber-400/6 px-4 py-3 text-center text-xs text-amber-300">
-                                    This order is reserved for another wallet —
-                                    you can&apos;t settle it.
+                                  <p className="rounded-xl border border-amber-400/20 bg-amber-400/10 px-4 py-3 text-center text-xs text-amber-300">
+                                    This order is reserved for another wallet.
                                   </p>
                                 )}
                                 <button
                                   onClick={() => void connectAndPay()}
                                   disabled={!payerAllowed(order)}
-                                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#38bdf8] py-3.5 text-sm font-semibold text-[#061018] transition hover:bg-[#67d8ff] disabled:opacity-50"
+                                  className="group relative flex w-full items-center justify-center gap-2 overflow-hidden rounded-xl bg-[#38bdf8] py-4 text-sm font-semibold text-[#061018] transition-all hover:bg-[#67d8ff] disabled:opacity-50"
                                 >
-                                  Pay {formatAmount(order, order.amount)}{" "}
-                                  {symbol(order)}
+                                  <div className="absolute inset-0 flex h-full w-full justify-center [transform:skew(-12deg)_translateX(-100%)] group-hover:duration-1000 group-hover:[transform:skew(-12deg)_translateX(100%)]">
+                                    <div className="relative h-full w-8 bg-white/20" />
+                                  </div>
+                                  Pay {formatAmount(order, order.amount)} {symbol(order)}
                                 </button>
                               </div>
                             ) : (
@@ -725,7 +682,7 @@ export default function CheckoutPage({
                         )}
 
                         {payTab === "qi" && (
-                          <div className="p-6">
+                          <div className="p-6 bg-[#121212]">
                             {qiOrder ? (
                               <QiPaymentPanel
                                 address={qiOrder.address}
@@ -733,12 +690,12 @@ export default function CheckoutPage({
                                 orderId={orderId}
                               />
                             ) : (
-                              <div className="flex flex-col items-center gap-3 text-center">
-                                <Coins size={28} className="text-[#4f5868]" />
-                                <p className="max-w-xs text-xs leading-5 text-[#8b93a7]">
-                                  Qi payments aren&apos;t enabled for this
-                                  checkout — the merchant hasn&apos;t configured a
-                                  Qi wallet.
+                              <div className="flex flex-col items-center gap-3 text-center py-4">
+                                <div className="flex h-12 w-12 items-center justify-center rounded-full bg-white/5">
+                                  <Coins size={24} className="text-[#4f5868]" />
+                                </div>
+                                <p className="text-xs text-[#8b93a7]">
+                                  Qi payments aren&apos;t enabled for this checkout.
                                 </p>
                               </div>
                             )}
@@ -748,27 +705,27 @@ export default function CheckoutPage({
                     </>
                   )}
 
-                  <div className="mt-5 flex items-center justify-center gap-5 text-xs text-[#8b93a7]">
+                  <div className="mt-6 flex items-center justify-center gap-6 text-[11px] font-medium uppercase tracking-wider text-[#4f5868]">
                     <span className="flex items-center gap-1.5">
-                      <LockKeyhole size={13} />
+                      <LockKeyhole size={14} className="text-[#8b93a7]" />
                       Secure
                     </span>
                     <span className="flex items-center gap-1.5">
-                      <ShieldCheck size={13} />
+                      <ShieldCheck size={14} className="text-[#8b93a7]" />
                       Non-custodial
                     </span>
                   </div>
 
-                  {/* Optional customer name — stored client-side only, shown on receipt */}
-                  <div className="mt-5">
-                    <p className="mb-2 text-sm text-[#8b93a7]">Your name (optional — appears on receipt)</p>
+                  {/* Optional customer name */}
+                  <div className="mt-8 pt-6 border-t border-white/5">
+                    <p className="mb-2 text-xs font-medium text-[#8b93a7]">Your name <span className="text-[#4f5868]">(appears on receipt)</span></p>
                     <input
                       type="text"
                       value={customerName}
                       onChange={(e) => setCustomerName(e.target.value)}
                       placeholder="e.g. Alice"
                       maxLength={60}
-                      className="h-10 w-full rounded-xl border border-white/7 bg-[#171717] px-3 text-sm text-white outline-none transition placeholder:text-[#4f5868] focus:border-[#38bdf8]/40"
+                      className="h-11 w-full rounded-xl border border-white/10 bg-[#0a0a0a] px-4 text-sm text-white outline-none transition-colors placeholder:text-[#4f5868] focus:border-[#38bdf8]/50"
                     />
                   </div>
                 </>

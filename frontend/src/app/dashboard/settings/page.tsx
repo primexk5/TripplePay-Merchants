@@ -1,13 +1,13 @@
 "use client";
 
-import { Check, Loader2, Save, ShieldCheck, Wallet } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Check, Loader2, Save, Trash2, Wallet } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 import { parseError } from "@/lib/utils";
 
 import { DashboardShell } from "@/components/layout/dashboard-shell";
-import { WalletSelector } from "@/components/ui/wallet-selector";
 import { isLoggedIn } from "@/lib/auth";
-import { adminPatch, useRelayerData } from "@/lib/relayer";
+import { listAvailableChains } from "@/lib/chains";
+import { adminPatch, adminWrite, type PayoutAddress, useRelayerData } from "@/lib/relayer";
 import {
   DEFAULT_WEBHOOK_PATH,
   normalizeWebhookInput,
@@ -16,7 +16,6 @@ import {
 
 export default function SettingsPage() {
   const { merchants, loading, error, refresh } = useRelayerData();
-  const [address, setAddress] = useState<string | null>(null);
   const [webhookUrl, setWebhookUrl] = useState("");
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -74,7 +73,7 @@ export default function SettingsPage() {
           <p className="mb-2 text-sm text-[#38bdf8]">Configuration</p>
           <h1 className="text-3xl font-semibold tracking-tight">Settings</h1>
           <p className="mt-2 text-sm text-[#8b93a7]">
-            Merchant profile and settlement wallet, synced with the relayer.
+            Merchant profile and the addresses your payments are paid to.
           </p>
         </div>
 
@@ -167,38 +166,7 @@ export default function SettingsPage() {
             )}
           </section>
 
-          <section className="rounded-2xl border border-white/7 bg-[#171717] p-6">
-            <div className="mb-6 flex items-start gap-4">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-emerald-400/15 bg-emerald-400/6 text-emerald-300">
-                <ShieldCheck size={18} />
-              </div>
-              <div>
-                <h2 className="font-semibold">Settlement wallet</h2>
-                <p className="mt-1 text-xs text-[#8b93a7]">
-                  The wallet that receives your settled payments.
-                </p>
-              </div>
-            </div>
-
-            {address ? (
-              <div className="rounded-xl border border-white/7 bg-[#171717] p-4">
-                <p className="text-xs text-[#8b93a7]">Connected address</p>
-                <p className="mt-2 break-all font-mono text-sm text-white">
-                  {address}
-                </p>
-                <p className="mt-2 text-xs text-emerald-300">
-                  This address can receive payments on every chain you create links on — merchants are chain-free.
-                </p>
-              </div>
-            ) : (
-              <WalletSelector
-                connectedAddress={null}
-                onConnected={setAddress}
-                label="Connect settlement wallet"
-                chain="any"
-              />
-            )}
-          </section>
+          <PayoutAddresses payouts={merchant?.payouts ?? []} onChanged={refresh} />
 
           <div className="flex items-center justify-end gap-3">
             {saveError && (
@@ -226,5 +194,168 @@ export default function SettingsPage() {
         </div>
       </div>
     </DashboardShell>
+  );
+}
+/**
+ * Per-chain payout destinations.
+ *
+ * A merchant signs in with one wallet, but each payment link pays out to the address nominated for
+ * THAT link's chain. A chain with no address here cannot have links created on it — the backend
+ * refuses rather than guess, so the gap is surfaced here next to the control that fixes it.
+ */
+function PayoutAddresses({
+  payouts,
+  onChanged,
+}: {
+  payouts: PayoutAddress[];
+  onChanged: () => void;
+}) {
+  const chains = listAvailableChains();
+  const [drafts, setDrafts] = useState<Record<number, string>>({});
+  const [busy, setBusy] = useState<number | null>(null);
+  const [rowError, setRowError] = useState<Record<number, string>>({});
+
+  const byChain = useMemo(() => new Map(payouts.map((p) => [p.chainId, p])), [payouts]);
+
+  // Keep drafts in step with the server unless the merchant is mid-edit, so a background refresh
+  // never overwrites what someone is typing.
+  useEffect(() => {
+    setDrafts((prev) => {
+      const next: Record<number, string> = {};
+      for (const chain of chains) {
+        const key = chain.chainId;
+        const server = byChain.get(key)?.address ?? "";
+        next[key] = Object.prototype.hasOwnProperty.call(prev, key) && prev[key] !== server && prev[key] !== ""
+          ? prev[key]
+          : server;
+      }
+      return next;
+    });
+  }, [payouts, byChain, chains]);
+
+  const set = (chainId: number, value: string) => {
+    setDrafts((d) => ({ ...d, [chainId]: value }));
+    setRowError((e) => {
+      if (!e[chainId]) return e;
+      const next = { ...e };
+      delete next[chainId];
+      return next;
+    });
+  };
+
+  const save = async (chainId: number) => {
+    const value = (drafts[chainId] ?? "").trim();
+    setBusy(chainId);
+    setRowError((e) => ({ ...e, [chainId]: "" }));
+    try {
+      await adminWrite(`/v1/me/payouts/${chainId}`, "PUT", { address: value });
+      onChanged();
+    } catch (err) {
+      setRowError((e) => ({ ...e, [chainId]: parseError(err) }));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const clear = async (chainId: number) => {
+    setBusy(chainId);
+    setRowError((e) => ({ ...e, [chainId]: "" }));
+    try {
+      await adminWrite(`/v1/me/payouts/${chainId}`, "DELETE");
+      setDrafts((d) => ({ ...d, [chainId]: "" }));
+      onChanged();
+    } catch (err) {
+      setRowError((e) => ({ ...e, [chainId]: parseError(err) }));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <section className="rounded-2xl border border-white/7 bg-[#171717] p-6">
+      <div className="mb-6 flex items-start gap-4">
+        <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-[#38bdf8]/15 bg-[#38bdf8]/6 text-[#38bdf8]">
+          <Wallet size={18} />
+        </div>
+        <div>
+          <h2 className="font-semibold">Payout addresses</h2>
+          <p className="mt-1 text-xs text-[#8b93a7]">
+            Each chain pays out to the address set here. Your sign-in wallet is seeded in
+            automatically; change any chain to a different address whenever you like.
+          </p>
+        </div>
+      </div>
+
+      {chains.length === 0 ? (
+        <p className="text-sm text-[#8b93a7]">
+          No chains are available in this deployment.
+        </p>
+      ) : (
+        <div className="space-y-4">
+          {chains.map((chain) => {
+            const saved = byChain.get(chain.chainId);
+            const draft = drafts[chain.chainId] ?? "";
+            const dirty = draft.trim() !== (saved?.address ?? "");
+            const error = rowError[chain.chainId];
+            const working = busy === chain.chainId;
+            return (
+              <div key={chain.chainId} className="rounded-xl border border-white/7 bg-[#171717] p-4">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm text-white">{chain.name}</p>
+                    <p className="text-xs text-[#4f5868]">
+                      chainId {chain.chainId}
+                      {saved ? ` · set ${saved.source === "login" ? "from your sign-in wallet" : "by you"}` : " · not set"}
+                    </p>
+                  </div>
+                  {saved && !dirty && (
+                    <span className="shrink-0 rounded-full bg-emerald-400/10 px-2.5 py-1 text-xs text-emerald-300">
+                      Ready
+                    </span>
+                  )}
+                  {!saved && !dirty && (
+                    <span className="shrink-0 rounded-full bg-amber-400/10 px-2.5 py-1 text-xs text-amber-300">
+                      Links blocked
+                    </span>
+                  )}
+                </div>
+                <div className="flex h-11 items-center overflow-hidden rounded-xl border border-white/7 bg-[#171717] transition focus-within:border-[#38bdf8]/40">
+                  <input
+                    type="text"
+                    value={draft}
+                    onChange={(e) => set(chain.chainId, e.target.value)}
+                    placeholder={chain.kind === "quai" ? "0x… (Quai zone address)" : "0x…"}
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="h-full w-full bg-transparent px-3 font-mono text-xs text-white outline-none placeholder:text-[#4f5868]"
+                  />
+                </div>
+                {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
+                <div className="mt-3 flex items-center gap-2">
+                  <button
+                    onClick={() => void save(chain.chainId)}
+                    disabled={!dirty || working}
+                    className="inline-flex items-center gap-2 rounded-lg bg-[#38bdf8] px-3.5 py-1.5 text-xs font-semibold text-[#061018] transition hover:bg-[#67d8ff] disabled:opacity-40"
+                  >
+                    {working && <Loader2 size={13} className="animate-spin" />}
+                    Save
+                  </button>
+                  {saved && (
+                    <button
+                      onClick={() => void clear(chain.chainId)}
+                      disabled={working}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-[#8b93a7] transition hover:border-red-400/40 hover:text-red-300 disabled:opacity-40"
+                    >
+                      <Trash2 size={13} />
+                      Clear
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
   );
 }

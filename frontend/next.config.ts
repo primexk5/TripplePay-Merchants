@@ -49,7 +49,7 @@ const connectSources = [
 // origins have to be allowed or the asset is blocked in the console and the wallet's UI renders
 // broken. Kept as explicit origins rather than `img-src https:` — a wildcard would undo the point
 // of a tight policy. Add an origin here when a supported wallet starts injecting one.
-const injectedImageOrigins = ["https://pelaguswallet.io"];
+const injectedImageOrigins = ["https://pelaguswallet.io", "https://www.pelaguswallet.io"];
 
 // React's dev-mode debugging (callstack reconstruction) requires eval; production never uses
 // it. CSP headers apply to dev and prod alike, so include 'unsafe-eval' only for dev builds.

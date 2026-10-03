@@ -72,7 +72,9 @@ describe('key hashing primitives', () => {
   it('masks a key without revealing the middle', () => {
     const { key } = generateApiKey();
     const masked = maskApiKey(key);
-    expect(masked).toMatch(/^qmk_[0-9a-f]{8}…\w{3}$/);
+    // The trailing 3 characters are the real tail of the random base64url segment, whose alphabet
+    // includes `-` and `_`. `\w` excludes both, so it matched only ~91% of keys and failed at random.
+    expect(masked).toMatch(/^qmk_[0-9a-f]{8}…[A-Za-z0-9_-]{3}$/);
     expect(masked).not.toContain(key.slice(13, 20));
   });
 

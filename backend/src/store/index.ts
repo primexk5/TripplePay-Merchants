@@ -102,7 +102,14 @@ export interface Store {
   // --- payment links (short slug → link template + order pool) ---
   upsertLink(link: PaymentLink): Promise<void>;
   getLink(slug: string): Promise<PaymentLink | undefined>;
-  listLinksForMerchant(merchantAddress: string): Promise<PaymentLink[]>;
+  /**
+   * Every link belonging to a merchant, newest first.
+   *
+   * Keyed by merchantId, NOT by address. A link records the address its money is paid TO, which
+   * is now resolved per chain and is frequently not the merchant's identity address — matching on
+   * it would hide exactly the links a multichain merchant created.
+   */
+  listLinksForMerchant(merchantId: string): Promise<PaymentLink[]>;
   /** Remove one orderId from the pool and return it, or undefined if pool is empty. */
   claimOrderFromPool(slug: string, payerAddress: string): Promise<string | undefined>;
   /**

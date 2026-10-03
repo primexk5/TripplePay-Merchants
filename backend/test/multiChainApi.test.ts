@@ -103,6 +103,26 @@ async function onboard(base: string, address: string): Promise<void> {
   expect(res.status).toBe(201);
 }
 
+/**
+ * Declare a Quai payout for the merchant.
+ *
+ * `quaisWallet` here is derived from a bare key with no zone prefix, so it is NOT a valid Cyprus-1
+ * destination and login deliberately refuses to seed it onto the Quai chain. These tests are about
+ * chain selection and allowlists rather than payouts, so they nominate an explicit Quai payout to
+ * put the Quai chain in a payable state — which is what a real Quai merchant's Pelagus wallet
+ * would supply.
+ */
+const CYPRUS1_PAYOUT = '0x002dB0fBCA5a3DC1336e5D00ABCbCd9daac9cFF6';
+
+async function declareQuaiPayout(base: string, token: string): Promise<void> {
+  const res = await req(base, '/v1/me/payouts/9', {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${token}`, ...jsonHeaders },
+    body: JSON.stringify({ address: CYPRUS1_PAYOUT }),
+  });
+  expect(res.status).toBe(200);
+}
+
 async function loginAs(
   base: string,
   wallet: QuaisWallet | EthersWallet,
@@ -145,6 +165,7 @@ describe('POST /v1/links — multi-chain', () => {
     const base = await startApp();
     await onboard(base, quaisWallet.address);
     const token = await loginAs(base, quaisWallet);
+    await declareQuaiPayout(base, token);
 
     const res = await req(base, '/v1/links', {
       method: 'POST',
@@ -153,6 +174,7 @@ describe('POST /v1/links — multi-chain', () => {
     });
     expect(res.status).toBe(201);
     expect(res.body.chainId).toBe(9);
+    expect((res.body.merchantAddress as string).toLowerCase()).toBe(CYPRUS1_PAYOUT.toLowerCase());
     expect((res.body.chain as Record<string, unknown>).id).toBe('quai');
   });
 
@@ -208,6 +230,7 @@ describe('POST /v1/links — multi-chain', () => {
     const base = await startApp();
     await onboard(base, quaisWallet.address);
     const token = await loginAs(base, quaisWallet);
+    await declareQuaiPayout(base, token);
 
     // The robinhood-testnet chain has no allowlist configured — any token is accepted there.
     const onEvm = await req(base, '/v1/links', {

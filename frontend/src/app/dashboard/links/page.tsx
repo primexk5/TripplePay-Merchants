@@ -25,6 +25,7 @@ import {
 import { listCurrencies, findCurrency, NATIVE_CURRENCY } from "@/lib/currencies";
 import { listChains, type ChainInfo } from "@/lib/chains";
 import { useChainSelector } from "@/lib/relayer";
+import { usePayouts } from "@/lib/payouts";
 
 /** Exact decimal-string → smallest-unit conversion (no float math). */
 function toUnits(decimal: string, decimals: number): bigint {
@@ -94,6 +95,10 @@ export default function LinksPage() {
   const [busy, setBusy] = useState(false);
   const [link, setLink] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Where this link's money would actually go. Shown before creation so a merchant is never
+  // surprised by the destination, and used to explain up front why a chain is refusing links.
+  const payouts = usePayouts();
+  const payoutForChain = payouts.find((p) => p.chainId === chain.chainId);
   const [links, setLinks] = useState<LinkInfo[]>([]);
   const [copied, setCopied] = useState<string | null>(null);
   const [loadingLinks, setLoadingLinks] = useState(false);
@@ -216,39 +221,33 @@ export default function LinksPage() {
           </p>
         </div>
 
-        <div className="space-y-5">
-          <section className="rounded-2xl border border-white/7 bg-[#171717] p-6">
+        <div className="space-y-6">
+          <section className="relative overflow-hidden rounded-3xl border border-white/10 bg-gradient-to-b from-[#121212] to-[#0a0a0a] p-1 shadow-2xl">
+            <div className="rounded-[22px] bg-[#171717] p-6 sm:p-8">
             {merchantAddress ? (
-              <div className="space-y-5">
-                {/* Payout wallet — the wallet connected at sign-in, no separate choice */}
-                <div className="rounded-xl border border-white/7 bg-[#171717] px-4 py-3">
-                  <div className="flex items-center justify-between">
-                    <p className="text-sm text-[#8b93a7]">Payout wallet</p>
-                    <Wallet size={14} className="text-[#38bdf8]" />
+              <div className="space-y-8">
+                {/* Sleek Payout Wallet Header */}
+                <div className="flex items-center justify-between rounded-xl bg-white/[0.03] px-4 py-3 border border-white/[0.05]">
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#38bdf8]/10">
+                      <Wallet size={16} className="text-[#38bdf8]" />
+                    </div>
+                    <div>
+                      <p className="text-xs text-[#8b93a7]">Settling to connected wallet</p>
+                      <p className="font-mono text-sm text-white">
+                        {merchantAddress.slice(0, 6)}...{merchantAddress.slice(-4)}
+                      </p>
+                    </div>
                   </div>
-                  <p className="mt-1.5 break-all font-mono text-xs text-white">
-                    {merchantAddress}
-                  </p>
-                  <p className="mt-1 text-xs leading-5 text-[#8b93a7]">
-                    Payments settle straight to this address on whichever chain
-                    each link is created on — a platform fee of 0.3% is deducted
-                    at settlement.
-                  </p>
+                  <div className="hidden sm:block text-right">
+                    <p className="text-xs text-[#8b93a7]">Platform fee: <span className="text-white">0.3%</span></p>
+                  </div>
                 </div>
 
-                <p className="-mt-2 text-xs leading-5 text-[#8b93a7]">
-                  You don&apos;t need to connect a wallet or hold any gas to
-                  publish a link. Each order is created and settled by the
-                  customer&apos;s own payment transaction, and payments arrive
-                  here.
-                </p>
-
-                <div className="grid gap-4 sm:grid-cols-2">
-                  {/* Chain — the feature this phase exists for: a link is fixed to exactly one
-                      chain, chosen here, which then filters the tokens offered below. */}
-                  <div className="sm:col-span-2">
-                    <p className="mb-2 text-sm text-[#8b93a7]">Chain</p>
-                    <div className="flex flex-wrap overflow-hidden rounded-xl border border-white/7">
+                  {/* Chain Selection */}
+                  <div>
+                    <p className="mb-3 text-sm font-medium text-[#c9d4e0]">Select Network</p>
+                    <div className="flex flex-wrap gap-2">
                       {CHAINS.map((c) => (
                         <button
                           key={c.chainId}
@@ -261,17 +260,17 @@ export default function LinksPage() {
                                 ? `${c.name} is temporarily unavailable — contact support.`
                                 : `${c.name} is coming soon`
                           }
-                          className={`flex-1 px-4 py-2.5 text-sm font-medium transition ${
+                          className={`relative flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition-all ${
                             !c.available
-                              ? "cursor-not-allowed bg-[#171717] text-[#4f5868]"
+                              ? "cursor-not-allowed border border-transparent bg-white/5 text-[#4f5868]"
                               : chain.chainId === c.chainId
-                                ? "bg-[#38bdf8] text-[#061018]"
-                                : "bg-[#171717] text-[#8b93a7] hover:text-white"
+                                ? "border border-[#38bdf8]/50 bg-[#38bdf8]/10 text-[#38bdf8] shadow-[0_0_15px_rgba(56,189,248,0.15)]"
+                                : "border border-white/10 bg-transparent text-[#8b93a7] hover:border-white/20 hover:text-white"
                           }`}
                         >
                           {c.name}
                           {!c.available && (
-                            <span className="ml-1.5 text-[10px] uppercase tracking-wider text-[#4f5868]">
+                            <span className="text-[10px] uppercase tracking-wider opacity-60">
                               {c.availability === "misconfigured" ? "Unavailable" : "Soon"}
                             </span>
                           )}
@@ -280,109 +279,107 @@ export default function LinksPage() {
                     </div>
                   </div>
 
-                  {/* Asset — filtered to the chosen chain's currencies. */}
-                  <div className="sm:col-span-2">
-                    <p className="mb-2 text-sm text-[#8b93a7]">Asset on {chain.name}</p>
-                    <div className="flex flex-wrap overflow-hidden rounded-xl border border-white/7">
-                      {CURRENCIES.map((c) => (
-                        <button
-                          key={c.address}
-                          onClick={() => setToken(c.address)}
-                          className={`flex-1 px-4 py-2.5 text-sm font-medium transition ${
-                            token === c.address
-                              ? "bg-[#38bdf8] text-[#061018]"
-                              : "bg-[#171717] text-[#8b93a7] hover:text-white"
-                          }`}
+                  <div className="grid gap-6 sm:grid-cols-2">
+                    {/* Amount & Asset Combined */}
+                    <div className="sm:col-span-2">
+                      <p className="mb-2 text-sm font-medium text-[#c9d4e0]">Amount</p>
+                      <div className="relative flex items-center overflow-hidden rounded-xl border border-white/10 bg-[#0a0a0a] transition-colors focus-within:border-[#38bdf8]/50">
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={amount}
+                          onChange={(e) => setAmount(e.target.value)}
+                          placeholder="0.00"
+                          className="h-14 flex-1 bg-transparent px-4 font-mono text-lg text-white outline-none placeholder:text-[#4f5868]"
+                        />
+                        <div className="h-8 w-[1px] bg-white/10" />
+                        <select
+                          value={token}
+                          onChange={(e) => setToken(e.target.value)}
+                          className="h-14 cursor-pointer appearance-none bg-transparent px-5 py-2 pr-10 font-medium text-white outline-none focus:bg-[#121212]"
+                          style={{
+                            backgroundImage: `url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238b93a7' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e")`,
+                            backgroundRepeat: 'no-repeat',
+                            backgroundPosition: 'right 1rem center',
+                            backgroundSize: '1em',
+                          }}
                         >
-                          {c.symbol}
-                        </button>
-                      ))}
+                          {CURRENCIES.map((c) => (
+                            <option key={c.address} value={c.address} className="bg-[#171717]">
+                              {c.symbol}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+
+                    {/* Shop name */}
+                    <div>
+                      <p className="mb-2 text-sm font-medium text-[#c9d4e0]">
+                        Shop / Display name <span className="text-[#4f5868]">(optional)</span>
+                      </p>
+                      <input
+                        type="text"
+                        value={shopName}
+                        onChange={(e) => setShopName(e.target.value)}
+                        placeholder="e.g. Alice's Coffee Shop"
+                        maxLength={200}
+                        className="h-12 w-full rounded-xl border border-white/10 bg-[#0a0a0a] px-4 text-sm text-white outline-none transition-colors placeholder:text-[#4f5868] focus:border-[#38bdf8]/50"
+                      />
+                    </div>
+
+                    {/* Expiry */}
+                    <div>
+                      <p className="mb-2 text-sm font-medium text-[#c9d4e0]">
+                        Expiry <span className="text-[#4f5868]">(optional)</span>
+                      </p>
+                      <select
+                        value={expiryHours}
+                        onChange={(e) => setExpiryHours(e.target.value)}
+                        className="h-12 w-full cursor-pointer appearance-none rounded-xl border border-white/10 bg-[#0a0a0a] px-4 text-sm text-white outline-none transition-colors focus:border-[#38bdf8]/50"
+                        style={{
+                          backgroundImage: `url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238b93a7' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e")`,
+                          backgroundRepeat: 'no-repeat',
+                          backgroundPosition: 'right 1rem center',
+                          backgroundSize: '1em',
+                        }}
+                      >
+                        <option value="">never expires</option>
+                        <option value="0.25">15 mins</option>
+                        <option value="0.5">30 mins</option>
+                        <option value="1">1 hour</option>
+                        <option value="2">2 hours</option>
+                        <option value="6">6 hours</option>
+                        <option value="12">12 hours</option>
+                        <option value="24">24 hours</option>
+                        <option value="48">48 hours</option>
+                      </select>
                     </div>
                   </div>
 
-                  {/* Amount */}
-                  <div>
-                    <p className="mb-2 text-sm text-[#8b93a7]">Amount</p>
-                    <input
-                      type="text"
-                      inputMode="decimal"
-                      value={amount}
-                      onChange={(e) => setAmount(e.target.value)}
-                      placeholder="25.0"
-                      className="h-11 w-full rounded-xl border border-white/7 bg-[#171717] px-3 font-mono text-sm text-white outline-none transition placeholder:text-[#4f5868] focus:border-[#38bdf8]/40"
-                    />
-                  </div>
-
-                  {/* Expiry */}
-                  <div>
-                    <p className="mb-2 text-sm text-[#8b93a7]">
-                      Expiry (optional)
-                    </p>
-                    <select
-                      value={expiryHours}
-                      onChange={(e) => setExpiryHours(e.target.value)}
-                      className="h-11 w-full rounded-xl border border-white/7 bg-[#171717] px-3 font-mono text-sm text-white outline-none transition focus:border-[#38bdf8]/40 appearance-none"
-                    >
-                      <option value="">never expires</option>
-                      <option value="0.25">15 mins</option>
-                      <option value="0.5">30 mins</option>
-                      <option value="1">1 hour</option>
-                      <option value="2">2 hours</option>
-                      <option value="6">6 hours</option>
-                      <option value="12">12 hours</option>
-                      <option value="24">24 hours</option>
-                      <option value="48">48 hours</option>
-                    </select>
-                  </div>
-
-                  {/* Shop name */}
-                  <div className="sm:col-span-2">
-                    <p className="mb-2 text-sm text-[#8b93a7]">
-                      Shop / Display name (optional)
-                    </p>
-                    <input
-                      type="text"
-                      value={shopName}
-                      onChange={(e) => setShopName(e.target.value)}
-                      placeholder="e.g. Alice's Coffee Shop"
-                      maxLength={200}
-                      className="h-11 w-full rounded-xl border border-white/7 bg-[#171717] px-3 text-sm text-white outline-none transition placeholder:text-[#4f5868] focus:border-[#38bdf8]/40"
-                    />
-                    <p className="mt-1 text-xs text-[#4f5868]">
-                      Shown to customers on the checkout page and receipt.
-                    </p>
-                  </div>
-                </div>
-
                 {/* Multi-pay toggle */}
-                <div className="rounded-xl border border-white/7 bg-[#171717] p-4">
-                  <div className="flex items-start justify-between gap-4">
-                    <div className="flex items-start gap-3">
-                      <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[#38bdf8]/10 text-[#38bdf8]">
-                        <Users size={15} />
+                <div className="rounded-2xl border border-white/10 bg-[#0a0a0a] p-5">
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="flex items-center gap-4">
+                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#38bdf8]/10 text-[#38bdf8]">
+                        <Users size={18} />
                       </div>
                       <div>
-                        <p className="text-sm font-medium text-white">
-                          Multi-pay link
-                        </p>
-                        <p className="mt-1 text-xs text-[#8b93a7]">
-                          Allow multiple customers to pay using the same link.
-                          Each customer&apos;s payment creates its own order in
-                          their transaction — no pool to pre-register and no
-                          gas for you to spend. The same wallet is blocked from
-                          re-paying within 5 minutes.
+                        <p className="text-sm font-medium text-white">Multi-pay Link</p>
+                        <p className="text-xs text-[#8b93a7] mt-0.5">
+                          Allow many customers to pay using this single link.
                         </p>
                       </div>
                     </div>
                     <button
                       onClick={() => setMultiPay((v) => !v)}
-                      className={`relative mt-0.5 h-6 w-11 shrink-0 rounded-full transition-colors ${
+                      className={`relative flex h-7 w-12 shrink-0 cursor-pointer items-center rounded-full transition-colors ${
                         multiPay ? "bg-[#38bdf8]" : "bg-white/10"
                       }`}
                     >
                       <span
-                        className={`absolute top-1 h-4 w-4 rounded-full bg-white shadow transition-transform ${
-                          multiPay ? "translate-x-5" : "translate-x-1"
+                        className={`absolute left-1 h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
+                          multiPay ? "translate-x-5" : "translate-x-0"
                         }`}
                       />
                     </button>
@@ -441,19 +438,50 @@ export default function LinksPage() {
                   </p>
                 )}
 
+                {/* Where this link pays out. Shown before creation so the destination is never a
+                    surprise, and a chain with no address is called out here rather than surfacing
+                    as a failure after the merchant has filled in the form. */}
+                <div className="rounded-xl border border-white/7 bg-[#171717] p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-xs text-[#8b93a7]">Pays out to</p>
+                    {payoutForChain && (
+                      <span className="shrink-0 rounded-full bg-emerald-400/10 px-2.5 py-1 text-xs text-emerald-300">
+                        {payoutForChain.source === "login" ? "Your sign-in wallet" : "Custom address"}
+                      </span>
+                    )}
+                  </div>
+                  {payoutForChain ? (
+                    <p className="mt-2 break-all font-mono text-xs text-white">
+                      {payoutForChain.address}
+                    </p>
+                  ) : (
+                    <p className="mt-2 text-xs text-amber-300">
+                      No payout address set for {chain.name} — links on this network can&apos;t be
+                      created until you add one in{" "}
+                      <a href="/dashboard/settings" className="underline underline-offset-2">
+                        Settings
+                      </a>
+                      .
+                    </p>
+                  )}
+                </div>
+
                 <button
                   onClick={() => void create()}
-                  disabled={busy}
-                  className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-[#38bdf8] px-5 py-3 text-sm font-semibold text-[#061018] transition hover:bg-[#67d8ff] disabled:opacity-50"
+                  disabled={busy || !amount}
+                  className="group relative inline-flex w-full items-center justify-center gap-2 overflow-hidden rounded-xl bg-[#38bdf8] px-5 py-4 text-sm font-semibold text-[#061018] transition-all hover:bg-[#67d8ff] disabled:opacity-50 disabled:hover:bg-[#38bdf8]"
                 >
+                  <div className="absolute inset-0 flex h-full w-full justify-center [transform:skew(-12deg)_translateX(-100%)] group-hover:duration-1000 group-hover:[transform:skew(-12deg)_translateX(100%)]">
+                    <div className="relative h-full w-8 bg-white/20" />
+                  </div>
                   {busy ? (
-                    <Loader2 size={16} className="animate-spin" />
+                    <Loader2 size={18} className="animate-spin" />
                   ) : (
-                    <Plus size={16} />
+                    <Plus size={18} />
                   )}
                   {busy
-                    ? "Creating short link…"
-                    : `Create ${symbol} payment link`}
+                    ? "Generating Link…"
+                    : `Create Link`}
                 </button>
 
                 {link && (
@@ -485,23 +513,28 @@ export default function LinksPage() {
                 )}
               </div>
             ) : (
-              <div className="py-8 text-center text-sm text-[#8b93a7]">
-                {loadingLinks
-                  ? "Loading your payout wallet…"
-                  : error ?? "Sign in with your wallet to create payment links."}
+              <div className="flex flex-col items-center justify-center py-12 text-center">
+                <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-white/5">
+                  <Wallet size={24} className="text-[#8b93a7]" />
+                </div>
+                <p className="text-sm text-[#8b93a7]">
+                  {loadingLinks
+                    ? "Loading your payout wallet…"
+                    : error ?? "Sign in with your wallet to create payment links."}
+                </p>
               </div>
             )}
+            </div>
           </section>
 
           {/* Existing links */}
           {merchantAddress && (
-            <section className="rounded-2xl border border-white/7 bg-[#171717] p-6">
-              <div className="flex items-center justify-between">
+            <section className="rounded-[22px] border border-white/10 bg-[#121212] p-6 sm:p-8">
+              <div className="flex items-center justify-between border-b border-white/5 pb-4">
                 <div>
-                  <h2 className="font-semibold">My payment links</h2>
-                  <p className="mt-1 text-xs text-[#8b93a7]">
-                    Links are stored on the backend — they work on any browser
-                    and device.
+                  <h2 className="text-lg font-semibold text-white">Payment Links</h2>
+                  <p className="text-xs text-[#8b93a7] mt-1">
+                    Your active and past payment links
                   </p>
                 </div>
                 {loadingLinks && (

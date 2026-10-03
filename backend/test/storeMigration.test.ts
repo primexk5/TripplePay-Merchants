@@ -73,7 +73,7 @@ describe('JsonStore — multi-chain migration (existing data must survive unchan
     };
     writeFileSync(path, JSON.stringify({ ...emptyShape, links: { def45678: legacyLink }, orderMeta: {} }));
     const store = new JsonStore(path, DEFAULT_CHAIN_ID);
-    const links = await store.listLinksForMerchant(legacyLink.merchantAddress);
+    const links = await store.listLinksForMerchant(legacyLink.merchantId);
     expect(links).toHaveLength(1);
     expect(links[0]?.chainId).toBe(DEFAULT_CHAIN_ID);
   });

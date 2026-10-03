@@ -15,6 +15,12 @@ import {
   recoverMessageSignerForKind,
   type ChainAddressKind,
 } from '../util/address.js';
+import {
+  resolveSettlementAddress,
+  seedIdentityPayoutAddresses,
+  validatePayoutAddress,
+  InvalidPayoutAddressError,
+} from '../settlement/payout.js';
 import { assertSafeWebhookUrl, UnsafeWebhookUrlError } from '../webhooks/urlGuard.js';
 import { rateLimit } from './rateLimit.js';
 import { cors } from './cors.js';
@@ -79,6 +85,7 @@ interface ResolvedChain {
   id: string;
   chainId: number;
   kind: ChainAddressKind;
+  zone?: string;
   name: string;
   acceptedTokens?: string[];
 }
@@ -160,6 +167,7 @@ export function createServer(
         id: entry.config.id,
         chainId: entry.config.chainId,
         kind: entry.config.kind,
+        zone: entry.config.zone,
         name: entry.config.name,
         acceptedTokens: entry.config.acceptedTokens,
       };
@@ -186,6 +194,7 @@ export function createServer(
           id: e.config.id,
           chainId: e.config.chainId,
           kind: e.config.kind,
+          zone: e.config.zone,
           name: e.config.name,
           acceptedTokens: e.config.acceptedTokens,
         }))
@@ -359,7 +368,11 @@ export function createServer(
     let chainId = defaultChain().chainId;
     if (parsed.data.slug) {
       const link = await store.getLink(parsed.data.slug);
-      if (link && link.merchantAddress === merchant.toLowerCase()) {
+      // Ownership by merchantId: link.merchantAddress is the chain's payout destination and is
+      // frequently NOT the identity address in the URL, so comparing the two would reject a
+      // merchant's own link the moment they set a per-chain payout address.
+      const owner = link ? await store.getMerchantById(link.merchantId) : undefined;
+      if (link && owner && owner.address === merchant.toLowerCase()) {
         slug = link.slug;
         chainId = link.chainId;
       }
@@ -409,6 +422,7 @@ export function createServer(
   app.post('/v1/auth/challenge', authLimiter, asyncHandler(async (req, res) => {
     const parsed = ChallengeSchema.safeParse(req.body);
     if (!parsed.success) {
+      console.log('challenge 400 invalid body', req.body, parsed.error.issues);
       return res.status(400).json({ error: 'invalid body', issues: parsed.error.issues });
     }
     let address: string;
@@ -416,11 +430,13 @@ export function createServer(
       // The merchant's identity is chain-free; the challenge itself still binds to ONE chain
       // (below) so the signature can be verified under that chain's own signing scheme.
       address = normalizeAddressAnyKind(parsed.data.address);
-    } catch {
+    } catch (e) {
+      console.log('challenge 400 bad address', parsed.data.address, e);
       return res.status(400).json({ error: 'address fails checksum validation' });
     }
     const chain = resolveChain(parsed.data.chainId);
     if (!chain) {
+      console.log('challenge 400 bad chain', parsed.data.chainId);
       return res.status(400).json({ error: `unknown or disabled chain "${parsed.data.chainId}"` });
     }
     const nonce = randomBytes(24).toString('hex');
@@ -514,6 +530,15 @@ export function createServer(
       'Set-Cookie',
       sessionCookie('qmsession', token, SESSION_TTL_MS, COOKIE_SECURE, COOKIE_SAME_SITE),
     );
+    // Seed payout addresses from the identity address for any chains the merchant hasn't
+    // configured yet. This is idempotent — existing rows are never overwritten — so it's safe
+    // to call on every login without clobbering anything the merchant configured by hand.
+    if (registry) {
+      const allChains = registry.entries.map((e) => e.config);
+      await seedIdentityPayoutAddresses(store, merchant, allChains, now).catch((err) => {
+        logger.warn({ err, merchantId: merchant.merchantId }, 'failed to seed identity payout addresses');
+      });
+    }
     logger.info({ merchantId: merchant.merchantId, address }, 'merchant logged in');
     res.json({ token, expiresAt: now + SESSION_TTL_MS, merchant: publicMerchant(merchant) });
   }));
@@ -534,7 +559,22 @@ export function createServer(
     const session = res.locals.session as Session;
     const merchant = await store.getMerchantById(session.merchantId);
     if (!merchant) return res.status(404).json({ error: 'merchant not found' });
-    res.json(publicMerchant(merchant));
+    // Include the merchant's per-chain payout map so the dashboard can show it without a
+    // second request. Each entry is enriched with the chain name/kind if the chain is currently
+    // configured on this deployment (it may have been removed since the row was written).
+    const rawPayouts = await store.listPayoutAddresses(merchant.merchantId);
+    const payouts = rawPayouts.map((p) => {
+      const chain = resolveChain(p.chainId);
+      return {
+        chainId: p.chainId,
+        chainName: chain?.name ?? null,
+        chainKind: chain?.kind ?? null,
+        address: p.address,
+        source: p.source,
+        createdAt: p.createdAt,
+      };
+    });
+    res.json({ ...publicMerchant(merchant), payouts });
   }));
 
   app.patch('/v1/me', auth, asyncHandler(async (req, res) => {
@@ -716,10 +756,24 @@ await store.upsertMerchant(updated);
     }
 
     const slug = newSlug();
+    // Where the money lands is resolved PER CHAIN, not taken from the merchant's identity address.
+    // A merchant's login wallet and their payout destination are different things now, so a link's
+    // chain decides whose address gets paid. Refuse rather than guess: paying an address that cannot
+    // receive on this chain loses the funds with no way to recover them.
+    const payoutRows = await store.listPayoutAddresses(merchant.merchantId);
+    const settlementAddress = resolveSettlementAddress(merchant, chain, payoutRows);
+    if (!settlementAddress) {
+      return res.status(400).json({
+        error: `no payout address for ${chain.name}. Add one under Settings → Payout addresses, or pick a different chain.`,
+        chainId: chain.chainId,
+        chainName: chain.name,
+        code: 'payout_address_required',
+      });
+    }
     const link: PaymentLink = {
       slug,
       chainId: chain.chainId,
-      merchantAddress: merchant.address,
+      merchantAddress: settlementAddress,
       merchantId: merchant.merchantId,
       merchantName: merchant.name,
       shopName: d.shopName ?? '',
@@ -751,7 +805,7 @@ await store.upsertMerchant(updated);
     const session = res.locals.session as Session;
     const merchant = await store.getMerchantById(session.merchantId);
     if (!merchant) return res.status(404).json({ error: 'merchant not found' });
-    const links = (await store.listLinksForMerchant(merchant.address)).map((l) => publicLink(l, resolveChain(l.chainId)));
+    const links = (await store.listLinksForMerchant(merchant.merchantId)).map((l) => publicLink(l, resolveChain(l.chainId)));
     res.json({ links });
   }));
 
@@ -1158,10 +1212,26 @@ await store.upsertMerchant(updated);
 
     const slug = newSlug();
     const now = Date.now();
+    // Same per-chain resolution as POST /v1/links: a gateway order pays the merchant's destination
+    // for the gateway chain, not blindly their identity address. Without this a Shopify merchant
+    // using an EVM identity could still be quoted a Quai link that can never deliver.
+    const gatewaySettlement = resolveSettlementAddress(
+      merchant,
+      gatewayChain,
+      await store.listPayoutAddresses(merchant.merchantId),
+    );
+    if (!gatewaySettlement) {
+      return res.status(400).json({
+        error: `no payout address for ${gatewayChain.name}. Add one under Settings → Payout addresses.`,
+        chainId: gatewayChain.chainId,
+        chainName: gatewayChain.name,
+        code: 'payout_address_required',
+      });
+    }
     const link: PaymentLink = {
       slug,
       chainId: gatewayChain.chainId,
-      merchantAddress: merchant.address,
+      merchantAddress: gatewaySettlement,
       merchantId: merchant.merchantId,
       merchantName: merchant.name,
       shopName: merchant.name,
@@ -1181,7 +1251,7 @@ await store.upsertMerchant(updated);
     await store.saveOrderMeta({
       orderId,
       chainId: gatewayChain.chainId,
-      merchantAddress: merchant.address.toLowerCase(),
+      merchantAddress: gatewaySettlement.toLowerCase(),
       customerName: d.customerName,
       source: 'checkout',
       reference: d.reference,
@@ -1218,7 +1288,9 @@ await store.upsertMerchant(updated);
   app.get('/v1/gateway/orders/:gatewayId', merchantAuth, gatewayLimiter, asyncHandler(async (req, res) => {
     const merchant = res.locals.merchant as Merchant;
     const link = await store.getLink(req.params.gatewayId ?? '');
-    if (!link || !link.gatewayOrderId || link.merchantAddress !== merchant.address.toLowerCase()) {
+    // Ownership is by merchantId, never by address: the link's merchantAddress is the payout
+    // destination for its chain, which may not be the merchant's identity address at all.
+    if (!link || !link.gatewayOrderId || link.merchantId !== merchant.merchantId) {
       return res.status(404).json({ error: 'gateway order not found' });
     }
     const meta = await store.getOrderMeta(link.gatewayOrderId);
@@ -1288,6 +1360,99 @@ await store.upsertMerchant(updated);
     const mine = await store.listMerchantApiKeys(merchant.address);
     if (!mine.some((k) => k.keyRef === keyRef)) return res.status(404).json({ error: 'api key not found' });
     await store.revokeMerchantApiKeyByRef(keyRef);
+    res.sendStatus(204);
+  }));
+
+  // --- per-chain payout addresses (self-service) ---
+  // GET  /v1/me/payouts             — list all configured payout destinations
+  // PUT  /v1/me/payouts/:chainId    — set (or replace) one chain's payout address
+  // DELETE /v1/me/payouts/:chainId  — clear one chain's configured address (falls back to identity)
+
+  app.get('/v1/me/payouts', auth, asyncHandler(async (req, res) => {
+    const session = res.locals.session as Session;
+    const merchant = await store.getMerchantById(session.merchantId);
+    if (!merchant) return res.status(404).json({ error: 'merchant not found' });
+    const rows = await store.listPayoutAddresses(merchant.merchantId);
+    const payouts = rows.map((p) => {
+      const chain = resolveChain(p.chainId);
+      return {
+        chainId: p.chainId,
+        chainName: chain?.name ?? null,
+        chainKind: chain?.kind ?? null,
+        address: p.address,
+        source: p.source,
+        createdAt: p.createdAt,
+      };
+    });
+    res.json({ payouts });
+  }));
+
+  const SetPayoutSchema = z.object({
+    address: z.string().min(1).max(100),
+  });
+
+  app.put('/v1/me/payouts/:chainId', auth, asyncHandler(async (req, res) => {
+    const session = res.locals.session as Session;
+    const merchant = await store.getMerchantById(session.merchantId);
+    if (!merchant) return res.status(404).json({ error: 'merchant not found' });
+
+    const chainIdParam = req.params.chainId ?? '';
+    const chain = resolveChain(chainIdParam);
+    if (!chain) {
+      return res.status(400).json({ error: `unknown or disabled chain "${chainIdParam}"` });
+    }
+
+    const parsed = SetPayoutSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'invalid body', issues: parsed.error.issues });
+    }
+
+    let normalized: string;
+    try {
+      normalized = validatePayoutAddress(chain, parsed.data.address);
+    } catch (err) {
+      if (err instanceof InvalidPayoutAddressError) {
+        return res.status(400).json({ error: err.message });
+      }
+      throw err;
+    }
+
+    await store.setPayoutAddress({
+      merchantId: merchant.merchantId,
+      chainId: chain.chainId,
+      address: normalized,
+      source: 'declared',
+      createdAt: Date.now(),
+    });
+    logger.info(
+      { merchantId: merchant.merchantId, chainId: chain.chainId, address: normalized },
+      'payout address updated',
+    );
+    res.json({
+      chainId: chain.chainId,
+      chainName: chain.name,
+      chainKind: chain.kind,
+      address: normalized,
+      source: 'declared',
+    });
+  }));
+
+  app.delete('/v1/me/payouts/:chainId', auth, asyncHandler(async (req, res) => {
+    const session = res.locals.session as Session;
+    const merchant = await store.getMerchantById(session.merchantId);
+    if (!merchant) return res.status(404).json({ error: 'merchant not found' });
+
+    const chainIdParam = req.params.chainId ?? '';
+    const chain = resolveChain(chainIdParam);
+    if (!chain) {
+      return res.status(400).json({ error: `unknown or disabled chain "${chainIdParam}"` });
+    }
+
+    await store.clearPayoutAddress(merchant.merchantId, chain.chainId);
+    logger.info(
+      { merchantId: merchant.merchantId, chainId: chain.chainId },
+      'payout address cleared — falling back to identity address',
+    );
     res.sendStatus(204);
   }));
 
@@ -1370,8 +1535,16 @@ await store.upsertMerchant(updated);
       createdAt: Date.now(),
     };
     await store.upsertMerchant(merchant);
-    // Payments that arrived before this address was registered were recorded as `skipped`, not
-    // lost — re-queue them now so the merchant catches up on anything it missed.
+    // Seed the per-chain payout map from the identity address straight away, so a merchant can
+    // create a link on their own chain immediately after onboarding without visiting Settings.
+    // Idempotent, and only writes chains the identity address is actually valid on.
+    if (registry) {
+      await seedIdentityPayoutAddresses(store, merchant, registry.entries.map((e) => e.config), Date.now()).catch(
+        (err) => {
+          logger.warn({ err, merchantId: merchant.merchantId }, 'failed to seed identity payout addresses');
+        },
+      );
+    }
     const requeued = await store.requeueSkippedForMerchant(merchant);
     logger.info({ merchantId: merchant.merchantId, address, requeued }, 'merchant onboarded');
     // The secret is returned exactly once — the merchant must store it to verify signatures.

@@ -55,7 +55,7 @@ export class QuaiClient implements ChainClient {
   private readonly nodeLocation: number[];
 
   constructor(cfg: Config) {
-    this.provider = new JsonRpcProvider(cfg.RPC_URL, undefined, { usePathing: true });
+    this.provider = new JsonRpcProvider(cfg.RPC_URL, undefined, { usePathing: false });
     this.address = getAddress(cfg.PAYWITHQUAI_ADDRESS);
     // Quai is sharded and provider block queries are zone-scoped. Derive the zone from the
     // contract address (its prefix encodes the zone, e.g. 0x00... = Cyprus-1).

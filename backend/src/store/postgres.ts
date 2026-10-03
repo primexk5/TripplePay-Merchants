@@ -688,10 +688,10 @@ export class PostgresStore implements Store {
     return rows.length ? mapLink(rows[0]!, this.defaultChainId) : undefined;
   }
 
-  async listLinksForMerchant(merchantAddress: string): Promise<PaymentLink[]> {
+  async listLinksForMerchant(merchantId: string): Promise<PaymentLink[]> {
     const { rows } = await this.pool.query(
-      'SELECT * FROM links WHERE merchant_address = $1 ORDER BY created_at DESC',
-      [merchantAddress.toLowerCase()],
+      'SELECT * FROM links WHERE merchant_id = $1 ORDER BY created_at DESC',
+      [merchantId],
     );
     return rows.map((r) => mapLink(r, this.defaultChainId));
   }
