@@ -1,0 +1,46 @@
+# Render blueprint for the relayer (backend).
+#
+# Why this file exists: running `npm run dev` (tsx watch) in production never
+# compiled the TypeScript and left the service crash-looping. The build and start
+# commands below are the ones that actually work, verified by booting
+# `node dist/index.js` with NODE_ENV=production.
+#
+# Secrets are declared `sync: false` so applying this blueprint never overwrites a
+# value already set in the dashboard. Set them once in the dashboard:
+#   ADMIN_API_KEY, DATABASE_URL, RPC_URL, PAYWITHQUAI_ADDRESS, CHAIN_ID, LOGIN_REALM
+services:
+  - type: web
+    name: pay-with-quai-backend
+    runtime: node
+    plan: starter
+    region: oregon
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    # `tsx watch` was never appropriate here; NODE_ENV is set by the platform.
+    envVars:
+      # engines only says ">=20", which lets Render pick a brand-new major on
+      # each deploy. Pin the line the test suite actually runs against locally.
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      # Merchant API keys are stored as HMAC-SHA256(pepper, key) so a database leak
+      # cannot be replayed. Render generates the secret once and keeps it stable
+      # across restarts and replicas; the app refuses to boot without it.
+      - key: API_KEY_PEPPER
+        generateValue: true
+      # Set these in the dashboard. generateValue is deliberately NOT used for
+      # ADMIN_API_KEY: it gates admin routes and the value is shown in our docs.
+      - key: ADMIN_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: RPC_URL
+        sync: false
+      - key: PAYWITHQUAI_ADDRESS
+        sync: false
+      - key: CHAIN_ID
+        sync: false
+      - key: LOGIN_REALM
+        sync: false
