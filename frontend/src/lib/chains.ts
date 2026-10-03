@@ -129,19 +129,38 @@ function logMisconfiguredChains(chains: ChainInfo[]): void {
 // product state — see resolveAvailability. No hardcoded fallback address is given deliberately:
 // papering over a missing NEXT_PUBLIC_PAYWITHQUAI_ADDRESS with a baked-in default would silence
 // exactly the diagnostic this model exists to surface.
+//
+// A deployment that serves Quai mainnet configures it the single-chain way the backend also
+// reads: CHAIN_ID=9 plus NEXT_PUBLIC_PAYWITHQUAI_ADDRESS / NEXT_PUBLIC_RPC_URL. Requiring the
+// dedicated NEXT_PUBLIC_QUAI_MAINNET_* vars instead makes such a deployment report mainnet as
+// "not yet launched", drop it from the chain picker and from `getDefaultChain()`, and strand the
+// login button — all while the backend is happily serving mainnet. So fall back to the legacy
+// vars, but ONLY when NEXT_PUBLIC_CHAIN_ID names mainnet: a testnet deployment sets that same
+// legacy var to its *testnet* contract, and reading it as a mainnet address is precisely the
+// conflation the dedicated vars exist to prevent.
+const quaiMainnetAddress =
+  process.env.NEXT_PUBLIC_QUAI_MAINNET_PAYWITHQUAI_ADDRESS ??
+  (Number(process.env.NEXT_PUBLIC_CHAIN_ID) === 9 ? process.env.NEXT_PUBLIC_PAYWITHQUAI_ADDRESS : undefined);
+const quaiMainnetRpcUrl =
+  process.env.NEXT_PUBLIC_QUAI_MAINNET_RPC_URL ??
+  (Number(process.env.NEXT_PUBLIC_CHAIN_ID) === 9 ? process.env.NEXT_PUBLIC_RPC_URL : undefined);
+const quaiMainnetAddressEnvVar = process.env.NEXT_PUBLIC_QUAI_MAINNET_PAYWITHQUAI_ADDRESS
+  ? "NEXT_PUBLIC_QUAI_MAINNET_PAYWITHQUAI_ADDRESS"
+  : "NEXT_PUBLIC_PAYWITHQUAI_ADDRESS";
+
 const QUAI_MAINNET: ChainInfoInput = {
   chainId: 9,
   slug: "quai",
   name: "Quai (mainnet)",
   kind: "quai",
-  rpcUrl: process.env.NEXT_PUBLIC_QUAI_MAINNET_RPC_URL ?? "https://rpc.quai.network/cyprus1",
-  contractAddress: process.env.NEXT_PUBLIC_QUAI_MAINNET_PAYWITHQUAI_ADDRESS ?? "",
-  addressEnvVar: "NEXT_PUBLIC_QUAI_MAINNET_PAYWITHQUAI_ADDRESS",
+  rpcUrl: quaiMainnetRpcUrl ?? "https://rpc.quai.network/cyprus1",
+  contractAddress: quaiMainnetAddress ?? "",
+  addressEnvVar: quaiMainnetAddressEnvVar,
   explorerUrl: "https://quaiscan.io",
   nativeCurrency: { name: "Quai", symbol: "QUAI", decimals: 18 },
   // When no mainnet address is configured this is intentionally "not yet launched" for this
   // deployment (testnet setup), not a misconfiguration — suppress the startup console.error.
-  launched: !!process.env.NEXT_PUBLIC_QUAI_MAINNET_PAYWITHQUAI_ADDRESS && process.env.NEXT_PUBLIC_QUAI_MAINNET_PAYWITHQUAI_ADDRESS !== "undefined" && process.env.NEXT_PUBLIC_QUAI_MAINNET_PAYWITHQUAI_ADDRESS !== "false",
+  launched: !!quaiMainnetAddress && quaiMainnetAddress !== "undefined" && quaiMainnetAddress !== "false",
 };
 
 // Native-currency assumption: Robinhood Chain testnet's RPC/explorer are standard EVM tooling
