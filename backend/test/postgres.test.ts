@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import type { Merchant, WebhookDelivery, PaymentLink, LinkClaim } from '../src/types.js';
 import { PostgresStore } from '../src/store/postgres.js';
 import { generateApiKey } from '../src/util/apikey.js';
+import { isolatedTestDb, dropTestSchema, REMOTE_DB_TIMEOUT_MS } from './helpers/pgTestDb.js';
 
 /**
  * Behavioral parity suite for {@link PostgresStore} — the same scenarios the JsonStore suite
@@ -9,9 +10,15 @@ import { generateApiKey } from '../src/util/apikey.js';
  *
  * Skipped unless TEST_DATABASE_URL is set. Run locally with, e.g.:
  *   TEST_DATABASE_URL=postgres://user:pass@localhost:5432/relayer_test npm test
+ *
+ * Runs in a private schema (see helpers/pgTestDb.ts) because this suite TRUNCATEs every table:
+ * sharing a database with the other live suite made them fail each other under vitest's parallel
+ * file execution. Timeouts are raised because a remote database pays a round-trip per statement.
  */
+const SCHEMA = 'pgtest_store_parity';
 const url = process.env.TEST_DATABASE_URL;
 const describePg = url ? describe : describe.skip;
+let isolated: string | undefined;
 
 const merchant = (over: Partial<Merchant> = {}): Merchant => ({
   merchantId: 'mch_1',
@@ -81,9 +88,10 @@ describePg('PostgresStore', () => {
   let store: PostgresStore;
 
   beforeAll(async () => {
-    store = new PostgresStore(url!, { ssl: false });
+    isolated = await isolatedTestDb(SCHEMA);
+    store = new PostgresStore(isolated!, { ssl: false });
     await store.init();
-  });
+  }, REMOTE_DB_TIMEOUT_MS);
 
   beforeEach(async () => {
     // Unlike the JsonStore suite (fresh temp file per test), tests here share one database —
@@ -91,11 +99,12 @@ describePg('PostgresStore', () => {
     await store.pool.query(
       `TRUNCATE cursors, merchants, deliveries, sessions, nonces, links, claims, api_keys CASCADE`,
     );
-  });
+  }, REMOTE_DB_TIMEOUT_MS);
 
   afterAll(async () => {
     await store.close();
-  });
+    await dropTestSchema(SCHEMA, isolated);
+  }, REMOTE_DB_TIMEOUT_MS);
 
   it('persists and reads back the cursor, scoped per chain/contract', async () => {
     await store.setCursor('1:0xabc', 100);
@@ -260,7 +269,7 @@ describePg('PostgresStore', () => {
     await store.upsertMerchant(merchant({ address: '0x00000000000000000000000000000000000000e1' }));
     await store.insertDeliveryIfAbsent(delivery('x:0'));
 
-    const s2 = new PostgresStore(url!, { ssl: false });
+    const s2 = new PostgresStore(isolated!, { ssl: false });
     await s2.init();
     expect(await s2.getMerchantByAddress('0x00000000000000000000000000000000000000E1')).toBeDefined();
     expect((await s2.getDelivery('x:0'))?.status).toBe('pending');
@@ -311,4 +320,4 @@ describePg('PostgresStore', () => {
     expect(await store.getMerchantByApiKey(key)).toBeUndefined();
     expect(await store.listMerchantApiKeys(addr)).toHaveLength(0);
   });
-});
+}, REMOTE_DB_TIMEOUT_MS);

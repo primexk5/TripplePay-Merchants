@@ -164,12 +164,16 @@ describe('JsonStore — multi-chain migration (existing data must survive unchan
   });
 });
 
+import { isolatedTestDb, dropTestSchema, REMOTE_DB_TIMEOUT_MS } from './helpers/pgTestDb.js';
+
+const SCHEMA = 'pgtest_chain_migration';
 const url = process.env.TEST_DATABASE_URL;
 const describePg = url ? describe : describe.skip;
 
 describePg('PostgresStore — multi-chain migration', () => {
   it('reads a pre-existing link/order_meta row with NULL chain_id back as the default chain', async () => {
-    const store = new PostgresStore(url!, { ssl: false }, 46630);
+    const isolated = await isolatedTestDb(SCHEMA);
+    const store = new PostgresStore(isolated!, { ssl: false }, 46630);
     await store.init(); // idempotent — safe even if another test file already ran it
     await store.pool.query('DELETE FROM links WHERE slug = $1', ['migrate01']);
     await store.pool.query('DELETE FROM order_meta WHERE order_id = $1', ['0x' + 'aa'.repeat(32)]);
@@ -195,6 +199,7 @@ describePg('PostgresStore — multi-chain migration', () => {
       await store.pool.query('DELETE FROM links WHERE slug = $1', ['migrate01']);
       await store.pool.query('DELETE FROM order_meta WHERE order_id = $1', ['0x' + 'aa'.repeat(32)]);
       await store.close();
+      await dropTestSchema(SCHEMA, isolated);
     }
   });
-});
+}, REMOTE_DB_TIMEOUT_MS);

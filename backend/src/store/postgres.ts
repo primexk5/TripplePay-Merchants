@@ -37,6 +37,7 @@ export class PostgresStore implements Store {
       ssl?: boolean;
       maxConnections?: number;
       rejectUnauthorized?: boolean;
+      connectTimeoutMillis?: number;
     } = {},
     private readonly defaultChainId: number = 9,
     apiKeyPepper: string = '',
@@ -55,7 +56,12 @@ export class PostgresStore implements Store {
       // IPv4-only host like Render resolves nothing and hangs) leaves the Pool retrying forever
       // and the process never reaches `listen`. Failing fast turns that into a boot error the
       // deploy log actually names, instead of a port-scan timeout with no cause.
-      connectionTimeoutMillis: 10_000,
+      //
+      // Generous by default: this bounds ACQUIRING a connection, not the query, and a managed
+      // pooler under load (Supabase's PgBouncer handing out backends) can take well over ten
+      // seconds. At 10s this surfaced as a spurious "Connection terminated due to connection
+      // timeout" in the live store suite while every single query was in fact correct.
+      connectionTimeoutMillis: options.connectTimeoutMillis ?? 30_000,
     });
   }
 

@@ -53,6 +53,7 @@ async function main(): Promise<void> {
             ssl: cfg.DATABASE_SSL,
             maxConnections: cfg.DATABASE_POOL_MAX,
             rejectUnauthorized: cfg.DATABASE_SSL_REJECT_UNAUTHORIZED,
+            connectTimeoutMillis: cfg.DATABASE_CONNECT_TIMEOUT_MS,
           },
           registry.default.config.chainId,
           cfg.API_KEY_PEPPER,

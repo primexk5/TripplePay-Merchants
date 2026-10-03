@@ -145,6 +145,11 @@ const EnvSchema = z.object({
   // (3-5) whenever DATABASE_URL points at Supabase.
   DATABASE_POOL_MAX: z.coerce.number().int().positive().max(100).default(10),
 
+  // How long to wait for a pooled connection before failing. Bounds connection ACQUISITION, not
+  // query execution, so it only needs raising when a managed pooler is slow to hand out a
+  // backend under burst load.
+  DATABASE_CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+
   // Supabase and Railway both present publicly-trusted certificates for their own hostnames, so
   // `rejectUnauthorized: true` does work against them. It stays off by default because some
   // managed-Postgres proxies present chains node can't verify, and turning this on must be a
