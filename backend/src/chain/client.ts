@@ -137,6 +137,14 @@ export class QuaiClient implements ChainClient {
     return this.contract.isSettled!(merchant, orderId) as Promise<boolean>;
   }
 
+  async feeBps(): Promise<number> {
+    return Number(await this.contract.feeBps!());
+  }
+
+  async feeRecipient(): Promise<string> {
+    return getAddress(await this.contract.feeRecipient!());
+  }
+
   async getOrder(merchant: string, orderId: string): Promise<OnChainOrder> {
     const o = await this.contract.getOrder!(merchant, orderId);
     return {

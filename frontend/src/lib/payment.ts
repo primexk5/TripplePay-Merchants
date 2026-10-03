@@ -119,14 +119,22 @@ const REVERT_MESSAGES: Record<string, string> = {
 export async function getRevertReason(
   merchant: string,
   orderId: string,
-  opts: { value?: bigint; token?: string; from: string },
+  opts: {
+    value?: bigint;
+    token?: string;
+    from: string;
+    /** Override for signed orders: probing payOrder would replay a different call (the order
+     *  doesn't exist yet), so the caller supplies the exact method and arguments it used. */
+    method?: string;
+    args?: unknown[];
+  },
 ): Promise<string | null> {
   try {
     const payAddress = resolvePayAddress();
     const token = opts.token;
     const isNative = !token || token.toLowerCase() === ZERO_ADDRESS.toLowerCase();
-    const method = isNative ? "payOrderNative" : "payOrder";
-    const data = payInterface.encodeFunctionData(method, [merchant, orderId]);
+    const method = opts.method ?? (isNative ? "payOrderNative" : "payOrder");
+    const data = payInterface.encodeFunctionData(method, opts.args ?? [merchant, orderId]);
     await getRpcProvider().call({
       to: payAddress,
       from: opts.from,
@@ -904,6 +912,160 @@ export async function payOrderNative(
 }
 
 /**
+ * Customer settles a server-authorized order in ONE transaction: `paySignedOrder` creates the
+ * order on-chain, marks it settled and moves the funds atomically. Nothing had to be registered
+ * beforehand, so the merchant pays no gas to publish a link and the platform pays none either.
+ *
+ * `chain` is optional and dispatches to evmPayment.ts for an "evm"-kind chain; omitted (or a
+ * "quai"-kind chain) takes the Quai path below.
+ */
+export async function paySignedOrder(
+  auth: SignedOrderAuthorization,
+  amount: bigint,
+  chain?: ChainInfo,
+): Promise<string> {
+  if (chain && chain.kind === "evm") {
+    return evmPayment.paySignedOrder(chain, auth, amount);
+  }
+  const wallet = getActiveWallet();
+  if (!wallet) {
+    throw new Error("No wallet connected — connect a wallet first.");
+  }
+  if (wallet.brand === "blip") {
+    return paySignedOrderViaBlip(wallet.provider, auth, amount);
+  }
+
+  // Pelagus / extension path.
+  const signer = await getSigner();
+  const connected = (await signer.getAddress()).toLowerCase();
+  if (connected !== auth.expectedPayer.toLowerCase()) {
+    throw new Error(`This payment was authorized for ${auth.expectedPayer}. Switch to that wallet to pay.`);
+  }
+  const contract = getContract(signer);
+  const order = contractOrder(auth, amount);
+  try {
+    if (auth.token.toLowerCase() !== ZERO_ADDRESS.toLowerCase()) {
+      const approveTx = await new Contract(auth.token, [
+        "function approve(address spender, uint256 amount) returns (bool)",
+      ], signer).approve(resolvePayAddress(), amount);
+      await waitForTxReceipt(approveTx.hash);
+    }
+    const isNative = auth.token.toLowerCase() === ZERO_ADDRESS.toLowerCase();
+    const tx = await contract.paySignedOrder(order, auth.signature, isNative ? { value: amount } : {});
+    return waitForTxReceipt(tx.hash);
+  } catch (err) {
+    const reason = await getRevertReason(auth.merchant, auth.orderId, {
+      token: auth.token,
+      value: amount,
+      from: connected,
+      method: "paySignedOrder",
+      args: [order, auth.signature],
+    }).catch(() => null);
+    if (reason) throw new Error(reason);
+    throw err;
+  }
+}
+
+/** ABI tuple for the SignedOrder struct — field order/types must match PayWithQuai.sol. */
+export function contractOrder(auth: SignedOrderAuthorization, amount: bigint) {
+  return {
+    merchant: auth.merchant,
+    orderId: auth.orderId,
+    token: auth.token,
+    amount,
+    expiry: BigInt(auth.expiry),
+    feeBps: auth.feeBps,
+    feeRecipient: auth.feeRecipient,
+    expectedPayer: auth.expectedPayer,
+  };
+}
+
+/** Same flow as paySignedOrder, inside the Blip browser: raw `quai_sendTransaction` for the
+ *  approve and the settle call (see payOrderViaBlip for why), with an app-wallet funding request
+ *  when either the token balance or the gas cushion is short. */
+async function paySignedOrderViaBlip(
+  provider: Eip1193Provider,
+  auth: SignedOrderAuthorization,
+  amount: bigint,
+): Promise<string> {
+  const payAddress = resolvePayAddress();
+  const net = await ensureQuaiNetwork(provider, QUAI_MAINNET_CHAIN);
+  if (net === "unsupported") {
+    throw new Error("Blip couldn't switch to Quai mainnet — switch networks and retry.");
+  }
+  const from = await blipConnectedAddress(provider);
+  if (from.toLowerCase() !== auth.expectedPayer.toLowerCase()) {
+    throw new Error(`This payment was authorized for ${auth.expectedPayer}. Switch to that wallet in Blip and retry.`);
+  }
+  const isNative = auth.token.toLowerCase() === ZERO_ADDRESS.toLowerCase();
+
+  if (!isNative) {
+    try {
+      const erc20 = new Contract(
+        auth.token,
+        ["function balanceOf(address) view returns (uint256)"],
+        getRpcProvider(),
+      );
+      const bal = (await erc20.balanceOf(from)) as bigint;
+      if (bal < amount) {
+        await requestAppWalletFunding(provider, {
+          chainId: QUAI_MAINNET_CHAIN.chainId,
+          reason: "payment",
+          continueLabel: "Continue payment",
+          assets: [
+            {
+              type: "erc20",
+              token: auth.token,
+              symbol: currencySymbol(auth.token),
+              decimals: currencyDecimals(auth.token),
+              amount: hexQty(amount - bal),
+              purpose: "payment",
+            },
+            {
+              type: "native",
+              symbol: "QUAI",
+              decimals: 18,
+              amountWei: hexQty(BLIP_GAS_CUSHION_WEI),
+              purpose: "gas",
+            },
+          ],
+        });
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name === "BlipFundingError") {
+        const code = (err as { code?: number }).code;
+        throw new BlipNeedsFundsError(
+          code === 4001
+            ? "Top-up declined — this site's app wallet needs more tokens to pay. Fund it in Blip and retry."
+            : "Couldn't top up this site's app wallet with tokens. Make sure your main vault holds enough, then retry.",
+        );
+      }
+      // Balance check failed (RPC hiccup) — proceed; the send surfaces real errors.
+    }
+    await ensureBlipNativeFunding(provider, from, 0n);
+
+    const approveInterface = new Interface([
+      "function approve(address spender, uint256 amount) returns (bool)",
+    ]);
+    const approveHash = await blipSend(provider, {
+      from,
+      to: auth.token,
+      data: approveInterface.encodeFunctionData("approve", [payAddress, amount]),
+    });
+    await waitForTxReceipt(approveHash);
+  } else {
+    await ensureBlipNativeFunding(provider, from, amount);
+  }
+
+  return blipSend(provider, {
+    from,
+    to: payAddress,
+    value: isNative ? hexQty(amount) : undefined,
+    data: payInterface.encodeFunctionData("paySignedOrder", [contractOrder(auth, amount), auth.signature]),
+  });
+}
+
+/**
  * Native payment inside the Blip browser: top up the per-origin app wallet when it can't
  * cover the amount (+ gas cushion), then send through the documented bridge method.
  */
@@ -1134,7 +1296,10 @@ export interface LinkInfo {
   symbol: string;
   expiryDurationSecs: number;
   multiPay: boolean;
-  poolSize: number;
+  /** Customer cap for a multi-pay link (0 = unlimited). */
+  maxRedemptions?: number;
+  /** Legacy only: pre-registered orders still held by a link created before signed orders. */
+  poolSize?: number;
   createdAt: number;
 }
 
@@ -1224,22 +1389,48 @@ export async function linkPaymentProblem(link: LinkInfo, chain?: ChainInfo): Pro
   return null;
 }
 
+/**
+ * A server-signed authorization to create and settle one order. The customer never sees or holds
+ * the signing key: the backend signs this AFTER authenticating the merchant who owns the link, and
+ * the customer's own transaction consumes it. Because it is bound to `expectedPayer`, it is
+ * useless to anyone else — which is exactly what makes it safe to hand to a browser.
+ *
+ * `amount` is a decimal string because this crosses JSON.
+ */
+export interface SignedOrderAuthorization {
+  merchant: string;
+  orderId: string;
+  token: string;
+  amount: string;
+  /** Unix seconds; 0 means it never expires. */
+  expiry: number;
+  feeBps: number;
+  feeRecipient: string;
+  expectedPayer: string;
+  signature: string;
+}
+
 export interface ClaimResult {
   orderId: string;
   merchant: string;
   token: string;
   amount: string;
-  poolRemaining: number;
+  /** Server authorization for lazy order creation. Absent only on legacy links that were
+   *  pre-registered on-chain (or when no signer is configured), where the order already exists. */
+  authorization?: SignedOrderAuthorization;
+  poolRemaining?: number;
   /** Set when the server returned 429 — the retryAfterSecs until they can claim again. */
   retryAfterSecs?: number;
 }
 
 /**
- * Claim an orderId from a short link's pool.
- * - On success: returns the claimed orderId.
- * - On 429 (same wallet within 5 mins): returns the existing orderId from the response so the
- *   customer can still complete payment on their already-claimed order.
- * - On 503 (pool exhausted): throws with a user-friendly message.
+ * Claim an order for a short link.
+ * - On success: returns the orderId, plus a server-signed `authorization` that lets the customer's
+ *   single transaction create AND settle it. Nothing is registered on-chain beforehand, so the
+ *   merchant spends no gas to publish a link.
+ * - On 429 (same wallet within 5 mins): returns the same orderId plus a fresh authorization, so a
+ *   customer who hit an error can retry on their existing order without wasting a redemption.
+ * - On 503 (link fully booked): throws with a user-friendly message.
  */
 export async function claimOrderFromLink(slug: string, payerAddress: string): Promise<ClaimResult> {
   const res = await backendFetch(`/v1/links/${slug}/claim`, {
@@ -1258,7 +1449,7 @@ export async function claimOrderFromLink(slug: string, payerAddress: string): Pr
     body = null;
   }
   if (res.status === 503) {
-    throw new Error('Payment link is fully booked — the merchant needs to add more order slots. Please try again later.');
+    throw new Error('This payment link is no longer available — please ask the merchant for a new link.');
   }
   if (res.status === 404 || res.status === 502 || res.status === 504 || !body) {
     throw new Error('The payment service is waking up — please tap Pay again in a few seconds.');
@@ -1283,7 +1474,11 @@ export async function createPaymentLink(payload: {
   symbol: string;
   expiryDurationSecs: number;
   multiPay: boolean;
-  orderPool: string[];
+  /** Cap on customers for a multi-pay link (0 = unlimited). The backend counts claims, since
+   *  orders are now created lazily and there is no on-chain pool to exhaust. */
+  maxRedemptions?: number;
+  /** Legacy only: pre-registered orderIds. New links send an empty array and never spend gas. */
+  orderPool?: string[];
   chainId?: number;
 }): Promise<LinkInfo> {
   const res = await backendFetch('/v1/links', {

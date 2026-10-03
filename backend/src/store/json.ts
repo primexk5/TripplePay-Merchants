@@ -1,7 +1,9 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, openSync, closeSync, fsyncSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import type { Store } from './index.js';
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey, MerchantApiKeyMeta, MerchantPayoutAddress, PayoutAddressSource, FixedOrderClaimResult } from '../types.js';
+import { hashApiKey, apiKeyRef, constantTimeEqual, DEV_API_KEY_PEPPER } from '../util/apikey.js';
 import { log } from '../logger.js';
 
 const logger = log('store');
@@ -16,6 +18,17 @@ interface FileShape {
   claims: Record<string, LinkClaim[]>;  // key: slug — array of all claims for that link
   orderMeta: Record<string, OrderMeta>; // key: lowercased orderId
   qiOrders: Record<string, QiOrder>;    // key: lowercased orderId
+  apiKeys: Record<string, MerchantApiKey>; // key: keyHash
+  /** Per-chain payout destinations, keyed `${merchantId}:${chainId}`. */
+  payoutAddresses: Record<string, MerchantPayoutAddress>;
+  /** Pre-hashing rows: key -> merchantAddress. Migrated to `apiKeys` on first successful use and
+   *  then deleted, so an existing database.json keeps working without a manual migration step. */
+  legacyApiKeys?: Record<string, string>;
+}
+
+/** Map key for one merchant's payout destination on one chain. */
+function payoutKey(merchantId: string, chainId: number): string {
+  return `${merchantId}:${chainId}`;
 }
 
 /** Case-insensitive lookup key binding a delivery to its (merchant, orderId). */
@@ -39,6 +52,9 @@ export class JsonStore implements Store {
   private readonly path: string;
   private readonly tmpPath: string;
   private data: FileShape;
+  /** Keyed-hash pepper for API keys. Optional so existing single-arg call sites keep working;
+   *  production always passes cfg.API_KEY_PEPPER (see index.ts). */
+  private readonly apiKeyPepper: string;
   private readonly byMerchantId = new Map<string, string>(); // merchantId -> address key
   private readonly byOrderKey = new Map<string, string>(); // "<merchant>:<orderId>" -> delivery id
 
@@ -46,8 +62,13 @@ export class JsonStore implements Store {
    *  of its own) is read back as. Optional so `new JsonStore(path)` keeps working exactly as
    *  before for every existing caller/test; production always passes the real default chain's
    *  chainId (see index.ts). */
-  constructor(path: string, private readonly defaultChainId: number = 9) {
+  constructor(
+    path: string,
+    private readonly defaultChainId: number = 9,
+    apiKeyPepper: string = '',
+  ) {
     this.path = path;
+    this.apiKeyPepper = apiKeyPepper || DEV_API_KEY_PEPPER;
     this.tmpPath = `${path}.tmp`;
     // 0700: this file holds plaintext webhook secrets (see class note) — keep the whole directory
     // owner-only. mode is masked by umask on creation and is a no-op if the dir already exists.
@@ -81,7 +102,7 @@ export class JsonStore implements Store {
   }
 
   private read(): FileShape {
-    if (!existsSync(this.path)) return { cursors: {}, merchants: {}, deliveries: {}, sessions: {}, nonces: {}, links: {}, claims: {}, orderMeta: {}, qiOrders: {} };
+    if (!existsSync(this.path)) return { cursors: {}, merchants: {}, deliveries: {}, sessions: {}, nonces: {}, links: {}, claims: {}, orderMeta: {}, qiOrders: {}, apiKeys: {}, payoutAddresses: {} };
     try {
       const parsed = JSON.parse(readFileSync(this.path, 'utf8')) as {
         cursor?: number | null;
@@ -113,6 +134,26 @@ export class JsonStore implements Store {
       for (const [id, d] of Object.entries(parsed.deliveries ?? {})) {
         deliveries[id] = this.withChainId(d);
       }
+      // API-key hashing migration. Before this change `apiKeys` was a map of plaintext credential ->
+      // record. Those rows are un-hashable here (the pepper lives in the environment, not the
+      // file), so move them to `legacyApiKeys` keyed by plaintext and let getMerchantByApiKey()
+      // upgrade each one in place the first time its owner actually presents it. Rows already in
+      // the new shape carry a keyHash and pass straight through.
+      const apiKeys: Record<string, MerchantApiKey> = {};
+      const legacyApiKeys: Record<string, string> = { ...((parsed as Partial<FileShape>).legacyApiKeys ?? {}) };
+      for (const [k, rec] of Object.entries((parsed as { apiKeys?: Record<string, unknown> }).apiKeys ?? {})) {
+        const r = rec as Partial<MerchantApiKey> & { key?: string };
+        if (typeof r?.keyHash === 'string' && r.keyHash.length > 0) {
+          apiKeys[k] = rec as MerchantApiKey;
+        } else if (typeof r?.merchantAddress === 'string' && typeof r?.key === 'string') {
+          legacyApiKeys[r.key] = r.merchantAddress ?? '';
+        } else {
+          logger.warn({ entry: k }, 'dropping unrecognised apiKeys entry during migration');
+        }
+      }
+      if (Object.keys(legacyApiKeys).length > 0) {
+        logger.warn({ count: Object.keys(legacyApiKeys).length }, 'found legacy plaintext API keys — they will be hashed on first use');
+      }
       return {
         cursors: parsed.cursors ?? {},
         merchants: parsed.merchants ?? {},
@@ -123,6 +164,11 @@ export class JsonStore implements Store {
         claims: (parsed as Partial<FileShape>).claims ?? {},
         orderMeta,
         qiOrders: (parsed as Partial<FileShape>).qiOrders ?? {},
+        apiKeys: apiKeys,
+        legacyApiKeys: legacyApiKeys,
+        // Absent on every file written before per-chain payouts existed — the settlement resolver
+        // falls back to the merchant's identity address, so those merchants keep working untouched.
+        payoutAddresses: (parsed as Partial<FileShape>).payoutAddresses ?? {},
       };
     } catch (err) {
       throw new Error(`Failed to read store at ${this.path}: ${(err as Error).message}`);
@@ -189,6 +235,46 @@ export class JsonStore implements Store {
     return this.data.merchants[address.toLowerCase()];
   }
 
+  async getMerchantByPayoutAddress(chainId: number, address: string): Promise<Merchant | undefined> {
+    const addr = address.toLowerCase();
+    for (const m of Object.values(this.data.merchants)) {
+      const rows = await this.listPayoutAddresses(m.merchantId);
+      const hit = rows.find((r) => r.chainId === chainId && r.address === addr);
+      if (hit) return m;
+      // Legacy fallback: a merchant with no configured row for this chain still receives at their
+      // identity address. The chain-kind check lives in the resolver, not here, so the store stays
+      // a dumb lookup and cannot disagree with it about which chains an address serves.
+      if (!rows.some((r) => r.chainId === chainId) && m.address === addr) return m;
+    }
+    return undefined;
+  }
+
+  async listPayoutAddresses(merchantId: string): Promise<MerchantPayoutAddress[]> {
+    return Object.values(this.data.payoutAddresses).filter((r) => r.merchantId === merchantId);
+  }
+
+  async setPayoutAddress(p: {
+    merchantId: string;
+    chainId: number;
+    address: string;
+    source: PayoutAddressSource;
+    createdAt: number;
+  }): Promise<void> {
+    this.data.payoutAddresses[payoutKey(p.merchantId, p.chainId)] = {
+      merchantId: p.merchantId,
+      chainId: p.chainId,
+      address: p.address.toLowerCase(),
+      source: p.source,
+      createdAt: p.createdAt,
+    };
+    this.flush();
+  }
+
+  async clearPayoutAddress(merchantId: string, chainId: number): Promise<void> {
+    delete this.data.payoutAddresses[payoutKey(merchantId, chainId)];
+    this.flush();
+  }
+
   async getMerchantById(merchantId: string): Promise<Merchant | undefined> {
     const key = this.byMerchantId.get(merchantId);
     return key ? this.data.merchants[key] : undefined;
@@ -196,6 +282,84 @@ export class JsonStore implements Store {
 
   async listMerchants(): Promise<Merchant[]> {
     return Object.values(this.data.merchants);
+  }
+
+  // --- merchant API keys ---
+
+  async createMerchantApiKey(k: {
+    key: string;
+    merchantAddress: string;
+    label: string;
+    createdAt: number;
+  }): Promise<{ keyRef: string }> {
+    const keyHash = hashApiKey(k.key, this.apiKeyPepper);
+    const keyRef = apiKeyRef(keyHash);
+    this.data.apiKeys[keyHash] = {
+      keyHash,
+      keyRef,
+      merchantAddress: k.merchantAddress.toLowerCase(),
+      label: k.label,
+      createdAt: k.createdAt,
+      lastUsedAt: 0,
+    };
+    this.flush();
+    return { keyRef };
+  }
+
+  async getMerchantByApiKey(key: string): Promise<Merchant | undefined> {
+    const hash = hashApiKey(key, this.apiKeyPepper);
+    const rec = this.data.apiKeys[hash];
+    if (rec) {
+      this.touchApiKey(hash);
+      return this.data.merchants[rec.merchantAddress];
+    }
+
+    // Legacy: keys issued before hashing were stored as plaintext. Accept one, then rewrite it in
+    // place as a hash so the plaintext copy is gone from disk on the very next boot. The merchant
+    // keeps using the same credential, so this needs no coordination.
+    const legacy = this.data.legacyApiKeys;
+    const legacyAddr = legacy?.[key];
+    if (legacy && legacyAddr) {
+      this.data.apiKeys[hash] = {
+        keyHash: hash,
+        keyRef: apiKeyRef(hash),
+        merchantAddress: legacyAddr.toLowerCase(),
+        label: '(migrated)',
+        createdAt: Date.now(),
+        lastUsedAt: Date.now(),
+      };
+      delete legacy[key];
+      this.flush();
+      logger.warn({ merchantAddress: legacyAddr }, 'migrated legacy plaintext API key to hashed form');
+      return this.data.merchants[legacyAddr.toLowerCase()];
+    }
+    return undefined;
+  }
+
+  async listMerchantApiKeys(merchantAddress: string): Promise<MerchantApiKeyMeta[]> {
+    const addr = merchantAddress.toLowerCase();
+    return Object.values(this.data.apiKeys)
+      .filter((k) => k.merchantAddress === addr)
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .map(({ keyRef, label, createdAt, lastUsedAt }) => ({ keyRef, label, createdAt, lastUsedAt }));
+  }
+
+  async revokeMerchantApiKeyByRef(keyRef: string): Promise<void> {
+    for (const [hash, rec] of Object.entries(this.data.apiKeys)) {
+      if (constantTimeEqual(rec.keyRef, keyRef)) {
+        delete this.data.apiKeys[hash];
+        this.flush();
+        return;
+      }
+    }
+  }
+
+  /** Best-effort last-used stamp; never worth failing a request over. */
+  private touchApiKey(hash: string): void {
+    const rec = this.data.apiKeys[hash];
+    if (!rec) return;
+    rec.lastUsedAt = Date.now();
+    this.flush();
   }
 
   async insertDeliveryIfAbsent(d: WebhookDelivery): Promise<boolean> {
@@ -384,6 +548,35 @@ export class JsonStore implements Store {
     return orderId;
   }
 
+  async mintClaimedOrder(
+    slug: string,
+    payerAddress: string,
+    maxRedemptions: number,
+  ): Promise<string | undefined> {
+    const link = this.data.links[slug];
+    if (!link) return undefined;
+    const existing = this.data.claims[slug] ?? [];
+    if (maxRedemptions > 0 && existing.length >= maxRedemptions) return undefined;
+    // Random rather than sequential: orderIds are unguessable ledger keys, and a customer must
+    // never be able to predict the next one and pre-emptively claim it.
+    const orderId = '0x' + randomBytes(32).toString('hex');
+    const claim: LinkClaim = {
+      slug,
+      orderId,
+      payerAddress: payerAddress.toLowerCase(),
+      claimedAt: Date.now(),
+      settled: false,
+    };
+    if (!this.data.claims[slug]) this.data.claims[slug] = [];
+    this.data.claims[slug]!.push(claim);
+    this.flush();
+    return orderId;
+  }
+
+  async listClaims(slug: string): Promise<LinkClaim[]> {
+    return [...(this.data.claims[slug] ?? [])].sort((a, b) => a.claimedAt - b.claimedAt);
+  }
+
   async reclaimStaleClaim(slug: string, payerAddress: string, olderThanMs: number): Promise<string | undefined> {
     const claims = this.data.claims[slug];
     if (!claims) return undefined;
@@ -415,6 +608,34 @@ export class JsonStore implements Store {
     this.flush();
   }
 
+  async claimFixedOrder(
+    slug: string,
+    orderId: string,
+    payerAddress: string,
+    staleAfterMs: number,
+  ): Promise<FixedOrderClaimResult> {
+    if (!this.data.claims[slug]) this.data.claims[slug] = [];
+    const list = this.data.claims[slug]!;
+    const idx = list.findIndex((c) => c.orderId === orderId);
+    const payer = payerAddress.toLowerCase();
+    if (idx === -1) {
+      list.push({ slug, orderId, payerAddress: payer, claimedAt: Date.now(), settled: false });
+      this.flush();
+      return { status: 'claimed' };
+    }
+    const existing = list[idx]!;
+    if (existing.settled) return { status: 'settled' };
+    const age = Date.now() - existing.claimedAt;
+    // Same wallet re-claiming, or a claim abandoned long enough ago: both hand the id over and
+    // refresh the timestamp so the current attempt isn't recycled out from under the customer.
+    if (existing.payerAddress === payer || age >= staleAfterMs) {
+      list[idx] = { ...existing, payerAddress: payer, claimedAt: Date.now() };
+      this.flush();
+      return { status: 'claimed' };
+    }
+    return { status: 'taken' };
+  }
+
   async getLatestClaim(slug: string, payerAddress: string): Promise<LinkClaim | undefined> {
     const claims = this.data.claims[slug];
     if (!claims) return undefined;
@@ -427,7 +648,15 @@ export class JsonStore implements Store {
   // --- order metadata ---
 
   async saveOrderMeta(meta: OrderMeta): Promise<void> {
-    this.data.orderMeta[meta.orderId] = meta;
+    const key = meta.orderId.toLowerCase();
+    const existing = this.data.orderMeta[key];
+    // Gateway order creation writes the merchant's shop `reference`; later writes (checkout name /
+    // link slug) don't carry one — preserve the reference rather than silently dropping it.
+    if (existing && existing.reference !== undefined && meta.reference === undefined) {
+      this.data.orderMeta[key] = { ...meta, reference: existing.reference };
+    } else {
+      this.data.orderMeta[key] = { ...meta, orderId: key };
+    }
     this.flush();
   }
 
@@ -454,6 +683,13 @@ export class JsonStore implements Store {
 
   async listQiOrders(): Promise<QiOrder[]> {
     return Object.values(this.data.qiOrders);
+  }
+
+  async listQiOrdersByMerchant(merchantAddress: string): Promise<QiOrder[]> {
+    const addr = merchantAddress.toLowerCase();
+    return Object.values(this.data.qiOrders)
+      .filter((o) => o.merchantAddress === addr)
+      .sort((a, b) => b.createdAt - a.createdAt);
   }
 
   async markQiOrderSettled(orderId: string, receivedQits: string, txHashes: string[]): Promise<QiOrder | undefined> {

@@ -53,7 +53,7 @@ export const QUAI_MAINNET_CHAIN = {
   rpcUrls: [
     process.env.NEXT_PUBLIC_RPC_URL ?? "https://rpc.quai.network/cyprus1",
   ],
-  blockExplorerUrls: ["https://quaiscan.io"],
+  blockExplorerUrls: ["https://explorer.qu.ai"],
 };
 
 export type ChainConfig = typeof QUAI_MAINNET_CHAIN;

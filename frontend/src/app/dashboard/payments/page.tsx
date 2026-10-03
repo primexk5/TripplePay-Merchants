@@ -1,27 +1,34 @@
 "use client";
 
-import { ArrowUpRight, ChevronDown, Search } from "lucide-react";
+import { ArrowUpRight, ChevronDown, Coins, Search } from "lucide-react";
 import { Fragment, useState } from "react";
 import { DashboardShell } from "@/components/layout/dashboard-shell";
 import { StatusBadge } from "@/components/ui/status-badge";
+import { isLoggedIn } from "@/lib/auth";
 import {
   formatDeliveryAmount,
   formatTimestamp,
   deliveryExplorerUrl,
   useRelayerData,
+  useQiRecon,
 } from "@/lib/relayer";
+import { qitsToQi } from "@/lib/qi";
 
 const STATUSES = ["all", "delivered", "pending", "failed"] as const;
 type StatusFilter = (typeof STATUSES)[number];
 
 export default function PaymentsPage() {
   const { deliveries, merchants, loading, error } = useRelayerData();
+  const qiRecon = useQiRecon();
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<StatusFilter>("all");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   // Webhook delivery info is only meaningful for merchants with a receiver URL; link-only
   // sellers (no website) see pure on-chain confirmation instead.
   const usesWebhook = merchants.some((m) => m.webhookUrl);
+  // /v1/me/qi is merchant-scoped (no demo/admin route), so the Qi ledger only means anything
+  // when there's a real merchant session behind the page.
+  const merchantMode = isLoggedIn();
 
   const filtered = deliveries.filter((d) => {
     if (status !== "all" && d.status !== status) return false;
@@ -44,7 +51,7 @@ export default function PaymentsPage() {
           </h1>
           <p className="mt-2 text-sm text-[#8b93a7]">
             {usesWebhook
-              ? "Every row is a confirmed on-chain settlement. The status filter tracks webhook delivery to your endpoint."
+              ? "Every row is a confirmed on-chain or Qi settlement. The status filter tracks webhook delivery to your endpoint."
               : "Every row is a settlement confirmed on-chain — funds are already in your wallet."}
           </p>
         </div>
@@ -52,6 +59,74 @@ export default function PaymentsPage() {
         {error && (
           <div className="mb-6 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-600">
             Relayer unreachable: {error}
+          </div>
+        )}
+
+
+        {merchantMode && qiRecon.recon && qiRecon.recon.summary.total > 0 && (
+          <div className="mb-6 rounded-2xl border border-white/7 bg-[#171717] p-5">
+            <div className="flex items-center gap-2 text-sm font-medium text-white">
+              <Coins size={16} className="text-[#ddff56]" />
+              Qi (UTXO) ledger
+            </div>
+            <p className="mt-1 text-xs text-[#8b93a7]">
+              Quai&apos;s UTXO settlements — customers send Qi to one-time receive
+              addresses per order.
+            </p>
+            <div className="mt-4 grid grid-cols-2 gap-x-6 gap-y-3 text-xs sm:grid-cols-4">
+              <div>
+                <p className="text-[#8b93a7]">Total Qi orders</p>
+                <p className="mt-0.5 text-lg font-semibold text-white">
+                  {qiRecon.recon.summary.total}
+                </p>
+              </div>
+              <div>
+                <p className="text-[#8b93a7]">Settled</p>
+                <p className="mt-0.5 text-lg font-semibold text-emerald-300">
+                  {qiRecon.recon.summary.settled}
+                </p>
+              </div>
+              <div>
+                <p className="text-[#8b93a7]">Pending</p>
+                <p className="mt-0.5 text-lg font-semibold text-amber-300">
+                  {qiRecon.recon.summary.pending}
+                </p>
+              </div>
+              <div>
+                <p className="text-[#8b93a7]">Accrued (payable)</p>
+                <p className="mt-0.5 text-lg font-semibold text-[#ddff56]">
+                  {qitsToQi(qiRecon.recon.summary.qitsReceived)} Qi
+                </p>
+              </div>
+            </div>
+            {qiRecon.recon.orders.length > 0 && (
+              <div className="mt-4 space-y-2 overflow-y-auto max-h-40 text-xs">
+                {qiRecon.recon.orders.map((o) => (
+                  <div key={o.orderId} className="flex items-center justify-between rounded-lg border border-white/7 bg-[#0F1116] px-3 py-2">
+                    <div className="flex items-center gap-3">
+                      <StatusBadge status={o.settled ? "confirmed" : "pending"} />
+                      <div>
+                        <p className="font-mono text-[11px] text-[#8b93a7]">
+                          {o.orderId.slice(0, 14)}…
+                        </p>
+                        <p className="mt-0.5 font-mono text-[10px] text-[#4f5868] break-all">
+                          {o.address}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <p className="font-medium text-white">
+                        {qitsToQi(o.settled ? o.receivedQits : o.qits)} Qi
+                      </p>
+                      <p className="mt-0.5 text-[11px] text-[#8b93a7]">
+                        {o.settled ? "settled" : "awaiting"}
+                        {o.meta.shopName ? ` · ${o.meta.shopName}` : ""}
+                      </p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
@@ -255,8 +330,41 @@ export default function PaymentsPage() {
                               </p>
                             </div>
                             <div>
-                              <p className="text-[#8b93a7]">Tx hash</p>
-                              {explorerUrl ? (
+                              <p className="text-[#8b93a7]">
+                                {d.payload.data.token === "qi" ? "UTXO tx hashes" : "Tx hash"}
+                              </p>
+                              {d.payload.data.token === "qi" ? (
+                                (d.payload.data.qi?.txHashes ?? []).length === 0 ? (
+                                  <p className="mt-0.5 font-mono text-[11px] text-[#8b93a7]">none yet</p>
+                                ) : (
+                                  <div className="mt-0.5 space-y-1">
+                                    {d.payload.data.qi!.txHashes.slice(0, 3).map((h, i) => {
+                                      const hUrl = deliveryExplorerUrl(d.payload.data.chainId, h);
+                                      return hUrl ? (
+                                        <a
+                                          key={i}
+                                          href={hUrl}
+                                          target="_blank"
+                                          rel="noreferrer"
+                                          onClick={(e) => e.stopPropagation()}
+                                          className="block truncate font-mono text-[11px] text-[#38bdf8] hover:text-[#67d8ff]"
+                                        >
+                                          {h}
+                                        </a>
+                                      ) : (
+                                        <p key={i} className="truncate font-mono text-[11px] text-[#ddff56]">
+                                          {h}
+                                        </p>
+                                      );
+                                    })}
+                                    {d.payload.data.qi!.txHashes.length > 3 && (
+                                      <p className="text-[10px] text-[#4f5868]">
+                                        +{d.payload.data.qi!.txHashes.length - 3} more
+                                      </p>
+                                    )}
+                                  </div>
+                                )
+                              ) : explorerUrl ? (
                                 <a
                                   href={explorerUrl}
                                   target="_blank"
@@ -272,6 +380,18 @@ export default function PaymentsPage() {
                                 </p>
                               )}
                             </div>
+                            {d.payload.data.token === "qi" && d.payload.data.qi && (
+                              <div>
+                                <p className="text-[#8b93a7]">Qi settlement</p>
+                                <p className="mt-0.5 font-mono text-[11px] text-white">
+                                  received{" "}
+                                  <span className="font-medium text-[#ddff56]">
+                                    {qitsToQi(d.payload.data.qi.receivedQits)} Qi
+                                  </span>{" "}
+                                  of {qitsToQi(d.payload.data.qi.qits)} Qi required
+                                </p>
+                              </div>
+                            )}
                           </div>
                         </td>
                       </tr>

@@ -8,10 +8,14 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {EIP712Upgradeable} from "@openzeppelin/contracts-upgradeable/utils/cryptography/EIP712Upgradeable.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 /// @title  PayWithQuai
 /// @notice Non-custodial merchant payment router for the "Pay with Quai" checkout system.
-///         Merchants pre-register orders; customers settle them in a single transaction. Funds
+///         Orders are created and settled by the customer in a single transaction: either a
+///         pre-registered order via `payOrder`, or an off-chain EIP-712 authorization from a
+///         trusted signer consumed by `paySignedOrder`. Funds
 ///         are forwarded immediately, and orders are marked settled to block double-fulfillment.
 /// @dev    UUPS implementation behind an ERC-1967 proxy. State lives in an ERC-7201 namespaced
 ///         struct (`_s()`); it is append-only across upgrades — never remove or reorder fields.
@@ -21,7 +25,8 @@ contract PayWithQuai is
     UUPSUpgradeable,
     Ownable2StepUpgradeable,
     PausableUpgradeable,
-    ReentrancyGuardUpgradeable
+    ReentrancyGuardUpgradeable,
+    EIP712Upgradeable
 {
     using SafeERC20 for IERC20;
 
@@ -55,6 +60,27 @@ contract PayWithQuai is
         uint64 nonce;         // per-merchant counter; distinguishes order-id reuse after purge
     }
 
+    /// @dev An order that does not exist on-chain yet. Produced off-chain by a trusted signer and
+    /// consumed by `paySignedOrder`, which creates and settles it in the customer's one
+    /// transaction — so the merchant never has to pre-register (and pay gas for) order slots.
+    /// Every field is committed by the signature: the payer cannot lower `amount`, retarget
+    /// `merchant`/`feeRecipient`, extend `expiry`, or drop `expectedPayer`.
+    struct SignedOrder {
+        address merchant;     // payout wallet; funds are forwarded here on settlement
+        bytes32 orderId;      // caller-chosen ledger id; unique per merchant while the order exists
+        address token;        // ERC-20 address, or NATIVE for native QUAI
+        uint256 amount;       // exact amount the payer owes, in the token's smallest unit
+        uint256 expiry;       // unix time after which the authorization is void; 0 = never
+        uint16 feeBps;        // fee locked in by the signer
+        address feeRecipient; // fee destination, locked in by the signer
+        address expectedPayer; // address(0) = anyone may pay; otherwise only this payer
+    }
+
+    /// @dev keccak256("SignedOrder(address merchant,bytes32 orderId,address token,uint256 amount,"
+    ///      "uint256 expiry,uint16 feeBps,address feeRecipient,address expectedPayer)")
+    bytes32 private constant SIGNED_ORDER_TYPEHASH =
+        0xfbae4a679a7032b61a424ab9ef7f70c17a0d5113f9096d8c5cc5538fbfc55007;
+
     /// @custom:storage-location erc7201:paywithquai.main
     /// @dev All mutable state. Append-only across upgrades — never remove/reorder.
     struct MainStorage {
@@ -64,6 +90,7 @@ contract PayWithQuai is
         uint96 feeBps;                          // current platform fee in bps
         mapping(address => uint64) orderNonces; // per-merchant order nonce counter
         address pauseGuardian;                  // may call pause() but never unpause()
+        mapping(address => bool) relayers;      // e-commerce gateway agents (gasless registration)
     }
 
     // keccak256(abi.encode(uint256(keccak256("paywithquai.main")) - 1)) & ~bytes32(uint256(0xff))
@@ -73,6 +100,24 @@ contract PayWithQuai is
     function _s() private pure returns (MainStorage storage $) {
         assembly {
             $.slot := MAIN_STORAGE_LOCATION
+        }
+    }
+
+    /// @custom:storage-location erc7201:paywithquai.signing
+    /// @dev New state introduced by the signed-order module, kept in its own ERC-7201 namespace so
+    ///      an upgrade can never disturb `paywithquai.main` (same pattern the V2 mock documents).
+    ///      The EIP-712 domain name/version live in OpenZeppelin's own namespace, separate again.
+    struct SigningStorage {
+        mapping(address => bool) signers; // may sign SignedOrder authorizations
+    }
+
+    // keccak256(abi.encode(uint256(keccak256("paywithquai.signing")) - 1)) & ~bytes32(uint256(0xff))
+    bytes32 private constant SIGNING_STORAGE_LOCATION =
+        0x910c421bf8c63fedb18cf38a71064519126b56849967a918fadef62aa76ee200;
+
+    function _sig() private pure returns (SigningStorage storage $) {
+        assembly {
+            $.slot := SIGNING_STORAGE_LOCATION
         }
     }
 
@@ -123,6 +168,8 @@ contract PayWithQuai is
     event FeeConfigUpdated(uint96 feeBps, address feeRecipient);
     event AcceptedTokenUpdated(address indexed token, bool accepted);
     event PauseGuardianUpdated(address indexed guardian);
+    event RelayerUpdated(address indexed relayer, bool enabled);
+    event SignerUpdated(address indexed signer, bool enabled);
 
     /// @notice Emitted when the owner sweeps stray funds from the contract.
     event TokensRescued(address indexed token, address indexed to, uint256 amount);
@@ -144,6 +191,9 @@ contract PayWithQuai is
     error ZeroAddress();
     error NativeTransferFailed();
     error ReceiveRejected();
+    error NotRelayer();
+    error InvalidSignature();
+    error SigningNotInitialized();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -255,6 +305,29 @@ contract PayWithQuai is
         _registerOrder(orderId, token, amount, expiry, expectedPayer);
     }
 
+    /// @notice Trusted relayer registers an order on a merchant's behalf — the gasless gateway
+    ///         flow. Shop checkouts are quoted and prepaid with gas by the platform relayer, so an
+    ///         e-commerce merchant never needs QUAI in their payout wallet just to register orders.
+    /// @dev    Only addresses in the relayer set (owner-managed) may call this. The
+    ///         (merchant, orderId) key stays unforgeable: settlements still forward to `merchant`,
+    ///         and a relayer can neither pay out nor settle any order.
+    /// @param merchant payout wallet the order belongs to (must be non-zero)
+    /// @param orderId  unique id generated by the merchant backend
+    /// @param token    ERC-20 token, or NATIVE for native QUAI; must be accepted
+    /// @param amount   exact amount owed, in the token's smallest unit
+    /// @param expiry   unix time after which the order can't be paid; 0 = never
+    function registerOrderFor(
+        address merchant,
+        bytes32 orderId,
+        address token,
+        uint256 amount,
+        uint256 expiry
+    ) external whenNotPaused {
+        if (!_s().relayers[msg.sender]) revert NotRelayer();
+        if (merchant == address(0)) revert ZeroAddress();
+        _registerOrderFor(merchant, orderId, token, amount, expiry, address(0));
+    }
+
     function _registerOrder(
         bytes32 orderId,
         address token,
@@ -262,12 +335,24 @@ contract PayWithQuai is
         uint256 expiry,
         address expectedPayer
     ) private whenNotPaused {
+        _registerOrderFor(msg.sender, orderId, token, amount, expiry, expectedPayer);
+    }
+
+    /// @dev Shared registration core: merchant- or relayer-authoritative, depending on the caller.
+    function _registerOrderFor(
+        address merchant,
+        bytes32 orderId,
+        address token,
+        uint256 amount,
+        uint256 expiry,
+        address expectedPayer
+    ) private {
         if (amount == 0) revert ZeroAmount();
         MainStorage storage $ = _s();
         if (!$.acceptedToken[token]) revert TokenNotAccepted();
         if (expiry != 0 && expiry <= block.timestamp) revert InvalidExpiry();
 
-        bytes32 key = orderKey(msg.sender, orderId);
+        bytes32 key = orderKey(merchant, orderId);
         if ($.orders[key].exists) revert OrderAlreadyExists();
 
         // Lock fee rate and recipient at registration. feeBps is always <= MAX_FEE_BPS (500),
@@ -275,10 +360,10 @@ contract PayWithQuai is
         // retroactively change this order.
         uint16 lockedFeeBps = uint16($.feeBps);
         address lockedFeeRecipient = $.feeRecipient; // guaranteed non-zero by _setFeeConfig
-        uint64 nonce = ++$.orderNonces[msg.sender];
+        uint64 nonce = ++$.orderNonces[merchant];
 
         $.orders[key] = Order({
-            merchant: msg.sender,
+            merchant: merchant,
             settled: false,
             exists: true,
             feeBps: lockedFeeBps,
@@ -290,7 +375,7 @@ contract PayWithQuai is
             expectedPayer: expectedPayer,
             nonce: nonce
         });
-        emit OrderRegistered(msg.sender, orderId, token, amount, expiry, lockedFeeBps, lockedFeeRecipient);
+        emit OrderRegistered(merchant, orderId, token, amount, expiry, lockedFeeBps, lockedFeeRecipient);
     }
 
     /// @notice Merchant cancels its own unpaid order, freeing the order id for reuse.
@@ -313,6 +398,169 @@ contract PayWithQuai is
         if (block.timestamp < o.settledAt + PURGE_DELAY) revert PurgeDelayNotElapsed();
         delete _s().orders[key];
         emit OrderPurged(msg.sender, orderId);
+    }
+
+    // --------------------------------------------------------------------- //
+    //                    Signed orders (customer-paid gas)                  //
+    // --------------------------------------------------------------------- //
+
+    /// @notice Initialize the EIP-712 domain used by `paySignedOrder`.
+    /// @dev    Runs once, after the v1 `initialize`. Owner-only, so an arbitrary caller can never
+    ///         set the domain on a fresh deployment and front-run the legitimate upgrade.
+    ///         Uses reinitializer(3): version 2 is reserved for the V2 upgrade-safety mock, and
+    ///         neither version has been consumed on any live deployment.
+    function initializeSigning(string calldata name, string calldata version) public reinitializer(3) onlyOwner {
+        __EIP712_init(name, version);
+    }
+
+    /// @notice Whether the EIP-712 domain has been initialized (i.e. `paySignedOrder` is usable).
+    /// @dev    Deployment tooling needs this to stay idempotent: `initializeSigning` is a
+    ///         reinitializer and can only ever run once, so an upgrade script must skip it (and
+    ///         upgrade with empty calldata) on a deployment where it has already been consumed.
+    function signingInitialized() external view returns (bool) {
+        return bytes(_EIP712Name()).length != 0;
+    }
+
+    /// @notice Whether `signer` may sign SignedOrder authorizations.
+    function isSigner(address signer) external view returns (bool) {
+        return _sig().signers[signer];
+    }
+
+    /// @notice EIP-712 struct hash of a SignedOrder.
+    /// @dev    Exposed so signers and tests can reproduce the digest the contract will recover
+    ///         without duplicating the ABI encoding.
+    function signedOrderHash(SignedOrder calldata o) external pure returns (bytes32) {
+        return _signedOrderHash(o);
+    }
+
+    /// @notice Full EIP-712 digest a customer wallet must sign for `o` on this chain.
+    function signedOrderDigest(SignedOrder calldata o) external view returns (bytes32) {
+        return _hashTypedDataV4(_signedOrderHash(o));
+    }
+
+    /// @notice Add (enabled=true) or remove (enabled=false) a trusted order signer. Owner only.
+    /// @dev    Removing a signer is the kill switch for `paySignedOrder` — it cannot affect orders
+    ///         already settled through the signed path, nor the legacy `registerOrder*` paths.
+    function setSigner(address signer, bool enabled) external onlyOwner {
+        if (signer == address(0)) revert ZeroAddress();
+        _sig().signers[signer] = enabled;
+        emit SignerUpdated(signer, enabled);
+    }
+
+    /// @notice Create and settle an order in one transaction from an off-chain signed authorization.
+    /// @dev    The caller supplies no pricing of their own: every commercial term is covered by the
+    ///         signature, so the only value the payer chooses is which wallet they send from. Gas is
+    ///         paid by the caller, so merchants never pre-register (and pay gas for) order slots.
+    ///
+    ///         `expectedPayer` committed in the signature is the anti-griefing anchor: a third party
+    ///         who sees the authorization in the mempool cannot settle it, so they cannot burn a
+    ///         customer's checkout. The domain separator binds chainId and this contract, so an
+    ///         authorization for one deployment can never be replayed against another.
+    ///
+    ///         Native orders require `msg.value == amount`; ERC-20 orders require a prior `approve`.
+    function paySignedOrder(SignedOrder calldata o, bytes calldata signature)
+        external
+        payable
+        nonReentrant
+        whenNotPaused
+    {
+        _recoverSigner(o, signature);
+
+        MainStorage storage $ = _s();
+        if (!$.acceptedToken[o.token]) revert TokenNotAccepted();
+        if (o.amount == 0) revert ZeroAmount();
+        if (o.expiry != 0 && o.expiry <= block.timestamp) revert InvalidExpiry();
+        if (o.feeBps > MAX_FEE_BPS) revert FeeTooHigh();
+        if (o.feeRecipient == address(0)) revert ZeroFeeRecipient();
+
+        bytes32 key = orderKey(o.merchant, o.orderId);
+        if ($.orders[key].exists) revert OrderAlreadyExists();
+        if (o.expectedPayer != address(0) && o.expectedPayer != msg.sender) revert WrongPayer();
+
+        uint256 amount = o.amount;
+        address token = o.token;
+        if (token == NATIVE && msg.value != amount) revert IncorrectNativeValue();
+        if (token != NATIVE && msg.value != 0) revert IncorrectNativeValue();
+
+        // Effects before interactions: the order exists and is settled before any value moves.
+        uint64 nonce = ++$.orderNonces[o.merchant];
+        $.orders[key] = Order({
+            merchant: o.merchant,
+            settled: true,
+            exists: true,
+            feeBps: o.feeBps,
+            token: token,
+            amount: amount,
+            expiry: o.expiry,
+            feeRecipient: o.feeRecipient,
+            settledAt: block.timestamp,
+            expectedPayer: o.expectedPayer,
+            nonce: nonce
+        });
+        emit OrderRegistered(
+            o.merchant, o.orderId, token, amount, o.expiry, o.feeBps, o.feeRecipient
+        );
+
+        uint256 fee = (amount * o.feeBps) / BPS_DENOMINATOR;
+        uint256 net = amount - fee;
+
+        if (token == NATIVE) {
+            if (fee > 0) {
+                _sendNative(o.feeRecipient, fee);
+                emit FeePaid(o.orderId, NATIVE, fee, o.feeRecipient);
+            }
+            _sendNative(o.merchant, net);
+        } else {
+            if (fee > 0) {
+                IERC20(token).safeTransferFrom(msg.sender, o.feeRecipient, fee);
+                emit FeePaid(o.orderId, token, fee, o.feeRecipient);
+            }
+            IERC20(token).safeTransferFrom(msg.sender, o.merchant, net);
+        }
+
+        emit PaymentReceived(o.merchant, o.orderId, msg.sender, token, amount, block.timestamp);
+        emit PaymentSettled(
+            o.merchant, o.orderId, msg.sender, token, amount, fee, net, nonce, block.timestamp
+        );
+    }
+
+    /// @dev Recovers the authorizing signer and enforces that it is currently trusted.
+    ///
+    ///      Signers must be EOAs: an ERC-1271 contract wallet produces a signature that ecrecover
+    ///      cannot attribute to any address, so there is no way to discover which allowlisted
+    ///      contract produced it. Supporting multisig signers would require an enumerable registry
+    ///      and a per-signer probe on every payment — not worth it for a single platform key.
+    ///
+    ///      Malformed signatures, wrong signers and tampered order fields all collapse into one
+    ///      `InvalidSignature`. That is deliberate on two counts: ecrecover returns a well-formed
+    ///      (r, s) pair for *any* digest, so a distinct "not a trusted signer" error would be an
+    ///      oracle revealing which addresses may sign; and it is simply the accurate description —
+    ///      an order whose fields were altered after signing has an invalid signature.
+    function _recoverSigner(SignedOrder calldata o, bytes calldata signature) private view {
+        if (bytes(_EIP712Name()).length == 0) revert SigningNotInitialized();
+        bytes32 digest = _hashTypedDataV4(_signedOrderHash(o));
+        (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
+        if (err != ECDSA.RecoverError.NoError || signer == address(0) || !_sig().signers[signer]) {
+            revert InvalidSignature();
+        }
+    }
+
+    /// @dev keccak256(abi.encode(SIGNED_ORDER_TYPEHASH, ...)). Field order and widths must stay in
+    ///      lockstep with the struct declaration and the off-chain signer.
+    function _signedOrderHash(SignedOrder calldata o) private pure returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                SIGNED_ORDER_TYPEHASH,
+                o.merchant,
+                o.orderId,
+                o.token,
+                o.amount,
+                o.expiry,
+                o.feeBps,
+                o.feeRecipient,
+                o.expectedPayer
+            )
+        );
     }
 
     // --------------------------------------------------------------------- //
@@ -423,6 +671,14 @@ contract PayWithQuai is
     function setPauseGuardian(address guardian) external onlyOwner {
         _s().pauseGuardian = guardian;
         emit PauseGuardianUpdated(guardian);
+    }
+
+    /// @notice Add (enabled=true) or remove (enabled=false) a trusted relayer — the address(es)
+    ///         allowed to call `registerOrderFor` (the e-commerce gateway). Owner only.
+    function setRelayer(address relayer, bool enabled) external onlyOwner {
+        if (relayer == address(0)) revert ZeroAddress();
+        _s().relayers[relayer] = enabled;
+        emit RelayerUpdated(relayer, enabled);
     }
 
     /// @notice Pause new registrations and payments (circuit breaker). Owner or pause guardian.

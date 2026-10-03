@@ -15,7 +15,7 @@ import { BrowserProvider, Contract, Interface, JsonRpcProvider, type Signer } fr
 import paywithquaiAbi from "./paywithquai.abi.json";
 import { ensureNetwork, getActiveWallet } from "./wallets";
 import type { ChainInfo } from "./chains";
-import type { OnChainOrder } from "./payment";
+import type { OnChainOrder, SignedOrderAuthorization } from "./payment";
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
@@ -37,6 +37,8 @@ const REVERT_MESSAGES: Record<string, string> = {
   ZeroAmount: "The order amount must be greater than zero.",
   InvalidExpiry: "The order expiry is invalid.",
   OrderAlreadyExists: "This order was already registered.",
+  InvalidSignature: "This payment authorization is not valid — please reload the page and try again.",
+  SigningNotInitialized: "This payment contract isn't accepting signed orders yet — please use another payment method.",
   EnforcedPause: "Payments are temporarily paused — try again in a moment.",
   ReentrancyGuardReentrantCall: "Transaction reentrancy blocked — please try again.",
 };
@@ -105,13 +107,21 @@ export async function getRevertReason(
   chain: ChainInfo,
   merchant: string,
   orderId: string,
-  opts: { value?: bigint; token?: string; from: string },
+  opts: {
+    value?: bigint;
+    token?: string;
+    from: string;
+    /** Override for signed orders: probing payOrder would replay a different call (the order
+     *  doesn't exist yet), so the caller supplies the exact method and arguments it used. */
+    method?: string;
+    args?: unknown[];
+  },
 ): Promise<string | null> {
   try {
     const token = opts.token;
     const isNative = !token || token.toLowerCase() === ZERO_ADDRESS.toLowerCase();
-    const method = isNative ? "payOrderNative" : "payOrder";
-    const data = payInterface.encodeFunctionData(method, [merchant, orderId]);
+    const method = opts.method ?? (isNative ? "payOrderNative" : "payOrder");
+    const data = payInterface.encodeFunctionData(method, opts.args ?? [merchant, orderId]);
     await getRpcProvider(chain).call({
       to: chain.contractAddress,
       from: opts.from,
@@ -239,6 +249,69 @@ export async function payOrderNative(
     if (reason) throw new Error(reason);
     throw err;
   }
+}
+
+/**
+ * Customer settles a server-authorized order in ONE transaction: the order does not exist on-chain
+ * yet, and this call creates it, records it as settled, and moves the funds. That is what removes
+ * the merchant's up-front gas — the customer pays their own.
+ *
+ * ERC-20 still needs an `approve` first (two transactions total); native needs just this one.
+ * The payer check is redundant-but-cheap: the contract already rejects a mismatched `expectedPayer`,
+ * but catching it before broadcasting avoids a wasted gas refund and a confusing revert.
+ */
+export async function paySignedOrder(
+  chain: ChainInfo,
+  auth: SignedOrderAuthorization,
+  amount: bigint,
+): Promise<string> {
+  const signer = await getSigner(chain);
+  const connected = (await signer.getAddress()).toLowerCase();
+  if (connected !== auth.expectedPayer.toLowerCase()) {
+    throw new Error(
+      `This payment was authorized for ${auth.expectedPayer}. Switch to that wallet to pay.`,
+    );
+  }
+  const contract = getContract(chain, signer);
+  const order = toContractOrder(auth, amount);
+  const isNative = auth.token.toLowerCase() === ZERO_ADDRESS.toLowerCase();
+  try {
+    if (!isNative) {
+      const erc20 = new Contract(
+        auth.token,
+        ["function approve(address spender, uint256 amount) returns (bool)"],
+        signer,
+      );
+      const approveTx = await erc20.approve(chain.contractAddress, amount);
+      await waitForTxReceipt(chain, approveTx.hash);
+    }
+    const tx = await contract.paySignedOrder(order, auth.signature, isNative ? { value: amount } : {});
+    return waitForTxReceipt(chain, tx.hash);
+  } catch (err) {
+    const reason = await getRevertReason(chain, auth.merchant, auth.orderId, {
+      token: auth.token,
+      value: amount,
+      from: connected,
+      method: "paySignedOrder",
+      args: [order, auth.signature],
+    }).catch(() => null);
+    if (reason) throw new Error(reason);
+    throw err;
+  }
+}
+
+/** ABI tuple for the SignedOrder struct — field order and types must match PayWithQuai.sol. */
+export function toContractOrder(auth: SignedOrderAuthorization, amount: bigint) {
+  return {
+    merchant: auth.merchant,
+    orderId: auth.orderId,
+    token: auth.token,
+    amount,
+    expiry: BigInt(auth.expiry),
+    feeBps: auth.feeBps,
+    feeRecipient: auth.feeRecipient,
+    expectedPayer: auth.expectedPayer,
+  };
 }
 
 /** Raw order read from the contract — same shape as payment.ts's OnChainOrder. */

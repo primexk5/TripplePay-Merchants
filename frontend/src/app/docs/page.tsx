@@ -14,14 +14,14 @@ import { DocsSideNav } from "@/components/docs/side-nav";
 export const metadata: Metadata = {
   title: "Documentation — TripplePay || Merchants",
   description:
-    "Accept crypto payments on Quai in 3 steps. Merchant integration guide for TripplePay || Merchants.",
+    "Accept crypto payments on Quai in 3 steps — the customer creates and pays the order, so you hold no gas. Merchant integration guide for TripplePay || Merchants.",
 };
 
 const sections = [
   { id: "overview", label: "Overview" },
   { id: "before-you-start", label: "Before you start" },
   { id: "supported-assets", label: "Supported assets" },
-  { id: "register-order", label: "Step 1 — Register the order" },
+  { id: "register-order", label: "Step 1 — Authorize the order" },
   { id: "customer-pays", label: "Step 2 — Customer pays" },
   { id: "read-order", label: "Read an order on-chain" },
   { id: "payment-links", label: "Payment Links" },
@@ -53,10 +53,13 @@ const tx = await pay.registerOrder(orderId, TOKEN_ADDRESS, amount, 0n);
 await tx.wait();`;
 
 const abiSnippet = `const PAYWITHQUAI_ABI = [
-  // Register — merchant backend, broadcast from the payout wallet
+  // Customer-paid orders — the customer creates AND settles in one call
+  "function paySignedOrder((address merchant, bytes32 orderId, address token, uint256 amount, uint256 expiry, uint16 feeBps, address feeRecipient, address expectedPayer) order, bytes signature) payable",
+  "function signedOrderDigest((address merchant, bytes32 orderId, address token, uint256 amount, uint256 expiry, uint16 feeBps, address feeRecipient, address expectedPayer) order) view returns (bytes32)",
+  // Legacy — register first, then settle (still fully supported)
   "function registerOrder(bytes32 orderId, address token, uint256 amount, uint256 expiry)",
   "function registerOrderWithPayer(bytes32 orderId, address token, uint256 amount, uint256 expiry, address payer)",
-  // Pay — customer wallet
+  // Pay a pre-registered order — customer wallet
   "function payOrder(address merchant, bytes32 orderId)",
   "function payOrderNative(address merchant, bytes32 orderId) payable",
   // Read — anyone; display a checkout and verify settlement
@@ -66,6 +69,51 @@ const abiSnippet = `const PAYWITHQUAI_ABI = [
   "function cancelOrder(bytes32 orderId)",
   "function purgeSettledOrder(bytes32 orderId)",
 ];`;
+
+const signedOrderFields = `// Field order and types are part of the digest — they must match PayWithQuai.sol exactly,
+// or every signature is rejected.
+const SIGNED_ORDER_FIELDS = [
+  { name: 'merchant',       type: 'address' },
+  { name: 'orderId',        type: 'bytes32' },
+  { name: 'token',          type: 'address' },
+  { name: 'amount',         type: 'uint256' },
+  { name: 'expiry',         type: 'uint256' },
+  { name: 'feeBps',         type: 'uint16'  },
+  { name: 'feeRecipient',   type: 'address' },
+  { name: 'expectedPayer',  type: 'address' },
+];`;
+
+const authorize = `// Your backend, after the customer starts checkout. NOTHING is broadcast here —
+// and nothing was broadcast when they added the item to their cart.
+import { Wallet } from 'quais';
+
+const signer = new Wallet(ORDER_SIGNER_KEY);          // allowlisted on-chain: setSigner(signer, true)
+
+// Same domain the contract was initialized with: initializeSigning('PayWithQuai', '1').
+// chainId + verifyingContract are per-deployment — get both from deployments/<network>.json.
+const domain = { name: 'PayWithQuai', version: '1', chainId, verifyingContract: PAYWITHQUAI_ADDRESS };
+
+const order = {
+  merchant: MERCHANT_ADDRESS,     // your payout wallet — the money lands here
+  orderId,                          // random bytes32, minted per checkout
+  token: TOKEN_ADDRESS,             // or address(0) for native QUAI
+  amount: 25000000n,
+  expiry: Math.floor(Date.now()/1000) + 1800,   // never leave this unbounded
+  feeBps: await pay.feeBps(),                    // read live — don't cache a fee
+  feeRecipient: await pay.feeRecipient(),
+  expectedPayer: customerAddress,   // binds this authorization to ONE wallet
+};
+
+const signature = await signer.signTypedData(domain, { SignedOrder: SIGNED_ORDER_FIELDS }, order);
+return res.json({ ...order, amount: order.amount.toString(), signature });   // hand to the customer`;
+
+const signedOrderErc20Pay = `// Customer wallet. ERC-20 needs the approval first, then ONE settlement call
+// that creates the order, forwards the funds and marks it settled.
+await token.approve(PAYWITHQUAI_ADDRESS, amount);
+await pay.paySignedOrder(order, signature);        // no msg.value: the contract pulls the tokens`;
+
+const signedOrderNativePay = `// Native: one transaction total, value included.
+await pay.paySignedOrder(order, signature, { value: amount });`;
 
 const erc20Pay = `await token.approve(PAYWITHQUAI_ADDRESS, amount);   // customer approves exact amount
 await pay.payOrder(MERCHANT_ADDRESS, orderId);       // customer pays`;
@@ -88,7 +136,7 @@ await window.ethereum.request({
     chainName: 'Quai Network (Mainnet)',
     nativeCurrency: { name: 'Quai', symbol: 'QUAI', decimals: 18 },
     rpcUrls: ['https://rpc.quai.network'],
-    blockExplorerUrls: ['https://quaiscan.io'],
+    blockExplorerUrls: ['https://explorer.qu.ai'],
   }],
 });`;
 
@@ -539,7 +587,7 @@ export default function DocsPage() {
             <SectionHeading
               id="register-order"
               kicker="Step 1"
-              title="Register the order (from your backend)"
+              title="Authorize the order (from your backend)"
             />
 
             <div className="mt-5">
@@ -547,67 +595,89 @@ export default function DocsPage() {
             </div>
 
             <p className="mt-5 text-[15px] leading-7 text-[#8b93a7]">
-              Register every expected payment before the customer pays.
-              Broadcast <span className="text-white">from your payout wallet</span> — that
-              wallet becomes both your merchant identity and where the money
-              lands.
+              Orders are created by the{" "}
+              <span className="text-white">customer&apos;s payment transaction</span>,
+              not by yours. Your backend mints an order id and signs one EIP-712
+              authorization for it; the contract verifies that signature and creates
+              the order, moves the money and marks it settled — all in that single
+              transaction. Nobody spends gas to open a checkout, and the payout wallet
+              only has to be able to{" "}
+              <span className="text-white">receive</span>.
             </p>
 
             <div className="mt-5">
-              <CodeBlock label="registerOrder.ts" code={received} />
+              <CodeBlock label="authorizeOrder.ts" code={authorize} />
             </div>
 
             <ul className="mt-4 space-y-2 text-sm leading-6 text-[#8b93a7]">
               <li className="flex gap-2.5">
                 <span className="mt-2 h-1 w-1 shrink-0 rounded-full bg-[#38bdf8]/6" />
                 <span>
-                  <span className="font-mono text-[13px] text-[#c9d4e0]">token</span>: an
-                  allowlisted ERC-20 address, or{" "}
-                  <span className="font-mono text-[13px] text-[#c9d4e0]">address(0)</span>{" "}
-                  for native QUAI.
-                </span>
-              </li>
-              <li className="flex gap-2.5">
-                <span className="mt-2 h-1 w-1 shrink-0 rounded-full bg-[#38bdf8]/6" />
-                <span>
-                  <span className="font-mono text-[13px] text-[#c9d4e0]">msg.sender</span>{" "}
-                  is the <span className="text-white">merchant</span> — the same address
-                  customers pass to{" "}
-                  <span className="font-mono text-[13px] text-[#c9d4e0]">payOrder(merchant, orderId)</span>.
-                  Orders are keyed by{" "}
                   <span className="font-mono text-[13px] text-[#c9d4e0]">
-                    orderKey(merchant, orderId)
-                  </span>
-                  , so a wallet can only see the orders it registered.
-                </span>
-              </li>
-              <li className="flex gap-2.5">
-                <span className="mt-2 h-1 w-1 shrink-0 rounded-full bg-[#38bdf8]/6" />
-                <span>
-                  The platform fee (0.3%) is locked into the order automatically
-                  here — you don&apos;t pass it.
-                </span>
-              </li>
-              <li className="flex gap-2.5">
-                <span className="mt-2 h-1 w-1 shrink-0 rounded-full bg-[#38bdf8]/6" />
-                <span>
-                  <span className="font-mono text-[13px] text-[#c9d4e0]">
-                    registerOrderWithPayer(orderId, token, amount, expiry, customerAddress)
+                    expectedPayer
                   </span>{" "}
-                  restricts settlement to one wallet — prepaid or invoice orders
-                  can&apos;t be front-run.
+                  binds the authorization to one wallet. Without it, anyone who
+                  sees the signature could settle the customer&apos;s order and
+                  deny them the purchase.
                 </span>
               </li>
               <li className="flex gap-2.5">
                 <span className="mt-2 h-1 w-1 shrink-0 rounded-full bg-[#38bdf8]/6" />
                 <span>
-                  Full ABI for the functions above:
+                  <span className="font-mono text-[13px] text-[#c9d4e0]">feeBps</span>{" "}
+                  and{" "}
+                  <span className="font-mono text-[13px] text-[#c9d4e0]">
+                    feeRecipient
+                  </span>{" "}
+                  are read from the chain at signing time, not from your config, so a
+                  fee change can never be back-dated into an old signature.
+                </span>
+              </li>
+              <li className="flex gap-2.5">
+                <span className="mt-2 h-1 w-1 shrink-0 rounded-full bg-[#38bdf8]/6" />
+                <span>
+                  The signing key must be allowlisted by the contract owner:{" "}
+                  <span className="font-mono text-[13px] text-[#c9d4e0]">
+                    setSigner(yourSigner, true)
+                  </span>
+                  . Removing it is an instant kill switch — settled orders are
+                  unaffected.
+                </span>
+              </li>
+              <li className="flex gap-2.5">
+                <span className="mt-2 h-1 w-1 shrink-0 rounded-full bg-[#38bdf8]/6" />
+                <span>
+                  The digest is public — a customer can verify exactly what you
+                  signed with{" "}
+                  <span className="font-mono text-[13px] text-[#c9d4e0]">
+                    signedOrderDigest(order)
+                  </span>
+                  . Never sign an amount, expiry or payout you did not intend.
                 </span>
               </li>
             </ul>
 
-            <div className="mt-3">
+            <div className="mt-5">
+              <CodeBlock label="signedOrderFields.ts" code={signedOrderFields} />
+            </div>
+
+            <div className="mt-5">
               <CodeBlock label="paywithquai.abi.js" code={abiSnippet} />
+            </div>
+
+            <Callout tone="success" title="Just want a link, not an integration?">
+              Payment Links and the Gateway API do all of this for you — no keys, no
+              signer, no gas. Use Step 1 only if you are wiring your own checkout.
+            </Callout>
+
+            <p className="mt-8 text-sm leading-6 text-[#8b93a7]">
+              <span className="text-white">Legacy:</span> orders registered by the
+              merchant up front still work exactly as before — nothing you already
+              shipped breaks, and they remain payable through this upgrade.
+            </p>
+
+            <div className="mt-3">
+              <CodeBlock label="registerOrder.ts (legacy)" code={received} />
             </div>
           </section>
 
@@ -620,23 +690,32 @@ export default function DocsPage() {
             />
 
             <p className="mt-5 text-[15px] leading-7 text-[#8b93a7]">
-              Point the customer at any checkout you own. Payment is always a
-              single contract call.
+              Point the customer at any checkout you own. Submit the order and
+              signature from Step 1 — the settlement call creates the order and
+              pays it in one transaction.
             </p>
 
             <p className="mt-5 text-sm font-medium text-white">ERC-20 — approve, then pay:</p>
             <div className="mt-3">
-              <CodeBlock label="pay.ts" code={erc20Pay} />
+              <CodeBlock label="pay.ts" code={signedOrderErc20Pay} />
             </div>
 
             <p className="mt-5 text-sm font-medium text-white">Native QUAI — send exact value:</p>
             <div className="mt-3">
-              <CodeBlock label="pay.ts" code={nativePay} />
+              <CodeBlock label="pay.ts" code={signedOrderNativePay} />
             </div>
 
-            <p className="mt-5 text-[15px] leading-7 text-[#8b93a7]">
+            <p className="mt-8 text-sm leading-6 text-[#8b93a7]">
+              <span className="text-white">Legacy orders</span> (registered up front
+              by you) settle without a signature:
+            </p>
+            <div className="mt-3">
+              <CodeBlock label="payLegacy.ts" code={`${erc20Pay}\n\n${nativePay}`} />
+            </div>
+
+            <p className="mt-8 text-[15px] leading-7 text-[#8b93a7]">
               The <span className="font-mono text-[13px] text-[#c9d4e0]">merchant</span>{" "}
-              argument is the payout wallet that registered the order. On the checkout
+              field is your payout wallet — the money lands there. On the checkout
               page, connect the customer&apos;s wallet like this:
             </p>
             <div className="mt-3">
@@ -644,9 +723,10 @@ export default function DocsPage() {
             </div>
 
             <Callout tone="success" title="One transaction, zero double-fulfillment">
-              The contract splits off the fee, forwards the rest to your wallet,
-              and marks the order settled — all in one transaction. A second
-              payment reverts, so double-fulfillment is impossible.
+              The contract verifies the signature, creates the order, splits off the
+              fee, forwards the rest to your wallet, and marks the order settled — all
+              in one transaction that the customer pays for. A second payment reverts,
+              so double-fulfillment is impossible.
             </Callout>
           </section>
 

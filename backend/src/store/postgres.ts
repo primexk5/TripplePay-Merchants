@@ -1,6 +1,8 @@
 import { Pool, type PoolClient } from 'pg';
+import { randomBytes } from 'node:crypto';
 import type { Store } from './index.js';
-import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder } from '../types.js';
+import type { Merchant, Session, WebhookDelivery, PaymentLink, LinkClaim, OrderMeta, QiOrder, MerchantApiKey, MerchantApiKeyMeta, MerchantPayoutAddress, PayoutAddressSource, FixedOrderClaimResult } from '../types.js';
+import { hashApiKey, apiKeyRef, DEV_API_KEY_PEPPER } from '../util/apikey.js';
 import { log } from '../logger.js';
 
 const logger = log('store:postgres');
@@ -21,6 +23,9 @@ const logger = log('store:postgres');
  */
 export class PostgresStore implements Store {
   readonly pool: Pool;
+  /** Keyed-hash pepper for API keys. Optional so existing 2/3-arg call sites keep working;
+   *  production always passes cfg.API_KEY_PEPPER (see index.ts). */
+  private readonly apiKeyPepper: string;
 
   /** `defaultChainId`: what a pre-multi-chain row (link/order_meta with a NULL chain_id, or a
    *  delivery whose stored payload predates chainId) is read back as. Optional so existing
@@ -30,7 +35,9 @@ export class PostgresStore implements Store {
     connectionString: string,
     options: { ssl?: boolean } = {},
     private readonly defaultChainId: number = 9,
+    apiKeyPepper: string = '',
   ) {
+    this.apiKeyPepper = apiKeyPepper || DEV_API_KEY_PEPPER;
     // node-postgres does NOT parse `sslmode` from the connection string itself, and Railway
     // requires TLS. Honor an explicit flag, else fall back to whatever sslmode the URL declares.
     const url = new URL(connectionString);
@@ -60,6 +67,9 @@ export class PostgresStore implements Store {
         active        BOOLEAN NOT NULL,
         created_at    BIGINT NOT NULL
       );
+      -- Append-only schema evolution: new optional columns are added idempotently so an existing
+      -- deployment upgrades in place without a migration tool.
+      ALTER TABLE merchants ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{"quaiMarkupBps":0,"fiatCurrencies":["USD","NGN"]}'::jsonb;
 
       CREATE TABLE IF NOT EXISTS deliveries (
         id              TEXT PRIMARY KEY,
@@ -112,6 +122,8 @@ export class PostgresStore implements Store {
         order_pool           JSONB NOT NULL,
         created_at           BIGINT NOT NULL
       );
+      ALTER TABLE links ADD COLUMN IF NOT EXISTS gateway_order_id TEXT;
+      ALTER TABLE links ADD COLUMN IF NOT EXISTS max_redemptions INTEGER NOT NULL DEFAULT 0;
       CREATE INDEX IF NOT EXISTS links_merchant ON links (merchant_address, created_at DESC);
 
       CREATE TABLE IF NOT EXISTS claims (
@@ -132,6 +144,7 @@ export class PostgresStore implements Store {
         slug             TEXT,
         created_at       BIGINT NOT NULL
       );
+      ALTER TABLE order_meta ADD COLUMN IF NOT EXISTS reference TEXT;
       CREATE INDEX IF NOT EXISTS order_meta_merchant ON order_meta (merchant_address, created_at DESC);
 
       -- Multi-chain migration (idempotent, safe to run every boot): a nullable chain_id, backfilled
@@ -153,7 +166,66 @@ export class PostgresStore implements Store {
       );
       -- For the Qi indexer sweep: pending (unsettled) orders, oldest first.
       CREATE INDEX IF NOT EXISTS qi_orders_pending ON qi_orders (settled, created_at);
+
+      -- The legacy plaintext bucket: NULL on every row minted after the hashing migration, so it
+      -- is deliberately nullable and carries no primary key. key_hash is the real identity
+      -- (see the migration below).
+      CREATE TABLE IF NOT EXISTS api_keys (
+        key              TEXT,
+        merchant_address TEXT NOT NULL,
+        label            TEXT NOT NULL,
+        created_at       BIGINT NOT NULL,
+        last_used_at     BIGINT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS api_keys_merchant ON api_keys (merchant_address, created_at DESC);
     `);
+
+    // Per-chain payout destinations. A merchant's IDENTITY address (merchants.address) is the wallet
+    // they sign in with; this table is where their money actually lands, one row per chain. That is
+    // what lets a single Quai-wallet merchant also take Base payments without a second account.
+    //
+    // Indexed on (address, chain_id) rather than only by merchant_id because the indexer resolves
+    // merchants FROM the on-chain payout address on every settled payment — see
+    // getMerchantByPayoutAddress.
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS merchant_payout_addresses (
+        merchant_id TEXT NOT NULL REFERENCES merchants (merchant_id) ON DELETE CASCADE,
+        chain_id    BIGINT NOT NULL,
+        address     TEXT NOT NULL,
+        source      TEXT NOT NULL DEFAULT 'declared',
+        created_at  BIGINT NOT NULL,
+        PRIMARY KEY (merchant_id, chain_id)
+      );
+      CREATE INDEX IF NOT EXISTS merchant_payout_addresses_lookup
+        ON merchant_payout_addresses (address, chain_id);
+    `);
+
+    // API-key hashing migration. The original table stored the bearer credential in `key` as the
+    // primary key. Credentials are now stored only as HMAC-SHA256(pepper, key) in `key_hash`,
+    // with a short non-secret `key_ref` so keys can be revoked from a URL without ever putting the
+    // secret in one. `key` stays (nullable) as the legacy bucket: the pepper is not available to
+    // SQL, so we cannot re-hash existing rows here — instead each row is upgraded in place the
+    // first time its owner presents it (see getMerchantByApiKey). Once every row has a key_hash,
+    // `key` can be dropped in a later migration.
+    //
+    // The DROP CONSTRAINT / DROP NOT NULL pair is what makes that documented design actually work:
+    // a fresh database created by the DDL above used to keep `key` as NOT NULL PRIMARY KEY, so
+    // every insert in createMerchantApiKey — which writes only the hash columns — failed with
+    // "null value in column key". That made POST /v1/me/apikeys (how merchants connect their
+    // Shopify store) unusable on any freshly provisioned database. The constraint has to go first:
+    // Postgres refuses to drop NOT NULL on a column that is still part of a primary key. Both
+    // statements are idempotent.
+    await this.pool.query(`
+      ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_hash TEXT;
+      ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_ref  TEXT;
+      ALTER TABLE api_keys DROP CONSTRAINT IF EXISTS api_keys_pkey;
+      ALTER TABLE api_keys ALTER COLUMN key DROP NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS api_keys_key_hash ON api_keys (key_hash) WHERE key_hash IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS api_keys_key_ref  ON api_keys (key_ref)  WHERE key_ref  IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS api_keys_key_legacy ON api_keys (key) WHERE key IS NOT NULL;
+    `);
+    // `key_hash IS NULL` is the legacy marker: it means "this row still holds a plaintext
+    // credential in `key`". Nothing else needs a flag column.
 
     // Backfill + index chain_id (parameterized — can't live in the template literal above).
     // WHERE chain_id IS NULL makes this a no-op on every boot after the first, so re-running it
@@ -183,16 +255,26 @@ export class PostgresStore implements Store {
 
   async upsertMerchant(m: Merchant): Promise<void> {
     await this.pool.query(
-      `INSERT INTO merchants (address, merchant_id, name, webhook_url, webhook_secret, active, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO merchants (address, merchant_id, name, webhook_url, webhook_secret, active, created_at, settings)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (address) DO UPDATE SET
          merchant_id = EXCLUDED.merchant_id,
          name = EXCLUDED.name,
          webhook_url = EXCLUDED.webhook_url,
          webhook_secret = EXCLUDED.webhook_secret,
          active = EXCLUDED.active,
-         created_at = EXCLUDED.created_at`,
-      [m.address.toLowerCase(), m.merchantId, m.name, m.webhookUrl, m.webhookSecret, m.active, m.createdAt],
+         created_at = EXCLUDED.created_at,
+         settings = EXCLUDED.settings`,
+      [
+        m.address.toLowerCase(),
+        m.merchantId,
+        m.name,
+        m.webhookUrl,
+        m.webhookSecret,
+        m.active,
+        m.createdAt,
+        JSON.stringify(m.settings ?? { quaiMarkupBps: 0, fiatCurrencies: ['USD', 'NGN'] }),
+      ],
     );
   }
 
@@ -204,14 +286,150 @@ export class PostgresStore implements Store {
     return rows.length ? mapMerchant(rows[0]!) : undefined;
   }
 
-  async getMerchantById(merchantId: string): Promise<Merchant | undefined> {
-    const { rows } = await this.pool.query('SELECT * FROM merchants WHERE merchant_id = $1', [merchantId]);
+  async getMerchantByPayoutAddress(chainId: number, address: string): Promise<Merchant | undefined> {
+    const addr = address.toLowerCase();
+    // Configured destination for this exact chain wins.
+    const mapped = await this.pool.query(
+      `SELECT m.* FROM merchant_payout_addresses p
+       JOIN merchants m ON m.merchant_id = p.merchant_id
+       WHERE p.chain_id = $1 AND p.address = $2`,
+      [chainId, addr],
+    );
+    if (mapped.rows.length) return mapMerchant(mapped.rows[0]!);
+    // Legacy fallback: merchants onboarded before per-chain payouts existed receive at their
+    // identity address. Mirrors JsonStore.getMerchantByPayoutAddress exactly.
+    const legacy = await this.pool.query(
+      'SELECT * FROM merchants WHERE address = $1',
+      [addr],
+    );
+    return legacy.rows.length ? mapMerchant(legacy.rows[0]!) : undefined;
+  }
+
+  async listPayoutAddresses(merchantId: string): Promise<MerchantPayoutAddress[]> {
+    const { rows } = await this.pool.query(
+      `SELECT merchant_id, chain_id, address, source, created_at FROM merchant_payout_addresses
+       WHERE merchant_id = $1 ORDER BY chain_id`,
+      [merchantId],
+    );
+    return rows.map((r) => mapPayoutAddress(r));
+  }
+
+  async setPayoutAddress(p: {
+    merchantId: string;
+    chainId: number;
+    address: string;
+    source: PayoutAddressSource;
+    createdAt: number;
+  }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO merchant_payout_addresses (merchant_id, chain_id, address, source, created_at)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (merchant_id, chain_id)
+       DO UPDATE SET address = EXCLUDED.address, source = EXCLUDED.source`,
+      [p.merchantId, p.chainId, p.address.toLowerCase(), p.source, p.createdAt],
+    );
+  }
+
+  async clearPayoutAddress(merchantId: string, chainId: number): Promise<void> {
+    await this.pool.query(
+      'DELETE FROM merchant_payout_addresses WHERE merchant_id = $1 AND chain_id = $2',
+      [merchantId, chainId],
+    );
+  }
+
+  async getMerchantById(merchantId: string): Promise<Merchant | undefined> {    const { rows } = await this.pool.query('SELECT * FROM merchants WHERE merchant_id = $1', [merchantId]);
     return rows.length ? mapMerchant(rows[0]!) : undefined;
   }
 
   async listMerchants(): Promise<Merchant[]> {
     const { rows } = await this.pool.query('SELECT * FROM merchants');
     return rows.map(mapMerchant);
+  }
+
+  // --- merchant API keys ---
+
+  async createMerchantApiKey(k: {
+    key: string;
+    merchantAddress: string;
+    label: string;
+    createdAt: number;
+  }): Promise<{ keyRef: string }> {
+    const keyHash = hashApiKey(k.key, this.apiKeyPepper);
+    const keyRef = apiKeyRef(keyHash);
+    await this.pool.query(
+      `INSERT INTO api_keys (key_hash, key_ref, merchant_address, label, created_at, last_used_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [keyHash, keyRef, k.merchantAddress.toLowerCase(), k.label, k.createdAt, 0],
+    );
+    return { keyRef };
+  }
+
+  async getMerchantByApiKey(key: string): Promise<Merchant | undefined> {
+    const hash = hashApiKey(key, this.apiKeyPepper);
+
+    const hashed = await this.pool.query(
+      `SELECT m.* FROM api_keys k JOIN merchants m ON m.address = k.merchant_address
+       WHERE k.key_hash = $1`,
+      [hash],
+    );
+    if (hashed.rows.length) {
+      // Best-effort last-used stamp; never worth failing a request over.
+      await this.pool
+        .query('UPDATE api_keys SET last_used_at = $1 WHERE key_hash = $2', [Date.now(), hash])
+        .catch(() => undefined);
+      return mapMerchant(hashed.rows[0]!);
+    }
+
+    // Legacy: a pre-hashing row still holding the plaintext credential. Accept it, then rewrite the
+    // row hashed in place so the plaintext column is emptied immediately. The merchant keeps using
+    // the same credential, so no re-issue and no downtime. Pinned to ONE client, because a manual
+    // BEGIN issued on `pool` could otherwise span two different pooled connections.
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        `UPDATE api_keys
+            SET key = NULL, key_hash = $1, key_ref = $2,
+                label = COALESCE(NULLIF(label, ''), '(migrated)')
+          WHERE key = $3 AND key_hash IS NULL
+        RETURNING merchant_address`,
+        [hash, apiKeyRef(hash), key],
+      );
+      if (!rows.length) {
+        await client.query('ROLLBACK');
+        return undefined;
+      }
+      const owner = await client.query('SELECT * FROM merchants WHERE address = $1', [
+        rows[0]!.merchant_address as string,
+      ]);
+      await client.query('COMMIT');
+      logger.warn('migrated legacy plaintext API key to hashed form');
+      return owner.rows.length ? mapMerchant(owner.rows[0]!) : undefined;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async listMerchantApiKeys(merchantAddress: string): Promise<MerchantApiKeyMeta[]> {
+    const { rows } = await this.pool.query(
+      `SELECT key_ref, label, created_at, last_used_at FROM api_keys
+        WHERE merchant_address = $1 AND key_hash IS NOT NULL
+        ORDER BY created_at DESC`,
+      [merchantAddress.toLowerCase()],
+    );
+    return rows.map((r) => ({
+      keyRef: r.key_ref as string,
+      label: r.label as string,
+      createdAt: toNum(r.created_at),
+      lastUsedAt: toNum(r.last_used_at),
+    }));
+  }
+
+  async revokeMerchantApiKeyByRef(keyRef: string): Promise<void> {
+    await this.pool.query('DELETE FROM api_keys WHERE key_ref = $1', [keyRef]);
   }
 
   // --- webhook deliveries ---
@@ -426,8 +644,8 @@ export class PostgresStore implements Store {
   async upsertLink(link: PaymentLink): Promise<void> {
     await this.pool.query(
       `INSERT INTO links (slug, merchant_address, merchant_id, merchant_name, shop_name, token_address,
-                          amount, amount_display, symbol, expiry_duration_secs, multi_pay, order_pool, created_at, chain_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                          amount, amount_display, symbol, expiry_duration_secs, multi_pay, order_pool, created_at, chain_id, gateway_order_id, max_redemptions)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
        ON CONFLICT (slug) DO UPDATE SET
          merchant_address = EXCLUDED.merchant_address,
          merchant_id = EXCLUDED.merchant_id,
@@ -441,7 +659,9 @@ export class PostgresStore implements Store {
          multi_pay = EXCLUDED.multi_pay,
          order_pool = EXCLUDED.order_pool,
          created_at = EXCLUDED.created_at,
-         chain_id = EXCLUDED.chain_id`,
+         chain_id = EXCLUDED.chain_id,
+         gateway_order_id = EXCLUDED.gateway_order_id,
+         max_redemptions = EXCLUDED.max_redemptions`,
       [
         link.slug,
         link.merchantAddress,
@@ -457,6 +677,8 @@ export class PostgresStore implements Store {
         JSON.stringify(link.orderPool),
         link.createdAt,
         link.chainId,
+        link.gatewayOrderId ?? null,
+        link.maxRedemptions ?? 0,
       ],
     );
   }
@@ -506,6 +728,107 @@ export class PostgresStore implements Store {
       );
       await client.query('COMMIT');
       return orderId;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Mint a fresh orderId for this claim, honouring `maxRedemptions` inside the same transaction
+   * that counts existing claims. The `SELECT ... FOR UPDATE` on the link row serializes concurrent
+   * claims for one link, so two customers racing for the final redemption cannot both succeed.
+   */
+  async mintClaimedOrder(
+    slug: string,
+    payerAddress: string,
+    maxRedemptions: number,
+  ): Promise<string | undefined> {
+    const client: PoolClient = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const linkRows = await client.query('SELECT slug FROM links WHERE slug = $1 FOR UPDATE', [slug]);
+      if (!linkRows.rows.length) {
+        await client.query('ROLLBACK');
+        return undefined;
+      }
+      if (maxRedemptions > 0) {
+        const { rows: countRows } = await client.query(
+          'SELECT COUNT(*)::int AS n FROM claims WHERE slug = $1',
+          [slug],
+        );
+        if ((countRows[0]!.n as number) >= maxRedemptions) {
+          await client.query('ROLLBACK');
+          return undefined;
+        }
+      }
+      const orderId = '0x' + randomBytes(32).toString('hex');
+      await client.query(
+        `INSERT INTO claims (slug, order_id, payer_address, claimed_at, settled)
+         VALUES ($1, $2, $3, $4, false)
+         ON CONFLICT (slug, order_id) DO NOTHING`,
+        [slug, orderId, payerAddress.toLowerCase(), Date.now()],
+      );
+      await client.query('COMMIT');
+      return orderId;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async claimFixedOrder(
+    slug: string,
+    orderId: string,
+    payerAddress: string,
+    staleAfterMs: number,
+  ): Promise<FixedOrderClaimResult> {
+    const client: PoolClient = await this.pool.connect();
+    try {
+      // Serialize on the link row, exactly like mintClaimedOrder: two wallets racing for the same
+      // gateway order id must not both come away believing they own it.
+      await client.query('BEGIN');
+      const linkRows = await client.query('SELECT slug FROM links WHERE slug = $1 FOR UPDATE', [slug]);
+      if (!linkRows.rows.length) {
+        await client.query('ROLLBACK');
+        return { status: 'taken' };
+      }
+      const payer = payerAddress.toLowerCase();
+      const { rows } = await client.query(
+        'SELECT payer_address, claimed_at, settled FROM claims WHERE slug = $1 AND order_id = $2 FOR UPDATE',
+        [slug, orderId],
+      );
+      const existing = rows[0] as
+        | { payer_address: string; claimed_at: number; settled: boolean }
+        | undefined;
+      if (!existing) {
+        await client.query(
+          `INSERT INTO claims (slug, order_id, payer_address, claimed_at, settled)
+           VALUES ($1, $2, $3, $4, false)`,
+          [slug, orderId, payer, Date.now()],
+        );
+        await client.query('COMMIT');
+        return { status: 'claimed' };
+      }
+      if (existing.settled) {
+        await client.query('ROLLBACK');
+        return { status: 'settled' };
+      }
+      const age = Date.now() - Number(existing.claimed_at);
+      if (existing.payer_address !== payer && age < staleAfterMs) {
+        await client.query('ROLLBACK');
+        return { status: 'taken' };
+      }
+      await client.query(
+        'UPDATE claims SET payer_address = $1, claimed_at = $2 WHERE slug = $3 AND order_id = $4',
+        [payer, Date.now(), slug, orderId],
+      );
+      await client.query('COMMIT');
+      return { status: 'claimed' };
     } catch (err) {
       await client.query('ROLLBACK').catch(() => undefined);
       throw err;
@@ -576,16 +899,25 @@ export class PostgresStore implements Store {
     return rows.length ? mapClaim(rows[0]!) : undefined;
   }
 
+  async listClaims(slug: string): Promise<LinkClaim[]> {
+    const { rows } = await this.pool.query(
+      `SELECT * FROM claims WHERE slug = $1 ORDER BY claimed_at ASC, order_id ASC`,
+      [slug],
+    );
+    return rows.map(mapClaim);
+  }
+
   // --- order metadata ---
 
   async saveOrderMeta(meta: OrderMeta): Promise<void> {
     await this.pool.query(
-      `INSERT INTO order_meta (order_id, merchant_address, customer_name, source, slug, created_at, chain_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO order_meta (order_id, merchant_address, customer_name, source, slug, reference, created_at, chain_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (order_id) DO UPDATE SET
          customer_name = COALESCE(EXCLUDED.customer_name, order_meta.customer_name),
          source        = EXCLUDED.source,
          slug          = EXCLUDED.slug,
+         reference     = COALESCE(EXCLUDED.reference, order_meta.reference),
          chain_id      = EXCLUDED.chain_id`,
       [
         meta.orderId.toLowerCase(),
@@ -593,11 +925,14 @@ export class PostgresStore implements Store {
         meta.customerName ?? null,
         meta.source,
         meta.slug ?? null,
+        meta.reference ?? null,
         meta.createdAt,
         meta.chainId,
       ],
     );
   }
+
+ 
 
   async getOrderMeta(orderId: string): Promise<OrderMeta | undefined> {
     const { rows } = await this.pool.query(
@@ -613,6 +948,7 @@ export class PostgresStore implements Store {
       customerName: (r.customer_name as string | null) ?? undefined,
       source: r.source as OrderMeta['source'],
       slug: (r.slug as string | null) ?? undefined,
+      reference: (r.reference as string | null) ?? undefined,
       createdAt: Number(r.created_at),
     };
   }
@@ -641,6 +977,14 @@ export class PostgresStore implements Store {
 
   async listQiOrders(): Promise<QiOrder[]> {
     const { rows } = await this.pool.query('SELECT * FROM qi_orders');
+    return rows.map(mapQiOrder);
+  }
+
+  async listQiOrdersByMerchant(merchantAddress: string): Promise<QiOrder[]> {
+    const { rows } = await this.pool.query(
+      'SELECT * FROM qi_orders WHERE merchant_address = $1 ORDER BY created_at DESC',
+      [merchantAddress.toLowerCase()],
+    );
     return rows.map(mapQiOrder);
   }
 
@@ -701,8 +1045,17 @@ export class PostgresStore implements Store {
 
 const toNum = (v: unknown): number => Number(v);
 
-function mapMerchant(row: Record<string, unknown>): Merchant {
+function mapPayoutAddress(row: Record<string, unknown>): MerchantPayoutAddress {
   return {
+    merchantId: row.merchant_id as string,
+    chainId: toNum(row.chain_id),
+    address: row.address as string,
+    source: row.source as PayoutAddressSource,
+    createdAt: toNum(row.created_at),
+  };
+}
+
+function mapMerchant(row: Record<string, unknown>): Merchant {  return {
     merchantId: row.merchant_id as string,
     address: row.address as string,
     name: row.name as string,
@@ -710,16 +1063,25 @@ function mapMerchant(row: Record<string, unknown>): Merchant {
     webhookSecret: row.webhook_secret as string,
     active: row.active as boolean,
     createdAt: toNum(row.created_at),
+    ...(row.settings
+      ? {
+          settings: {
+            quaiMarkupBps:
+              ((row.settings as { quaiMarkupBps?: number })?.quaiMarkupBps ?? 0),
+            fiatCurrencies:
+              ((row.settings as { fiatCurrencies?: string[] })?.fiatCurrencies ?? ['USD', 'NGN']),
+          } as Merchant['settings'],
+        }
+      : {}),
   };
 }
 
-// `deliveries` has no chain_id column (see init()'s migration comment) — the top-level
-// WebhookDelivery.chainId is derived from the payload's own (already-persisted) chainId instead,
-// falling back to defaultChainId for a delivery whose payload predates multi-chain support.
 function mapDelivery(row: Record<string, unknown>, defaultChainId: number): WebhookDelivery {
   const payload = row.payload as WebhookDelivery['payload'];
   return {
     id: row.id as string,
+    // `deliveries` has no chain_id column — the chain lives on the payload, which every writer
+    // populates. Fall back to the deployment default only for rows predating multi-chain.
     chainId: payload.data.chainId ?? defaultChainId,
     merchantId: row.merchant_id as string,
     url: row.url as string,
@@ -758,6 +1120,10 @@ function mapLink(row: Record<string, unknown>, defaultChainId: number): PaymentL
     expiryDurationSecs: toNum(row.expiry_duration_secs),
     multiPay: row.multi_pay as boolean,
     orderPool: (row.order_pool as string[]) ?? [],
+    maxRedemptions: toNum(row.max_redemptions ?? 0),
+    ...((row.gateway_order_id as string | null | undefined)
+      ? { gatewayOrderId: row.gateway_order_id as string }
+      : {}),
     createdAt: toNum(row.created_at),
   };
 }

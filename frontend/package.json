@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "abi:sync": "node scripts/sync-abi.mjs"
   },
   "dependencies": {
     "clsx": "^2.1.1",

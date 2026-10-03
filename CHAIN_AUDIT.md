@@ -5,7 +5,18 @@ Read-only audit of the `feat/multichain` branch. Goal: understand what it would 
 starting with **Robinhood Chain testnet** (chain ID `46630`, RPC
 `https://rpc.testnet.chain.robinhood.com/rpc`) and **Base Sepolia** (chain ID `84532`).
 
-No files were modified. All paths are relative to the repo root.
+All paths are relative to the repo root.
+
+> **Status / scope note.** For the signed-order change specifically, see
+> `docs/SIGNED_ORDERS_AUDIT_BRIEF.md` — invariants, threat model, test map and residual risks.
+> That document is a *self-review*, not an independent audit.
+>
+> This file is an *internal engineering record* written while shipping the
+> signed-order upgrade — not an independent third-party audit, and the §3 deployment sections
+> describe live-network state as it was when last touched. The signed-order path described in
+> §1–§2 has been implemented and is covered by the repo's own test suites; it has **not** been
+> reviewed by an external security auditor. Do not treat this document as sign-off for mainnet
+> funds.
 
 ---
 
@@ -23,11 +34,37 @@ TripplePay is a non-custodial merchant checkout system with three packages:
 
 ### End-to-end payment flow
 
+**Primary (current) — customer-paid signed orders.** No merchant transaction, no merchant gas:
+the order is created and settled by the customer's own payment.
+
+```
+customer (checkout page) → backend claim                 [POST /v1/links/:slug/claim]
+   ▼
+merchant backend (or platform signer, allowlisted)        [backend/src/chain/signer.ts]
+   │  mints a random orderId, reads live feeBps + feeRecipient from-chain, and signs one
+   │  EIP-712 SignedOrder { merchant, orderId, token, amount, expiry, feeBps,
+   │                        feeRecipient, expectedPayer }
+   ▼
+customer (checkout page)
+   │ 1. approve() [ERC-20 only] then paySignedOrder(order, signature)   [frontend/src/lib/payment.ts]
+   ▼
+PayWithQuai.sol (proxy)                                    [contracts/contracts/PayWithQuai.sol]
+   │  verifies the signer against the allowlist, recovers the signer, checks chainId/domain,
+   │  payer == expectedPayer (when set), and not-already-exists — then STORES and SETTLES the
+   │  order in the SAME transaction, splits the fee, forwards funds to merchant + feeRecipient,
+   │  emits PaymentReceived + PaymentSettled
+   ▼
+backend Indexer (poll loop)                                 [backend/src/indexer/indexer.ts]
+```
+
+**Legacy — merchant-registered orders.** Still fully supported and still payable after the signed
+upgrade; used only by orders registered before it:
+
 ```
 merchant (dashboard/API)
-   │ 1. registerOrder(orderId, token, amount, expiry)      [frontend/src/lib/payment.ts → quais Contract]
+   │ 1. registerOrder / registerOrderBatch / registerOrderWithPayer   [frontend/src/lib/payment.ts]
    ▼
-PayWithQuai.sol (proxy)                                     [contracts/contracts/PayWithQuai.sol]
+PayWithQuai.sol (proxy)
    │  order stored, keyed by keccak256(merchant, orderId)
    ▼
 customer (checkout page)
@@ -68,15 +105,27 @@ contains no Quai-specific opcodes, precompiles, or SDK calls.** All "Quai-specif
 in comments/docs (zone assumptions) and in the off-chain tooling that deploys/talks to it, not in
 the bytecode itself.
 
-- **Purpose**: merchants pre-register orders (`registerOrder`/`registerOrderBatch`/
-  `registerOrderWithPayer`, lines 211–256), customers settle them (`payOrder` for ERC-20 at
-  line 324, `payOrderNative` for native currency at line 351). Funds are forwarded to
-  `merchant` and `feeRecipient` in the same transaction — the contract never holds a balance
-  during normal operation.
-- **Key functions**: `registerOrder`, `registerOrderBatch` (max 50, added in a v2 upgrade —
-  see §2.3), `registerOrderWithPayer`, `cancelOrder`, `purgeSettledOrder`, `payOrder`,
-  `payOrderNative`, admin: `setTokenAccepted`, `setFeeConfig`, `setPauseGuardian`, `pause`/
-  `unpause`, `rescueTokens`, `_authorizeUpgrade`.
+- **Purpose**: two coexisting order lifecycles. **(a) Signed / customer-paid (primary):**
+  an allowlisted signer authorizes an order off-chain with EIP-712 and the customer's
+  `paySignedOrder` creates *and* settles it in one transaction. **(b) Legacy:** merchants
+  pre-register orders (`registerOrder`/`registerOrderBatch`/`registerOrderWithPayer`) and
+  customers settle them with `payOrder` (ERC-20) or `payOrderNative` (native). Funds are
+  forwarded to `merchant` and `feeRecipient` in the same transaction as settlement — the
+  contract never holds a balance during normal operation.
+- **Key functions**: `paySignedOrder`, `signedOrderHash`, `signedOrderDigest`,
+  `initializeSigning`, `signingInitialized`, `setSigner`/`isSigner`; legacy
+  `registerOrder`, `registerOrderBatch` (max 50, added in a v2 upgrade — see §2.3),
+  `registerOrderWithPayer`, `cancelOrder`, `purgeSettledOrder`, `payOrder`, `payOrderNative`;
+  admin: `setTokenAccepted`, `setFeeConfig`, `setPauseGuardian`, `pause`/`unpause`,
+  `rescueTokens`, `_authorizeUpgrade`.
+- **Signed-order authorization**: EIP-712 domain `PayWithQuai` / `1` + deployment `chainId` +
+  `verifyingContract` (fixed at `initializeSigning`, a `reinitializer`, so it cannot change under
+  live signatures). The digest covers `merchant`, `orderId`, `token`, `amount`, `expiry`,
+  `feeBps`, `feeRecipient`, `expectedPayer` — fee and recipient are therefore part of what the
+  merchant signs, not read from mutable contract state at settlement time. `expectedPayer` binds
+  an authorization to one wallet, so a leaked signature cannot be settled by anyone else.
+  Signing storage lives in its own ERC-7201 namespace (`paywithquai.signing`) and leaves the
+  legacy `paywithquai.main` layout byte-identical.
 - **Events**: `OrderRegistered`, `OrderCancelled`, `OrderPurged`, `PaymentReceived` (the one the
   relayer indexes — line 96), `PaymentSettled` (richer version with fee/net/nonce, line 108),
   `FeePaid`, `FeeConfigUpdated`, `AcceptedTokenUpdated`, `PauseGuardianUpdated`, `TokensRescued`.
@@ -86,9 +135,11 @@ the bytecode itself.
     (`_authorizeUpgrade`, line 451). In production this should be a `TimelockController` (see §2.4).
   - **Pause guardian** (`_s().pauseGuardian`) — can call `pause()` (line 429) but never
     `unpause()` — a one-way circuit breaker independent of the owner key.
-- **Fee logic**: fee is `uint96 feeBps` capped at 500 (5%), **locked into each `Order` at
-  registration time** (line 276) — a later `setFeeConfig` only affects orders registered
-  afterward. Split is `fee = amount * feeBps / 10_000`, `net = amount - fee` (lines 337–338,
+- **Fee logic**: fee is `uint96 feeBps` capped at 500 (5%), **locked into each `Order` at the
+  moment the order is created** — for legacy orders that is registration time, for signed orders
+  it is whatever the backend read from-chain when it signed (and re-verified against the signed
+  fields at settlement). A later `setFeeConfig` only affects orders created afterward, and can
+  never change what an already-issued signature pays. Split is `fee = amount * feeBps / 10_000`, `net = amount - fee` (lines 337–338,
   364–365).
 - **Stablecoin allowlist**: `mapping(address => bool) acceptedToken` (in `MainStorage`, line 62).
   `address(0)` (`NATIVE`, line 29) is the sentinel for the chain's native currency. Only the owner
@@ -167,9 +218,16 @@ in the **off-chain tooling**:
 
 ### 2.5 Existing tests
 
-- `contracts/test/PayWithQuai.test.js` (912 lines, standard Mocha/Chai via `hardhat-toolbox`).
-  Command: `npx hardhat test` (also `npm test` — `contracts/package.json`). Runs entirely on the
-  Hardhat in-process EVM — **no live Quai node or funds required**.
+- `contracts/test/PayWithQuai.test.js` (standard Mocha/Chai via `hardhat-toolbox`) and
+  `contracts/test/PayWithQuaiSigned.test.js` (signed-order + legacy-coexistence suite).
+  Command: `npx hardhat test` (also `npm test` — `contracts/package.json`); 108 tests pass.
+  Runs entirely on the Hardhat in-process EVM — **no live Quai node or funds required**.
+  The signed suite additionally covers: domain/type-hash pinning, signer allowlist
+  add/remove/kill-switch, bad-signature and wrong-domain rejection, `expectedPayer` binding,
+  `chainId` mismatch, tampering with every signed field, re-registration of an existing id,
+  expiry, double settlement, signer revoke after signing, pause behaviour on the signed path,
+  fee-recipient routing, native/ERC-20 settlement, and legacy pre-registered orders remaining
+  fully payable.
 - Coverage (by `describe` block): deployment/initialization guards, `registerOrder` (incl. batch
   and payer-restricted variants), `cancelOrder`, `payOrder` (ERC-20) incl. double-fulfillment and
   fee-flooring, `payOrderNative`, order expiry, fee-locked-at-registration (both fee rate and fee
@@ -298,7 +356,15 @@ scripts themselves read/write it.
 
 ---
 
-## 4. Backend relayer (`backend/`)
+## 4. Backend signer + merchant API (`backend/`)
+
+> This section predates the signed-order upgrade and describes the backend in its merchant-funded
+> form. What changed: `src/chain/relayer.ts` (transaction broadcaster) and `RELAYER_PRIVATE_KEY`
+> are **gone** — the backend no longer sends transactions and holds no gas. It now *signs*
+> authorizations off-chain (`src/chain/signer.ts`, `ORDER_SIGNER_PRIVATE_KEY`), mints order ids
+> per claim (`Store.mintClaimedOrder`), and enforces link expiry/cap itself, because with
+> customer-paid orders no on-chain order exists to carry those deadlines. Link "pools" survive
+> only as legacy leftovers for orders registered before the upgrade.
 
 ### 4.1 Framework, entry point, structure
 
@@ -307,7 +373,7 @@ scripts themselves read/write it.
 - Folder structure:
   - `src/api/` — `server.ts` (Express app + all routes, 910 lines), `cors.ts`, `rateLimit.ts`.
   - `src/chain/` — `client.ts` (`QuaiClient`, EVM/Quai read layer), `abi.ts` (minimal ABI),
-    `qi.ts` (`QiService`, Qi/UTXO layer).
+    `signer.ts` (EIP-712 order signer + JSON serialization), `qi.ts` (`QiService`, Qi/UTXO layer).
   - `src/indexer/` — `indexer.ts` (`Indexer`, EVM event indexer), `qi-indexer.ts` (`QiIndexer`).
   - `src/store/` — `index.ts` (`Store` interface), `json.ts` (file-backed impl), `postgres.ts`
     (Postgres impl).

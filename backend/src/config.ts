@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { DEV_API_KEY_PEPPER } from './util/apikey.js';
 
 /**
  * Environment configuration, validated at startup. Any missing/invalid value fails fast with a
@@ -69,6 +70,14 @@ const EnvSchema = z.object({
   // Only relevant in local dev — the dashboard runs on a different port than the backend.
   CORS_ORIGINS: z.string().default('*'),
   ADMIN_API_KEY: z.string().min(16, 'ADMIN_API_KEY should be at least 16 chars'),
+
+  // HMAC key used to derive the stored hash of every merchant API key. Merchant keys are bearer
+  // credentials, so they are persisted only as HMAC-SHA256(API_KEY_PEPPER, key) — a database dump
+  // (or a leaked backup, or a read-only SQL injection) therefore yields nothing an attacker can
+  // replay. Without the pepper, offline brute-forcing a stolen api_keys table becomes possible.
+  //   generate with:  node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+  // Must be STABLE across restarts and replicas: changing it invalidates every issued key.
+  API_KEY_PEPPER: z.string().min(16, 'API_KEY_PEPPER should be at least 16 chars').default(DEV_API_KEY_PEPPER),
   // Optional ERC-20 allowlist for payment links (comma-separated addresses). Native QUAI is
   // always allowed. When unset/empty, any 20-byte token address may be used.
   ACCEPTED_TOKENS: z
@@ -89,7 +98,10 @@ const EnvSchema = z.object({
   // The entire Qi surface is feature-gated: unless BOTH QI_MNEMONIC and QI_RPC_URL are set, the
   // backend never derives Qi addresses, order APIs return `qi: null`, and the Qi indexer is idle.
   //   QI_MNEMONIC: the merchant's Qi HD wallet seed phrase (BIP44, m/44'/969'/0'/0/<n>).
-  //   QI_RPC_URL:  a Quai Qi-chain JSON-RPC endpoint, e.g. https://qi-cyprus1.quai.network.
+  //   QI_RPC_URL:  a JSON-RPC endpoint for the chain Qi addresses live on. Qi derives on
+  //                Cyprus-1 (m/44'/969'/0'/0/<n>), so this is the SAME endpoint as the Quai
+  //                Cyprus-1 RPC: https://rpc.quai.network/cyprus1. The /cyprus1 path suffix is
+  //                required — the bare host answers eth_chainId but fails every eth_call.
   QI_MNEMONIC: z.string().min(1).optional(),
   QI_RPC_URL: z.string().url().optional(),
   // Qi price per 1 QUAI of an order, in qits. 1000 qits = 1 Qi, but the whole rate is tunable so a
@@ -121,6 +133,42 @@ const EnvSchema = z.object({
   // Force TLS for the Postgres connection (Railway requires it). Auto-detected from sslmode in
   // DATABASE_URL when present; set true explicitly if your URL omits it.
   DATABASE_SSL: boolish(false),
+
+  // --- e-commerce gateway (fiat-quoted prefilled orders for shop plugins) ---
+  // Live QUAI↔fiat rate feed used by POST /v1/gateway/orders. Points at a CoinGecko-style
+  // `simple/price` JSON (ids=quai-network, vs_currencies=usd,ngn). When unset (or on fetch
+  // failure) the fixed GATEWAY_FALLBACK_* rates are used; when neither exists the gateway rejects
+  // gateway orders with a clear "no rate available" error.
+  GATEWAY_RATE_URL: z.string().url().optional(),
+  // How long a fetched rate is cached before the next gateway quote re-fetches it.
+  GATEWAY_RATE_TTL_MS: z.coerce.number().int().positive().default(60_000),
+  GATEWAY_FALLBACK_USD_PER_QUAI: z
+    .string()
+    .optional()
+    .transform((v) => (v && v.trim() !== '' ? Number(v) : undefined))
+    .pipe(z.number().positive().optional()),
+  GATEWAY_FALLBACK_NGN_PER_QUAI: z
+    .string()
+    .optional()
+    .transform((v) => (v && v.trim() !== '' ? Number(v) : undefined))
+    .pipe(z.number().positive().optional()),
+  // Default per-merchant markup applied when a merchant hasn't set settings.quaiMarkupBps.
+  GATEWAY_MARKUP_BPS_DEFAULT: z.coerce.number().int().min(0).max(10_000).default(0),
+  // Public origin of the payment page (e.g. https://pay.example.com). Used to build the
+  // checkoutUrl a gateway order returns. When unset the backend derives it from the request
+  // (protocol + host) — set it explicitly behind a proxy/NAT so links stay correct.
+  PUBLIC_BASE_URL: z.string().url().optional(),
+
+  // --- off-chain order signing (customer pays gas) ---------------------------------------
+  // The backend signs EIP-712 order authorizations instead of broadcasting a registration tx, so
+  // the merchant never needs a funded wallet to publish a link and the platform spends no gas:
+  // the customer's own transaction creates and settles the order. The derived address must be
+  // allowlisted on each deployment with setSigner(address, true).
+  ORDER_SIGNER_PRIVATE_KEY: z
+    .string()
+    .regex(/^0x[0-9a-fA-F]{64}$/, 'ORDER_SIGNER_PRIVATE_KEY must be a 32-byte hex private key')
+    .optional(),
+
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
   LOG_PRETTY: boolish(false),
 });
@@ -137,6 +185,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       .map((i) => `  - ${i.path.join('.') || '(root)'}: ${i.message}`)
       .join('\n');
     throw new Error(`Invalid environment configuration:\n${issues}`);
+  }
+  // The dev default keeps `npm run dev` and the test-suite working with a zero-config .env, but it
+  // is a constant in the source, so production must supply a real one.
+  if (env.NODE_ENV === 'production' && parsed.data.API_KEY_PEPPER === DEV_API_KEY_PEPPER) {
+    throw new Error(
+      'API_KEY_PEPPER is required when NODE_ENV=production. Merchant API keys are stored as ' +
+        'HMAC-SHA256(pepper, key) so that a database leak cannot be replayed; without a real ' +
+        'pepper the API-key hashing silently falls back to a constant compiled into the source. ' +
+        'Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64url\'))" ' +
+        'and keep it stable across restarts and replicas.',
+    );
   }
   if (parsed.data.WEBHOOK_ALLOW_INSECURE_URLS && env.NODE_ENV === 'production') {
     throw new Error(

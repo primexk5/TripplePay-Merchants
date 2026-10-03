@@ -11,20 +11,20 @@ import {
   Smartphone,
   Wallet,
 } from "lucide-react";
-import { useState, useRef } from "react";
+import { useState, useRef, useSyncExternalStore } from "react";
 import { toPng } from "html-to-image";
 import { PaymentMethodSelector } from "@/components/checkout/payment-method-selector";
 import { Receipt } from "@/components/ui/receipt";
 import { Logo } from "@/components/logo";
 import QRCode from "react-qr-code";
 
-// Blip deep-link: opens the Blip mobile wallet (iOS & Android) directly to a pre-filled payment screen.
-// Format confirmed from blippay.me in-app browser integration docs.
-// Replace DEMO_MERCHANT_ADDRESS with your real merchant address in production.
-const DEMO_MERCHANT_ADDRESS = "0x89205A3A3b2A69De6Dbf7f01ED13B2108B2c43e7";
-function blipDeepLink(amount: string, label: string) {
-  return `blip://pay?to=${DEMO_MERCHANT_ADDRESS}&amount=${amount}&label=${encodeURIComponent(label)}`;
-}
+// Blip deep-link: opens a checkout page inside Blip's in-app browser (iOS & Android) so the
+// payment runs the registered-order flow (blip://browser?url=…), NOT a raw send-to-address
+// blip://pay?to=… link — a send-to-address link registers no order and fires no webhook
+// (see the docs warning in merchant-integration / /docs).
+const CHECKOUT_DEMO_PATH = "/checkout/demo";
+const blipDeepLink = (pageUrl: string) =>
+  `blip://browser?url=${encodeURIComponent(pageUrl)}`;
 import {
   newOrderId,
 } from "@/lib/payment";
@@ -47,6 +47,14 @@ export default function CheckoutDemoPage() {
   const [isConnectingWallet, setIsConnectingWallet] = useState(false);
   const receiptRef = useRef<HTMLDivElement>(null);
   const [downloading, setDownloading] = useState(false);
+  // Absolute URL for the Blip deep link — client-only value that is hydration-safe: servers render
+// the relative CHECKOUT_DEMO_PATH, browsers resolve the real location once. The Blip flow opens
+// THIS demo page inside Blip's in-app browser.
+const checkoutHref = useSyncExternalStore(
+  () => () => {},
+  () => window.location.href,
+  () => CHECKOUT_DEMO_PATH,
+);
 
   const downloadReceipt = async (orderId: string) => {
     if (!receiptRef.current) return;
@@ -248,7 +256,7 @@ export default function CheckoutDemoPage() {
                   {/* QR encodes a Blip deep-link so scanning auto-opens the Blip app (iOS & Android) */}
                   <div className="mb-4 rounded-2xl bg-white p-3 shadow-md ring-4 ring-[#C1ED00]/20">
                     <QRCode
-                      value={blipDeepLink(AMOUNT_QUAI, "Quai Store")}
+                      value={blipDeepLink(checkoutHref)}
                       size={160}
                       level="M"
                       fgColor="#0F1116"
@@ -259,12 +267,12 @@ export default function CheckoutDemoPage() {
                     Scan with Blip
                   </p>
                   <p className="mb-5 text-center text-xs text-[#8b93a7]">
-                    Open the Blip app → tap <span className="font-medium text-white">Scan</span> → payment pre-fills automatically.
+                    Open the Blip app → tap <span className="font-medium text-white">Scan</span> → this demo opens inside Blip&apos;s browser.
                   </p>
 
                   {/* "Open in Blip" deep-link — works when viewing on mobile */}
                   <a
-                    href={blipDeepLink(AMOUNT_QUAI, "Quai Store")}
+                    href={blipDeepLink(checkoutHref)}
                     className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#C1ED00] py-3 text-sm font-semibold text-[#0F1116] transition hover:bg-[#d4ff00]"
                   >
                     <Smartphone size={15} />

@@ -130,6 +130,13 @@ requires no manual migration step:
 - **Indexer cursors are untouched** — `cursorScope(chainId, contractAddress)` already existed
   before multi-chain support and its format hasn't changed, so a legacy deployment's existing
   cursor is picked up by its chain's indexer exactly as before, with no gap and no re-scan.
+- **Merchant API keys are upgraded in place.** Keys used to be stored as plaintext bearer secrets
+  and are now stored only as `HMAC-SHA256(API_KEY_PEPPER, key)`. Existing keys keep working with no
+  re-issue and no downtime: Postgres gets `key_hash`/`key_ref` columns via
+  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, and the first request that presents a still-plaintext
+  key rewrites that row hashed in place (emptying `key`) before the request is authorized. The JSON
+  store does the same thing in memory on load. A key that is never presented again is never
+  migrated — revoke it with `DELETE /v1/me/apikeys/:keyRef` instead.
 
 ## API
 
@@ -255,8 +262,29 @@ npm test            # vitest: signer, backoff, store idempotency, dispatcher del
   implement the `Store` interface (`src/store/index.ts`) over SQLite/Postgres — nothing else changes.
 - **Secrets:** `ADMIN_API_KEY` and per-merchant `webhookSecret`s are sensitive. Onboarding returns
   a secret once; store it encrypted. Re-onboarding the same address **rotates** the secret. The
-  store file (`DATABASE_PATH`) holds secrets in plaintext and is written `0600` inside a `0700`
-  directory — keep it off shared/backed-up paths.
+  store file (`DATABASE_PATH`) holds webhook secrets in plaintext and is written `0600` inside a
+  `0700` directory — keep it off shared/backed-up paths. Merchant API keys are the exception: they
+  are stored hashed, never in plaintext (see below).
+- **Merchant API keys are hashed at rest.** A merchant API key is a bearer credential that can
+  create gateway orders and move funds, so it is persisted only as
+  `HMAC-SHA256(API_KEY_PEPPER, key)`; the plaintext exists only in the `POST /v1/me/apikeys`
+  response and in the merchant's own environment. Consequences worth knowing:
+  - `API_KEY_PEPPER` is **required** when `NODE_ENV=production` — boot fails without it, because the
+    fallback pepper is a constant compiled into the source and would make a database leak
+    replayable. Generate with
+    `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"`.
+  - The pepper must be **stable across restarts and replicas**. Rotating it invalidates every key
+    already issued; treat it like the signing key it effectively is.
+  - `GET /v1/me/apikeys` returns metadata only (`keyRef`, `label`, timestamps) — listing keys never
+    echoes a usable credential.
+  - `DELETE /v1/me/apikeys/:keyRef` revokes by the short non-secret `keyRef` rather than the key, so
+    a credential never has to appear in a URL (and therefore never lands in access logs, proxy logs
+    or browser history). The `keyRef` is a truncated prefix of the stored hash.
+  - Why a keyed hash and not bcrypt/argon2: authentication needs an indexed equality lookup ("which
+    merchant owns this key?"), and password hashes are deliberately non-deterministic, which would
+    force a scan-and-verify over the whole table. These keys are 144 bits of `randomBytes`, not
+    guessable passwords, so a fast HMAC is the correct primitive; the pepper is what removes the
+    offline-brute-force risk that a stolen table would otherwise carry.
 - **Webhook URL safety (SSRF):** merchant webhook URLs must be `https` and must not resolve to a
   private/loopback/link-local/reserved address. This is enforced at onboarding **and** re-checked by
   DNS immediately before every delivery (blocking DNS-rebinding), and 3xx redirects are never

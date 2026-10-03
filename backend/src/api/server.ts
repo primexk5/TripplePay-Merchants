@@ -6,8 +6,9 @@ import type { ChainClient } from '../chain/types.js';
 import type { ChainRegistry } from '../chain/index.js';
 import type { QiService } from '../chain/qi.js';
 import type { Config } from '../config.js';
-import type { Merchant, Session, PaymentLink, WebhookDelivery, QiOrder } from '../types.js';
+import type { Merchant, Session, PaymentLink, WebhookDelivery, QiOrder, MerchantApiKey } from '../types.js';
 import { newMerchantId, newWebhookSecret, newSlug } from '../util/ids.js';
+import { generateApiKey } from '../util/apikey.js';
 import {
   normalizeAddressAnyKind,
   normalizeAddressForKind,
@@ -19,6 +20,15 @@ import { rateLimit } from './rateLimit.js';
 import { cors } from './cors.js';
 import { cursorScope } from '../indexer/indexer.js';
 import type { Indexer } from '../indexer/indexer.js';
+import { createRateProvider, type RateProvider } from '../gateway/rate-provider.js';
+import {
+  createOrderSigner,
+  serializeAuthorization,
+  type OrderSigner,
+  type SignedAuthorizationJson,
+} from '../chain/signer.js';
+import { getAddress as getQuaiAddress } from 'quais';
+import { getAddress as getEvmAddress } from 'ethers';
 import { log } from '../logger.js';
 
 const logger = log('api');
@@ -93,8 +103,14 @@ interface ChainHealthView {
  *   POST /v1/auth/login                   wallet-signature login -> bearer session token
  *   POST /v1/auth/logout                  invalidate the session token
  *   GET  /v1/me                           (session) the logged-in merchant's profile
- *   PATCH /v1/me                          (session) update own name/webhookUrl
+ *   PATCH /v1/me                          (session) update own name/webhookUrl + gateway settings
+ *   POST /v1/me/apikeys                   (merchant) issue a server-to-server API key (shown once)
+ *   GET  /v1/me/apikeys                   (merchant) list own API keys
+ *   DELETE /v1/me/apikeys/:key            (merchant) revoke an API key
  *   GET  /v1/me/deliveries                (session) own webhook deliveries
+ *   GET  /v1/me/qi                        (session) Qi settlement reconciliation
+ *   POST /v1/gateway/orders               (merchant) create a fiat-quoted single-pay order (gateway)
+ *   GET  /v1/gateway/orders/:gatewayId    (merchant) gateway order status
  *   GET  /v1/merchants                     (admin) list merchants
  *   POST /v1/merchants                     (admin) onboard a merchant -> returns webhook secret ONCE
  *   PATCH /v1/merchants/:address           (admin) update name/webhookUrl/active without rotating secret
@@ -102,7 +118,8 @@ interface ChainHealthView {
  *   POST /v1/deliveries/:id/retry          (admin) re-queue a failed/skipped delivery
  *   GET  /v1/chains                        (admin) configured chains + health
  * Admin routes require `Authorization: Bearer <ADMIN_API_KEY>`. Self-service routes require a
- * session token issued by POST /v1/auth/login.
+ * session token issued by POST /v1/auth/login, or (gateway + API-key routes) an `X-Merchant-Key`
+ * bearer issued by POST /v1/me/apikeys.
  *
  * `registry`/`indexers` are optional and additive: when absent (every existing caller/test that
  * predates multi-chain support), every route behaves exactly as it did against the single
@@ -116,6 +133,8 @@ export function createServer(
   qiService?: QiService,
   registry?: ChainRegistry,
   indexers?: Map<number, Indexer>,
+  rate: RateProvider = createRateProvider(cfg),
+  signer: OrderSigner = createOrderSigner(cfg),
 ): Express {
   // The single implied chain when no registry is configured — reproduces the pre-multi-chain
   // behaviour exactly (same id/kind normalization normalizeAddress/recoverMessageSigner used).
@@ -536,11 +555,14 @@ export function createServer(
         throw e;
       }
     }
-    const { name, webhookUrl } = parsed.data;
+    const { name, webhookUrl, settings } = parsed.data;
     const updated: Merchant = {
       ...merchant,
       name: name ?? merchant.name,
       webhookUrl: webhookUrl ?? merchant.webhookUrl,
+      settings: settings
+        ? { quaiMarkupBps: settings.quaiMarkupBps ?? merchant.settings?.quaiMarkupBps ?? 0, fiatCurrencies: settings.fiatCurrencies ?? merchant.settings?.fiatCurrencies ?? ['USD', 'NGN'] }
+        : merchant.settings,
     };
 await store.upsertMerchant(updated);
     // First webhook URL configured by the merchant themselves — catch up on payments that
@@ -568,6 +590,7 @@ await store.upsertMerchant(updated);
             source: meta.source,
             slug: meta.slug ?? null,
             shopName: link?.shopName ?? null,
+            reference: meta.reference ?? null,
           },
         };
       }),
@@ -583,6 +606,56 @@ await store.upsertMerchant(updated);
     });
   }));
 
+  const qiReconView = async (o: QiOrder, merchantAddress: string) => {
+    const delivery = await store.getDeliveryByOrder(merchantAddress, o.orderId);
+    const meta = await store.getOrderMeta(o.orderId);
+    const link = meta?.slug ? await store.getLink(meta.slug) : undefined;
+    return {
+      orderId: o.orderId,
+      address: o.address,
+      qits: o.qits,
+      receivedQits: o.receivedQits,
+      settled: o.settled,
+      txHashes: o.txHashes,
+      createdAt: o.createdAt,
+      settledAt: o.settledAt,
+      webhook: delivery ? { status: delivery.status, attempts: delivery.attempts } : null,
+      meta: {
+        source: meta?.source ?? null,
+        slug: meta?.slug ?? null,
+        shopName: link?.shopName ?? null,
+        reference: meta?.reference ?? null,
+      },
+    };
+  };
+
+  // Merchant self-service Qi reconciliation: every Qi order the merchant has been paid on (or is
+  // awaiting), the one-time receive addresses, and the accrued qits. This is the read surface for
+  // "what Qi have my customers sent and to which addresses?" — settlement detection and webhook
+  // delivery happen in the Qi indexer; here the merchant just reconciles against their HD wallet.
+  app.get('/v1/me/qi', auth, asyncHandler(async (req, res) => {
+    const session = res.locals.session as Session;
+    const merchant = await store.getMerchantById(session.merchantId);
+    if (!merchant) return res.status(404).json({ error: 'merchant not found' });
+
+    const orders = await store.listQiOrdersByMerchant(merchant.address);
+    const viewed = await Promise.all(orders.map((o) => qiReconView(o, merchant.address)));
+
+    const settled = viewed.filter((v) => v.settled);
+    const summary = {
+      total: viewed.length,
+      settled: settled.length,
+      pending: viewed.length - settled.length,
+      // Accrued value for the payout: sum of what the ledger books say arrived on the merchant's
+      // derived addresses, in qits. Overpayments (a payer sending more than required) are counted
+      // in receivedQits, so this is the real "sweep this much Qi" number for the HD wallet.
+      qitsRequired: settled.reduce((sum, v) => sum + BigInt(v.qits ?? '0'), 0n).toString(),
+      qitsReceived: settled.reduce((sum, v) => sum + BigInt(v.receivedQits ?? '0'), 0n).toString(),
+    };
+
+    res.json({ orders: viewed, summary });
+  }));
+
   // --- payment links (short URLs + multi-pay order pool) ---
 
   const CreateLinkSchema = z.object({
@@ -593,8 +666,14 @@ await store.upsertMerchant(updated);
     symbol: z.string().max(10),
     expiryDurationSecs: z.number().int().min(0).default(0),
     multiPay: z.boolean().default(false),
-    /** Pre-registered orderIds sent by the merchant after signing them on-chain. */
+    /**
+     * Legacy only: pre-registered orderIds from a merchant's on-chain `registerOrderBatch` call.
+     * New links send none — the backend mints and signs a fresh order per claim, so a merchant
+     * never needs a funded wallet to publish a link.
+     */
     orderPool: z.array(z.string().regex(/^0x[0-9a-fA-F]{64}$/)).default([]),
+    /** Cap on customers served by a multi-pay link. 0 = unlimited. */
+    maxRedemptions: z.number().int().min(0).max(100_000).default(0),
     /** Which chain this link is denominated on — a chain slug or numeric chainId. Defaults to
      *  the default chain. A link belongs to exactly ONE chain, fixed at creation. */
     chainId: ChainIdOrSlugSchema,
@@ -616,13 +695,16 @@ await store.upsertMerchant(updated);
       return res.status(400).json({ error: `unknown or disabled chain "${d.chainId}"` });
     }
 
-    // Single-pay links need exactly one orderId in the pool.
-    if (!d.multiPay && d.orderPool.length !== 1) {
-      return res.status(400).json({ error: 'single-pay link requires exactly one orderId in orderPool' });
+    // Without a signed-order signer, a link still needs pre-registered orders to be payable:
+    // there would be nothing to authorize at claim time.
+    if (!signer.enabled && d.orderPool.length === 0) {
+      return res.status(503).json({
+        error: 'link creation is unavailable — the order signer is not configured (ORDER_SIGNER_PRIVATE_KEY)',
+      });
     }
-    // Multi-pay links need at least one pre-registered order to be useful.
-    if (d.multiPay && d.orderPool.length === 0) {
-      return res.status(400).json({ error: 'multi-pay link requires at least one pre-registered orderId' });
+    // A single-pay link serves exactly one customer, so a cap above 1 would be misleading.
+    if (!d.multiPay && d.maxRedemptions > 1) {
+      return res.status(400).json({ error: 'single-pay link cannot allow more than one redemption' });
     }
 
     // Optional ERC-20 allowlist — this chain's own (ACCEPTED_TOKENS in legacy single-chain mode).
@@ -648,11 +730,18 @@ await store.upsertMerchant(updated);
       expiryDurationSecs: d.expiryDurationSecs,
       multiPay: d.multiPay,
       orderPool: d.orderPool,
+      maxRedemptions: d.multiPay ? d.maxRedemptions : 1,
       createdAt: Date.now(),
     };
     await store.upsertLink(link);
     logger.info(
-      { slug, merchantId: merchant.merchantId, chainId: chain.chainId, multiPay: d.multiPay, poolSize: d.orderPool.length },
+      {
+        slug,
+        merchantId: merchant.merchantId,
+        chainId: chain.chainId,
+        multiPay: d.multiPay,
+        maxRedemptions: link.maxRedemptions,
+      },
       'payment link created',
     );
     res.status(201).json(publicLink(link, chain));
@@ -699,6 +788,58 @@ await store.upsertMerchant(updated);
   // An unsettled claim older than this is considered abandoned and its orderId is handed back
   // out — otherwise abandoned checkouts permanently drain the pool until it reads "fully booked".
   const CLAIM_STALE_MS = 15 * 60 * 1000; // 15 minutes
+  // Don't mint an authorization with less life than this: a customer who signs it, waits, and
+  // submits would just lose gas to an OrderExpired revert.
+  const MIN_AUTHORIZATION_LIFE_SECS = 60;
+
+  /** The link's hard deadline, in Unix seconds (0 = never expires). */
+  function linkExpiresAtSecs(link: PaymentLink): number {
+    return link.expiryDurationSecs > 0
+      ? Math.floor(link.createdAt / 1000) + link.expiryDurationSecs
+      : 0;
+  }
+
+  /**
+   * Signs an authorization for one claimed order so the customer can create AND settle it in a
+   * single transaction — this is what removes the merchant's registration gas entirely.
+   *
+   * The fee and expiry are read from the chain at signing time (not taken from the request), so a
+   * link can never be re-quoted to a stale fee or an unbounded expiry. The payout address is the
+   * link's own merchant address, already established when the merchant created the link.
+   *
+   * Binds `expectedPayer` to the claiming wallet: without this, anyone able to see the
+   * authorization could settle the customer's order and deny them the purchase.
+   */
+  async function signClaimedOrder(
+    chain: ResolvedChain,
+    link: PaymentLink,
+    orderId: string,
+    payerAddress: string,
+  ): Promise<SignedAuthorizationJson> {
+    const [feeBps, feeRecipient] = await Promise.all([
+      chain.client.feeBps(),
+      chain.client.feeRecipient(),
+    ]);
+    // Expire at the LINK's deadline, not "now + window": an authorization must never outlive the
+    // checkout window the merchant advertised, or a link would stay payable indefinitely.
+    // 0 (link never expires) is preserved as a non-expiring authorization.
+    const expiry = linkExpiresAtSecs(link);
+    return serializeAuthorization(
+      await signer.sign(
+        {
+          merchant: link.merchantAddress,
+          orderId,
+          token: link.tokenAddress,
+          amount: BigInt(link.amount),
+          expiry,
+          feeBps: Number(feeBps),
+          feeRecipient,
+          expectedPayer: payerAddress,
+        },
+        { chainId: chain.chainId, contractAddress: chain.client.address },
+      ),
+    );
+  }
 
   app.post('/v1/links/:slug/claim', linkLimiter, asyncHandler(async (req, res) => {
     const slug = req.params.slug ?? '';
@@ -721,6 +862,55 @@ await store.upsertMerchant(updated);
       return res.status(400).json({ error: 'payerAddress fails checksum validation' });
     }
 
+    // Expiry has to be enforced HERE now. Previously the on-chain order's expiry did this job;
+    // with lazily created orders the backend is the only place that knows the link is dead, and
+    // it would otherwise keep minting valid authorizations for an expired link forever.
+    const expiresAtSecs = linkExpiresAtSecs(link);
+    if (expiresAtSecs > 0) {
+      const remainingSecs = expiresAtSecs - Math.floor(Date.now() / 1000);
+      if (remainingSecs <= 0) {
+        return res.status(410).json({ error: 'this payment link has expired' });
+      }
+      if (remainingSecs < MIN_AUTHORIZATION_LIFE_SECS) {
+        return res.status(410).json({ error: 'this payment link is about to expire' });
+      }
+    }
+
+    // Gateway links carry a FIXED pre-minted orderId from order creation: that one id is being sold
+    // to exactly one customer, so ownership has to be taken atomically. Unconditionally
+    // upserting here let any second wallet steal the id and walk away with its own signature,
+    // leaving the first wallet holding an authorization that can never settle.
+    if (link.gatewayOrderId) {
+      const fixed = await store.claimFixedOrder(slug, link.gatewayOrderId, payerAddress, CLAIM_STALE_MS);
+      if (fixed.status === 'settled') {
+        return res.status(409).json({ error: 'this order has already been paid' });
+      }
+      if (fixed.status === 'taken') {
+        return res.status(409).json({
+          error: 'this checkout is already being paid by another wallet',
+        });
+      }
+      if (!signer.enabled) {
+        // No signer configured: the gateway order was registered the old way and stays payable
+        // through payOrder, so the claim response carries no signature.
+        return res.json({
+          orderId: link.gatewayOrderId,
+          merchant: formatChainAddress(defaultChain().kind, link.merchantAddress),
+          token: link.tokenAddress,
+          amount: link.amount,
+          authorization: null,
+        });
+      }
+      const authorization = await signClaimedOrder(chain, link, link.gatewayOrderId, payerAddress);
+      return res.json({
+        orderId: link.gatewayOrderId,
+        merchant: formatChainAddress(chain.kind, link.merchantAddress),
+        token: link.tokenAddress,
+        amount: link.amount,
+        authorization,
+      });
+    }
+
     // 5-min double-pay guard: same wallet cannot claim again until previous claim expires.
     const latest = await store.getLatestClaim(slug, payerAddress);
     if (latest && !latest.settled) {
@@ -732,13 +922,19 @@ await store.upsertMerchant(updated);
           error: 'already claimed — wait before paying again',
           retryAfterSecs,
           orderId: latest.orderId, // let them reuse their already-claimed orderId
+          // Re-sign for the retry: the original authorization may be close to expiry, and the
+          // customer must still be the bound payer. Same orderId, so no extra redemption is used.
+          ...(signer.enabled
+            ? { authorization: await signClaimedOrder(chain, link, latest.orderId, payerAddress) }
+            : {}),
         });
       }
     }
 
     // Recycle abandoned checkouts first: an unsettled claim older than CLAIM_STALE_MS is
-    // reassigned to this payer instead of consuming a fresh pool slot. The orderId stays valid
-    // on-chain (link orders have no payer binding), so reuse is safe.
+    // reassigned to this payer instead of consuming a fresh redemption. Reuse is safe *only*
+    // because the authorization is re-signed for the new payer below — the old one was bound to
+    // the previous wallet and would correctly be rejected on-chain.
     const recycled = await store.reclaimStaleClaim(slug, payerAddress, CLAIM_STALE_MS);
     if (recycled) {
       logger.info({ slug, payerAddress, orderId: recycled }, 'stale claim recycled');
@@ -748,22 +944,34 @@ await store.upsertMerchant(updated);
         merchant: normalizeAddressForKind(chain.kind, link.merchantAddress),
         token: link.tokenAddress,
         amount: link.amount,
-        poolRemaining: link.orderPool.length,
+        ...(signer.enabled ? { authorization: await signClaimedOrder(chain, link, recycled, payerAddress) } : {}),
       });
     }
 
-    const orderId = await store.claimOrderFromPool(slug, payerAddress);
+    // A legacy link still holds pre-registered orders: use those first so no merchant's
+    // already-paid-for gas is wasted. Once the pool is empty, mint on demand instead.
+    const pooled = link.orderPool.length > 0 ? await store.claimOrderFromPool(slug, payerAddress) : undefined;
+    const orderId = pooled ?? (await store.mintClaimedOrder(slug, payerAddress, link.maxRedemptions ?? 0));
     if (!orderId) {
-      return res.status(503).json({ error: 'no orders available — pool exhausted; ask the merchant to add more' });
+      return res.status(503).json({
+        error: link.multiPay
+          ? 'this link has no remaining payments — ask the merchant for a new link'
+          : 'this link is not available for payment',
+      });
     }
-    logger.info({ slug, payerAddress, orderId }, 'order claimed from pool');
+    logger.info(
+      { slug, payerAddress, orderId, source: pooled ? 'pool' : 'minted' },
+      'order claimed',
+    );
     res.json({
       orderId,
       chainId: link.chainId,
       merchant: normalizeAddressForKind(chain.kind, link.merchantAddress),
       token: link.tokenAddress,
       amount: link.amount,
-      poolRemaining: link.orderPool.length,
+      // Present only when a signer is configured; the customer submits it with their payment so
+      // the order is created and settled in the one transaction they pay gas for.
+      ...(signer.enabled ? { authorization: await signClaimedOrder(chain, link, orderId, payerAddress) } : {}),
     });
   }));
 
@@ -786,6 +994,40 @@ await store.upsertMerchant(updated);
       return res.status(503).json({ error: 'Qi payments are only available for links on the Quai chain' });
     }
 
+    // Gateway (shop-plugin) links have a fixed pre-minted orderId and skip the pool entirely:
+    // no pops, no stale-claim recycling, no sentinel holder. The order was allocated at order
+    // creation; here we just materialize its Qi receive address and record the checkout context.
+    if (link.gatewayOrderId) {
+      const orderId = link.gatewayOrderId;
+      const qits = qiService.orderQits(BigInt(link.amount));
+      const rec = await qiService.ensureQiOrder(orderId, link.merchantAddress, qits);
+      if (!rec) {
+        return res.status(500).json({ error: 'could not allocate a Qi receive address — try again' });
+      }
+      // Preserve the merchant's shop reference already stored at order-creation time (source
+      // refreshes to 'link' now the customer is actually paying this link).
+      const existing = await store.getOrderMeta(orderId);
+      await store.saveOrderMeta({
+        orderId,
+        chainId: link.chainId,
+        merchantAddress: link.merchantAddress.toLowerCase(),
+        customerName: existing?.customerName,
+        source: 'link',
+        slug,
+        reference: existing?.reference,
+        createdAt: Date.now(),
+      });
+      logger.info({ slug, orderId }, 'gateway Qi order checkout started');
+      res.json({
+        orderId,
+        merchant: formatChainAddress(defaultChain().kind, link.merchantAddress),
+        amount: link.amount,
+        poolRemaining: 0,
+        qi: qiView(rec),
+      });
+      return;
+    }
+
     // Recycle abandoned Qi reservations too: an earlier qi-claim that never received funds leaves
     // its order bound to the sentinel payer; handing the order back keeps the pool from draining.
     const recycled = await store.reclaimStaleClaim(slug, 'qi', CLAIM_STALE_MS);
@@ -799,6 +1041,17 @@ await store.upsertMerchant(updated);
     if (!rec) {
       return res.status(500).json({ error: 'could not allocate a Qi receive address — try again' });
     }
+    // Record the link context at reservation time so a later settlement can (a) mark the claim
+    // row settled and (b) surface on the dashboard as a payment-link source, exactly like the
+    // on-chain path's POST /meta does right after confirmation.
+    await store.saveOrderMeta({
+      orderId: rec.orderId,
+      chainId: link.chainId,
+      merchantAddress: link.merchantAddress.toLowerCase(),
+      source: 'link',
+      slug,
+      createdAt: Date.now(),
+    });
     if (!recycled) {
       logger.info({ slug, orderId }, 'order reserved for Qi payment');
     } else {
@@ -812,6 +1065,230 @@ await store.upsertMerchant(updated);
       poolRemaining: link.orderPool.length,
       qi: qiView(rec),
     });
+  }));
+
+  // --- e-commerce gateway (fiat-quoted, prefilled single-pay orders for shop plugins) ---
+  // Two auth surfaces share these routes: a session (dashboard / curl) OR an `X-Merchant-Key`
+  // bearer issued by POST /v1/me/apikeys (server-to-server store plugins).
+  const merchantAuth = requireMerchant(store);
+
+  const gatewayLimiter = rateLimit({
+    windowMs: cfg.PUBLIC_RATE_LIMIT_WINDOW_MS ?? 60_000,
+    max: cfg.PUBLIC_RATE_LIMIT_MAX ?? 60,
+  });
+
+  const CreateGatewayOrderSchema = z.object({
+    // Fiat amount the customer should pay, e.g. "25.00" (decimal string; parsed as a number).
+    amount: z.string().regex(/^\d+(\.\d+)?$/, 'amount must be a fiat decimal string, e.g. "25.00"'),
+    fiatCurrency: z.string().min(2).max(12),
+    // The shop's own order number/ref — echoed back verbatim in the settlement webhook (data.reference).
+    reference: z.string().trim().min(1).max(100).optional(),
+    customerName: z.string().trim().min(1).max(60).optional(),
+    // Settlement asset. 'qi' = gas-free one-time address (default). 'quai' = EVM order.
+    token: z.enum(['quai', 'qi']).optional().default('qi'),
+    // Legacy EVM method: the merchant's own pre-registered on-chain orderId. Omit it — the
+    // backend mints an id and authorizes it per claim, so no registration (and no gas) is needed.
+    orderId: z.string().regex(/^0x[0-9a-fA-F]{64}$/).optional(),
+    // Checkout-window length; the EVM order (when we register it) expires after this.
+    expiresInSecs: z.number().int().min(60).max(7 * 24 * 3600).optional().default(1800),
+  });
+
+  app.post('/v1/gateway/orders', merchantAuth, gatewayLimiter, asyncHandler(async (req, res) => {
+    const merchant = res.locals.merchant as Merchant;
+    const parsed = CreateGatewayOrderSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'invalid body', issues: parsed.error.issues });
+    }
+    const d = parsed.data;
+
+    // The gateway settles on the deployment's default chain. It is Quai-only today (Qi has no
+    // EVM equivalent, and the pricing feed is keyed to Quai), so a deployment whose default is
+    // an EVM chain must be told plainly rather than handed a Quai-denominated link.
+    const gatewayChain = defaultChain();
+    if (gatewayChain.kind !== 'quai') {
+      return res.status(501).json({
+        error: `gateway checkout is not available on '${gatewayChain.name}' — it currently supports Quai only`,
+      });
+    }
+
+    // --- fiat → QUAI quote: live rate + merchant markup, rounded UP to wei (never underpaid) ---
+    const markets = (merchant.settings?.fiatCurrencies ?? ['USD', 'NGN']).map((c) => c.toLowerCase());
+    const cur = d.fiatCurrency.toLowerCase();
+    if (!markets.includes(cur)) {
+      return res.status(400).json({ error: `currency ${d.fiatCurrency} is not enabled for this merchant` });
+    }
+    const fiat = Number(d.amount);
+    if (!Number.isFinite(fiat) || fiat <= 0) {
+      return res.status(400).json({ error: 'amount must be a positive number' });
+    }
+    const rates = await rate.getRates([d.fiatCurrency]);
+    const rawFiatPerQuai = rates[cur];
+    if (!rawFiatPerQuai) {
+      return res.status(503).json({
+        error: `no market rate available for ${d.fiatCurrency} — try again later (or configure GATEWAY_FALLBACK_*)`,
+      });
+    }
+    const markupBps = merchant.settings?.quaiMarkupBps ?? cfg.GATEWAY_MARKUP_BPS_DEFAULT;
+    const quai = (fiat / rawFiatPerQuai) * (1 + markupBps / 10_000);
+    const wei = BigInt(Math.ceil(quai * 1e18));
+
+    // --- allocate the payable order for the settlement asset ---
+    let orderId: string;
+    if (d.token === 'qi') {
+      // Gas-free: no EVM order exists — the platform derives a one-time Qi receive address on
+      // first checkout. orderId is just the ledger key for this shop order.
+      orderId = '0x' + randomBytes(32).toString('hex').toLowerCase();
+    } else if (d.orderId) {
+      // Legacy: the merchant registered this order themselves and paid its gas up front.
+      orderId = d.orderId.toLowerCase();
+      const onChain = await client.getOrder(merchant.address, orderId);
+      if (!onChain.exists) {
+        return res.status(400).json({ error: 'orderId is not registered on-chain for this merchant' });
+      }
+    } else if (signer.enabled) {
+      // Off-chain only: the orderId is minted here and authorized when the customer claims it,
+      // so the platform spends no gas and the merchant needs no funded wallet.
+      orderId = '0x' + randomBytes(32).toString('hex').toLowerCase();
+    } else {
+      return res.status(503).json({
+        error:
+          'QUAI checkout is unavailable — the order signer is not configured (ORDER_SIGNER_PRIVATE_KEY)',
+      });
+    }
+
+    const slug = newSlug();
+    const now = Date.now();
+    const link: PaymentLink = {
+      slug,
+      chainId: gatewayChain.chainId,
+      merchantAddress: merchant.address,
+      merchantId: merchant.merchantId,
+      merchantName: merchant.name,
+      shopName: merchant.name,
+      tokenAddress: ZERO_ADDRESS,
+      amount: wei.toString(),
+      amountDisplay: nativeDisplay(wei),
+      symbol: 'QUAI',
+      expiryDurationSecs: d.expiresInSecs,
+      multiPay: false,
+      orderPool: [],
+      maxRedemptions: 1,
+      gatewayOrderId: orderId,
+      createdAt: now,
+    };
+    await store.upsertLink(link);
+    // Shop reference lives on the order metadata so the settlement webhook can echo it back.
+    await store.saveOrderMeta({
+      orderId,
+      chainId: gatewayChain.chainId,
+      merchantAddress: merchant.address.toLowerCase(),
+      customerName: d.customerName,
+      source: 'checkout',
+      reference: d.reference,
+      createdAt: now,
+    });
+
+    const base = cfg.PUBLIC_BASE_URL ?? `${req.protocol}://${req.get('host')}`;
+    logger.info(
+      { slug, merchantId: merchant.merchantId, token: d.token, currency: d.fiatCurrency, wei: wei.toString(), markupBps },
+      'gateway order created',
+    );
+    res.status(201).json({
+      gatewayId: slug,
+      reference: d.reference ?? null,
+      merchant: formatChainAddress(defaultChain().kind, merchant.address),
+      checkoutUrl: `${base.replace(/\/+$/, '')}/pay/${slug}`,
+      expiresAt: now + d.expiresInSecs * 1000,
+      token: d.token,
+      orderId,
+      quote: {
+        currency: d.fiatCurrency.toUpperCase(),
+        amount: d.amount,
+        quaiWei: wei.toString(),
+        quaiDisplay: nativeDisplay(wei),
+        fiatPerQuai: rawFiatPerQuai,
+        markupBps,
+      },
+    });
+  }));
+
+  // Payment status for the plugin: same fields the merchant would pull by polling the checkout
+  // page, aggregated into one call. `paid` = delivered webhook; `settled` = confirmed but delivery
+  // pending; `pending`/`expired` = awaiting or missed.
+  app.get('/v1/gateway/orders/:gatewayId', merchantAuth, gatewayLimiter, asyncHandler(async (req, res) => {
+    const merchant = res.locals.merchant as Merchant;
+    const link = await store.getLink(req.params.gatewayId ?? '');
+    if (!link || !link.gatewayOrderId || link.merchantAddress !== merchant.address.toLowerCase()) {
+      return res.status(404).json({ error: 'gateway order not found' });
+    }
+    const meta = await store.getOrderMeta(link.gatewayOrderId);
+    const delivery = await store.getDeliveryByOrder(merchant.address, link.gatewayOrderId);
+    const expired = link.expiryDurationSecs > 0 && Date.now() > link.createdAt + link.expiryDurationSecs * 1000;
+    let qi: ReturnType<typeof qiView> | null = null;
+    if (qiService?.enabled) {
+      const rec = await store.getQiOrder(link.gatewayOrderId);
+      if (rec) qi = qiView(rec);
+    }
+    const status = qi
+      ? (qi.settled ? 'paid' : expired ? 'expired' : 'pending')
+      : delivery
+        ? (delivery.status === 'delivered' ? 'paid' : 'settled')
+        : expired
+          ? 'expired'
+          : 'pending';
+    res.json({
+      gatewayId: link.slug,
+      reference: meta?.reference ?? null,
+      token: link.tokenAddress === ZERO_ADDRESS ? 'quai' : link.tokenAddress,
+      amount: link.amount,
+      createdAt: link.createdAt,
+      expiresAt: link.expiryDurationSecs > 0 ? link.createdAt + link.expiryDurationSecs * 1000 : null,
+      status,
+      orderId: link.gatewayOrderId,
+      qi,
+      webhook: delivery ? { status: delivery.status, attempts: delivery.attempts } : null,
+    });
+  }));
+
+  // --- merchant server-to-server API keys (X-Merchant-Key) ---
+
+  const CreateApiKeySchema = z.object({ label: z.string().trim().min(1).max(60) });
+
+  app.post('/v1/me/apikeys', merchantAuth, asyncHandler(async (req, res) => {
+    const merchant = res.locals.merchant as Merchant;
+    const parsed = CreateApiKeySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'invalid body', issues: parsed.error.issues });
+    }
+    const now = Date.now();
+    // Only the HMAC is persisted; `key` exists in this response and nowhere else, ever.
+    const { key, keyId } = generateApiKey();
+    const { keyRef } = await store.createMerchantApiKey({
+      key,
+      merchantAddress: merchant.address.toLowerCase(),
+      label: parsed.data.label,
+      createdAt: now,
+    });
+    logger.info({ merchantId: merchant.merchantId, label: parsed.data.label, keyId }, 'merchant API key issued');
+    res.status(201).json({ key, keyRef, label: parsed.data.label, createdAt: now });
+  }));
+
+  // Metadata only. A previously-returned list of live credentials is enough to take over every
+  // merchant account on the deployment, so listing must never echo the secret back.
+  app.get('/v1/me/apikeys', merchantAuth, asyncHandler(async (req, res) => {
+    const merchant = res.locals.merchant as Merchant;
+    res.json({ apiKeys: await store.listMerchantApiKeys(merchant.address) });
+  }));
+
+  // Revoke by keyRef. The credential itself must never appear in a URL — it would be captured by
+  // access logs, proxies and browser history, where it outlives the revocation.
+  app.delete('/v1/me/apikeys/:keyRef', merchantAuth, asyncHandler(async (req, res) => {
+    const merchant = res.locals.merchant as Merchant;
+    const keyRef = req.params.keyRef ?? '';
+    const mine = await store.listMerchantApiKeys(merchant.address);
+    if (!mine.some((k) => k.keyRef === keyRef)) return res.status(404).json({ error: 'api key not found' });
+    await store.revokeMerchantApiKeyByRef(keyRef);
+    res.sendStatus(204);
   }));
 
   // --- admin ---
@@ -906,9 +1383,18 @@ await store.upsertMerchant(updated);
       name: z.string().min(1).max(200).optional(),
       webhookUrl: z.string().url().optional(),
       active: z.boolean().optional(),
+      // Gateway pricing: the markup (bps, 0..10000) applied over the live QUAI market rate, and
+      // the fiat currencies this shop quotes in. Managed via the merchant dashboard; admin PATCH
+      // manages the rest. An empty currency array is rejected — a shop always quotes in something.
+      settings: z
+        .object({
+          quaiMarkupBps: z.number().int().min(0).max(10_000).optional(),
+          fiatCurrencies: z.array(z.string().min(2).max(12)).min(1).optional(),
+        })
+        .optional(),
     })
-    .refine((v) => v.name !== undefined || v.webhookUrl !== undefined || v.active !== undefined, {
-      message: 'at least one of name, webhookUrl or active is required',
+    .refine((v) => v.name !== undefined || v.webhookUrl !== undefined || v.active !== undefined || v.settings !== undefined, {
+      message: 'at least one of name, webhookUrl, active or settings is required',
     });
 
   admin.patch('/merchants/:address', asyncHandler(async (req, res) => {
@@ -935,13 +1421,16 @@ await store.upsertMerchant(updated);
       }
     }
     // Deliberately NOT rotating the webhook secret here — PATCH updates profile fields (name /
-    // url / active); rotating would break the merchant's signature verification out of the blue.
-    const { name, webhookUrl, active } = parsed.data;
+    // url / active / settings); rotating would break the merchant's signature verification out of the blue.
+    const { name, webhookUrl, active, settings } = parsed.data;
     const updated: Merchant = {
       ...existing,
       name: name ?? existing.name,
       webhookUrl: webhookUrl ?? existing.webhookUrl,
       active: active ?? existing.active,
+      settings: settings
+        ? { quaiMarkupBps: settings.quaiMarkupBps ?? existing.settings?.quaiMarkupBps ?? 0, fiatCurrencies: settings.fiatCurrencies ?? existing.settings?.fiatCurrencies ?? ['USD', 'NGN'] }
+        : existing.settings,
     };
 await store.upsertMerchant(updated);
     // First time a webhook URL is configured: re-queue payments that settled while it was
@@ -1014,7 +1503,21 @@ function publicMerchant(m: Merchant) {
     webhookUrl: m.webhookUrl,
     active: m.active,
     createdAt: m.createdAt,
+    settings: m.settings ?? { quaiMarkupBps: 0, fiatCurrencies: ['USD', 'NGN'] },
   };
+}
+
+/** Wei → readable native amount, trimmed of trailing zeros ("25000000000000000000" → "25"). */
+function nativeDisplay(wei: bigint) {
+  const s = (Number(wei) / 1e18).toFixed(6);
+  return s.replace(/\.?0+$/, '');
+}
+
+/** EIP-55 checksummed address for a chain kind — the gateway's response `merchant` field. Quai
+ *  addresses checksum via `quais`, EVM ones via `ethers`; both accept the other's output but
+ *  produce different casing for the same hex, so pick the flavor from the chain. */
+function formatChainAddress(kind: ChainAddressKind, address: string): string {
+  return kind === 'evm' ? getEvmAddress(address) : getQuaiAddress(address);
 }
 
 /** Link view — omits the internal orderPool array; pool size only. Includes the link's chain
@@ -1038,6 +1541,10 @@ function publicLink(l: PaymentLink, chain: ResolvedChain | undefined) {
     symbol: l.symbol,
     expiryDurationSecs: l.expiryDurationSecs,
     multiPay: l.multiPay,
+    /** Customer cap for a multi-pay link (0 = unlimited). Replaces the old pool size, since
+     *  there is no pre-registered pool left to exhaust. */
+    maxRedemptions: l.maxRedemptions ?? 0,
+    /** Legacy only: pre-registered orders still held by links created before signed orders. */
     poolSize: l.orderPool.length,
     createdAt: l.createdAt,
   };
@@ -1110,6 +1617,43 @@ function requireSession(store: Store) {
           return res.status(401).json({ error: 'unauthorized — log in again' });
         }
         res.locals.session = session;
+        next();
+      })
+      .catch(next);
+  };
+}
+
+/** Require a merchant: either a valid session (bearer/cookie) OR an `X-Merchant-Key` API key.
+ *  On success res.locals.merchant is set (and res.locals.session when a session was used). */
+function requireMerchant(store: Store) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const apiKey = req.header('x-merchant-key') ?? '';
+    if (apiKey) {
+      void store
+        .getMerchantByApiKey(apiKey)
+        .then((merchant) => {
+          if (!merchant || !merchant.active) {
+            return res.status(401).json({ error: 'invalid merchant key' });
+          }
+          res.locals.merchant = merchant;
+          next();
+        })
+        .catch(next);
+      return;
+    }
+    const token = bearerToken(req) || cookieToken(req) || '';
+    void store
+      .getSession(token)
+      .then(async (session) => {
+        if (!session) {
+          return res.status(401).json({ error: 'unauthorized — log in or send X-Merchant-Key' });
+        }
+        const merchant = await store.getMerchantById(session.merchantId);
+        if (!merchant || !merchant.active) {
+          return res.status(401).json({ error: 'unauthorized' });
+        }
+        res.locals.session = session;
+        res.locals.merchant = merchant;
         next();
       })
       .catch(next);

@@ -15,13 +15,9 @@ import {
 import { useEffect, useState } from "react";
 import { parseError } from "@/lib/utils";
 import { DashboardShell } from "@/components/layout/dashboard-shell";
-import { WalletSelector } from "@/components/ui/wallet-selector";
 import { checkSession } from "@/lib/auth";
-import { getActiveWallet, ensureNetwork, silentActiveWalletAddress } from "@/lib/wallets";
 import {
   ZERO_ADDRESS,
-  newOrderId,
-  registerOrderBatch,
   createPaymentLink,
   fetchMyLinks,
   type LinkInfo,
@@ -45,32 +41,29 @@ function shortUrl(slug: string): string {
   return `/pay/${slug}`;
 }
 
-type ExpiryResult =
-  | { ok: true; expiry: bigint; expiryDurationSecs: number }
-  | { ok: false };
+type ExpiryResult = { ok: true; expiryDurationSecs: number } | { ok: false };
 
 /**
- * Derives the on-chain `expiry` (registered immutably) and the `expiryDurationSecs` sent to the
- * backend from ONE captured timestamp, so the two can never drift apart. Call this exactly once,
- * at submit time — never twice, and never during render (Date.now() is impure; this must only
- * run in response to the merchant's click, not on an arbitrary re-render).
+ * The checkout window, in seconds, sent to the backend.
+ *
+ * There is no longer an on-chain `expiry` to keep in sync: orders are created lazily, so the
+ * backend stamps each authorization with this window at claim time. A blank field means the link
+ * never expires.
  */
 function computeExpiry(expiryHoursInput: string): ExpiryResult {
-  if (expiryHoursInput.trim() === "") return { ok: true, expiry: 0n, expiryDurationSecs: 0 };
+  if (expiryHoursInput.trim() === "") return { ok: true, expiryDurationSecs: 0 };
   const hours = Number(expiryHoursInput);
   if (!Number.isFinite(hours) || hours <= 0) return { ok: false };
-  const expiryDurationSecs = Math.round(hours * 3600);
-  const submittedAtSecs = Math.floor(Date.now() / 1000);
-  return { ok: true, expiry: BigInt(submittedAtSecs + expiryDurationSecs), expiryDurationSecs };
+  return { ok: true, expiryDurationSecs: Math.round(hours * 3600) };
 }
 
-const POOL_SIZE_OPTIONS = [5, 10, 20, 50];
+/** How many customers a multi-pay link serves. 0 = unlimited. This is a backend counter, not a
+ *  pre-registered pool: there is no on-chain order to run out. */
+const MAX_REDEMPTION_OPTIONS = [0, 5, 10, 25, 50, 100];
 
 export default function LinksPage() {
-  // The wallet the merchant signed in with — the ONLY payout destination.
+  // The wallet the merchant signed in with — the ONLY payout destination, fixed at sign-in.
   const [merchantAddress, setMerchantAddress] = useState<string | null>(null);
-  // The account currently exposed by the connected wallet (must equal merchantAddress).
-  const [connectedAddress, setConnectedAddress] = useState<string | null>(null);
   // Which chain this link will be created on — a link belongs to exactly one chain, chosen here.
   const CHAINS = listChains();
   const [chain, setChain] = useChainSelector();
@@ -97,9 +90,8 @@ export default function LinksPage() {
   const [shopName, setShopName] = useState("");
   const [expiryHours, setExpiryHours] = useState("");
   const [multiPay, setMultiPay] = useState(false);
-  const [poolTarget, setPoolTarget] = useState(10);
+  const [maxRedemptions, setMaxRedemptions] = useState(0);
   const [busy, setBusy] = useState(false);
-  const [registering, setRegistering] = useState(false);
   const [link, setLink] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [links, setLinks] = useState<LinkInfo[]>([]);
@@ -133,44 +125,15 @@ export default function LinksPage() {
     };
   }, []);
 
-  // Read the already-connected account silently; connect only if none is available.
-  useEffect(() => {
-    void (async () => {
-      const addr = await silentActiveWalletAddress().catch(() => null);
-      if (addr) setConnectedAddress(addr);
-    })();
-  }, []);
-
   const create = async () => {
     const payout = merchantAddress;
     if (!payout) {
       setError("Sign in with your wallet to create payment links.");
       return;
     }
-    // Re-verify the wallet is STILL connected before signing — connectedAddress is a snapshot
-    // from mount (or the last successful connect) and goes stale if the extension locks or
-    // disconnects mid-session. Without this, a merchant hits a cryptic signing error deep in
-    // registerOrderBatch with no "Connect wallet" button visible to recover with, since that UI
-    // only renders while connectedAddress is empty.
-    const stillConnected = await silentActiveWalletAddress().catch(() => null);
-    if (!stillConnected) {
-      setConnectedAddress(null);
-      setError("Your wallet disconnected — connect it again to continue.");
-      return;
-    }
-    if (stillConnected.toLowerCase() !== connectedAddress?.toLowerCase()) {
-      setConnectedAddress(stillConnected);
-    }
-    if (!connectedAddress) {
-      setError("Connect your wallet to sign order registrations — it also receives the payments.");
-      return;
-    }
-    if (connectedAddress.toLowerCase() !== payout.toLowerCase()) {
-      setError(
-        "The connected wallet doesn't match your registered payout wallet — connect the wallet you signed in with.",
-      );
-      return;
-    }
+    // The payout address is the wallet the merchant signed in with, and the backend only ever
+    // signs authorizations paying out to it. Nothing else here needs a wallet: no order is
+    // registered on-chain, so there is no transaction to sign and no gas to spend.
     let units: bigint;
     try {
       units = toUnits(amount, selected.decimals);
@@ -183,47 +146,22 @@ export default function LinksPage() {
       return;
     }
 
-    const poolSize = multiPay ? poolTarget : 1;
     setBusy(true);
-    setRegistering(true);
     setError(null);
     setLink(null);
 
     // Registry currencies carry their canonical mainnet address; native uses ZERO_ADDRESS.
     const onChainToken: string = selected.address;
 
-    // `expiry` is registered on-chain and can never be changed afterwards, so it and
-    // `expiryDurationSecs` (sent to the backend, shown to the merchant) must derive from the
-    // exact same captured instant — see computeExpiry's own note on why this can't be two
-    // separate Date.now() reads.
     const expiryResult = computeExpiry(expiryHours);
     if (!expiryResult.ok) {
       setError("Expiry must be a positive number of hours.");
       setBusy(false);
-      setRegistering(false);
       return;
     }
-    const { expiry, expiryDurationSecs } = expiryResult;
+    const { expiryDurationSecs } = expiryResult;
 
-    const orderIds: string[] = [];
     try {
-      for (let i = 0; i < poolSize; i++) orderIds.push(newOrderId());
-
-      // Make sure the connected wallet is actually on the chosen chain before asking it to
-      // sign — it may still be on whatever chain it was last switched to. ensureNetwork refuses
-      // outright (no RPC call) if the connected wallet can't serve this chain at all, with a
-      // specific, named error instead of a stuck wallet.
-      const activeWallet = getActiveWallet();
-      if (activeWallet) {
-        await ensureNetwork(activeWallet, chain);
-      }
-
-      // Register all orders on-chain in one atomic transaction — signed by the connected
-      // wallet, which is the payout wallet (assertMerchantSigner enforces the match).
-      await registerOrderBatch(payout, orderIds, onChainToken, units, expiry, chain);
-      setRegistering(false);
-
-      // Create the short link in the backend
       const created = await createPaymentLink({
         shopName: shopName.trim(),
         tokenAddress: onChainToken,
@@ -232,12 +170,12 @@ export default function LinksPage() {
         symbol,
         expiryDurationSecs,
         multiPay,
-        orderPool: orderIds,
+        maxRedemptions: multiPay ? maxRedemptions : 1,
+        orderPool: [],
         chainId: chain.chainId,
       });
 
-      const url = shortUrl(created.slug);
-      setLink(url);
+      setLink(shortUrl(created.slug));
 
       // Refresh links list
       try {
@@ -254,7 +192,6 @@ export default function LinksPage() {
       setError(parseError(err) || "Failed to create payment link.");
     } finally {
       setBusy(false);
-      setRegistering(false);
     }
   };
 
@@ -293,35 +230,18 @@ export default function LinksPage() {
                     {merchantAddress}
                   </p>
                   <p className="mt-1 text-xs leading-5 text-[#8b93a7]">
-                    Payments settle straight to your connected wallet on
-                    whichever chain each link is created on — a platform fee
-                    of 0.3% is deducted at settlement.
+                    Payments settle straight to this address on whichever chain
+                    each link is created on — a platform fee of 0.3% is deducted
+                    at settlement.
                   </p>
-                  {connectedAddress &&
-                  connectedAddress.toLowerCase() !== merchantAddress.toLowerCase() ? (
-                    <p className="mt-3 rounded-lg border border-amber-400/20 bg-amber-400/6 px-3 py-2.5 text-xs leading-5 text-amber-300">
-                      The wallet connected in this browser (
-                      {connectedAddress.slice(0, 8)}…) is not your registered
-                      payout wallet. Connect the wallet you signed in with — it
-                      signs order registrations and receives every payment.
-                    </p>
-                  ) : null}
                 </div>
 
-                {!connectedAddress && (
-                  <div>
-                    <p className="mb-2 text-sm text-[#8b93a7]">
-                      Connect your wallet to sign order registrations
-                    </p>
-                    <WalletSelector
-                      connectedAddress={null}
-                      onConnected={(addr) => setConnectedAddress(addr)}
-                      onDisconnect={() => setConnectedAddress(null)}
-                      label="Connect wallet"
-                      chain={chain}
-                    />
-                  </div>
-                )}
+                <p className="-mt-2 text-xs leading-5 text-[#8b93a7]">
+                  You don&apos;t need to connect a wallet or hold any gas to
+                  publish a link. Each order is created and settled by the
+                  customer&apos;s own payment transaction, and payments arrive
+                  here.
+                </p>
 
                 <div className="grid gap-4 sm:grid-cols-2">
                   {/* Chain — the feature this phase exists for: a link is fixed to exactly one
@@ -447,10 +367,10 @@ export default function LinksPage() {
                         </p>
                         <p className="mt-1 text-xs text-[#8b93a7]">
                           Allow multiple customers to pay using the same link.
-                          You pre-register a pool of orders on-chain; each
-                          customer claims one slot with a single wallet popup.
-                          Same wallet is blocked from re-paying within 5
-                          minutes.
+                          Each customer&apos;s payment creates its own order in
+                          their transaction — no pool to pre-register and no
+                          gas for you to spend. The same wallet is blocked from
+                          re-paying within 5 minutes.
                         </p>
                       </div>
                     </div>
@@ -471,32 +391,44 @@ export default function LinksPage() {
                   {multiPay && (
                     <div className="mt-4 border-t border-white/7 pt-4">
                       <p className="mb-2 text-sm text-[#8b93a7]">
-                        Pool size — number of orders to pre-register
+                        Customer limit — how many customers can pay this link
                       </p>
                       <div className="flex gap-2 flex-wrap">
-                        {POOL_SIZE_OPTIONS.map((n) => (
+                        {MAX_REDEMPTION_OPTIONS.map((n) => (
                           <button
                             key={n}
-                            onClick={() => setPoolTarget(n)}
+                            onClick={() => setMaxRedemptions(n)}
                             className={`rounded-lg border px-4 py-2 text-sm font-medium transition ${
-                              poolTarget === n
+                              maxRedemptions === n
                                 ? "border-[#38bdf8] bg-[#38bdf8]/10 text-[#38bdf8]"
                                 : "border-white/7 text-[#8b93a7] hover:text-white"
                             }`}
                           >
-                            {n} orders
+                            {n === 0 ? "Unlimited" : n}
                           </button>
                         ))}
                       </div>
-                      <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber-400/20 bg-amber-400/6 px-3 py-2.5">
+                      <div className="mt-3 flex items-start gap-2 rounded-lg border border-[#38bdf8]/20 bg-[#38bdf8]/6 px-3 py-2.5">
                         <AlertCircle
                           size={13}
-                          className="mt-0.5 shrink-0 text-amber-300"
+                          className="mt-0.5 shrink-0 text-[#38bdf8]"
                         />
-                        <p className="text-xs text-amber-300">
-                          Creating this link will ask your wallet to sign exactly{" "}
-                          <strong>1 transaction</strong> to pre-register all {poolTarget} payment slots at once.
-                          You pay the gas; customers only pay for their payment transaction.
+                        <p className="text-xs text-[#38bdf8]">
+                          {maxRedemptions === 0 ? (
+                            <>
+                              This link stays open indefinitely. Each
+                              customer&apos;s payment creates its own order in
+                              their transaction.
+                            </>
+                          ) : (
+                            <>
+                              This link serves up to{" "}
+                              <strong>{maxRedemptions}</strong>{" "}
+                              {maxRedemptions === 1 ? "customer" : "customers"}
+                              , then stops. Publish another link to keep
+                              selling.
+                            </>
+                          )}
                         </p>
                       </div>
                     </div>
@@ -520,9 +452,7 @@ export default function LinksPage() {
                     <Plus size={16} />
                   )}
                   {busy
-                    ? registering
-                      ? "Registering orders on-chain…"
-                      : "Creating short link…"
+                    ? "Creating short link…"
                     : `Create ${symbol} payment link`}
                 </button>
 
@@ -622,7 +552,14 @@ export default function LinksPage() {
                           <p className="mt-0.5 truncate font-mono text-xs text-[#4f5868]">
                             /pay/{l.slug} ·{" "}
                             {new Date(l.createdAt).toLocaleString()}
-                            {l.multiPay && ` · ${l.poolSize} slot${l.poolSize !== 1 ? "s" : ""} left`}
+                            {l.multiPay &&
+                              (l.maxRedemptions
+                                ? ` · up to ${l.maxRedemptions} customers`
+                                : " · unlimited customers")}
+                            {l.multiPay &&
+                              l.poolSize !== undefined &&
+                              l.poolSize > 0 &&
+                              ` · ${l.poolSize} legacy slot${l.poolSize !== 1 ? "s" : ""} left`}
                           </p>
                         </div>
                         <div className="flex shrink-0 items-center gap-2">

@@ -58,7 +58,7 @@ async function main() {
   const receipt = await tx.wait();
   console.log(`   tx: ${receipt.hash}`);
 
-  // Parse the PaymentReceived event the relayer would pick up.
+  // Parse the PaymentReceived event the backend indexer picks up.
   for (const log of receipt.logs) {
     let parsed;
     try {
@@ -79,7 +79,7 @@ async function main() {
 
   const settled = await pay.isSettled(wallet.address, orderId);
   console.log(`\nOrder settled on-chain: ${settled}`);
-  console.log('The relayer would now POST a "payment.confirmed" webhook to the merchant.');
+  console.log('The backend indexer would now POST a "payment.confirmed" webhook to the merchant.');
 
   // --- Native QUAI round: same loop, settlement in QUAI via msg.value ---
   console.log('\n--- Native QUAI round ---');

@@ -178,9 +178,15 @@ export class Indexer {
       return;
     }
 
-    const merchant = await this.store.getMerchantByAddress(e.merchant);
+    // Resolve by the PAYOUT address, not the identity address. `e.merchant` is the address the
+    // customer actually paid, read straight off the event, so it is the merchant's configured
+    // destination for this chain — which is not necessarily their login address. Looking this up
+    // with getMerchantByAddress would silently miss the moment those two diverge and turn every
+    // delivery into a `skipped` row against an unknown merchant.
+    const merchant = await this.store.getMerchantByPayoutAddress(this.cfg.CHAIN_ID, e.merchant);
+    const meta = await this.store.getOrderMeta(e.orderId); // gateway links carry data.reference
     const nowMs = this.now();
-    const payload = this.buildPayload(id, e, merchant?.merchantId ?? unknownMerchantId(e.merchant), order.feeBps, order.nonce);
+    const payload = this.buildPayload(id, e, merchant?.merchantId ?? unknownMerchantId(e.merchant), order.feeBps, order.nonce, meta?.reference);
 
     // No merchant registered for this payout address: record the payment but don't attempt delivery.
     if (!merchant) {
@@ -242,7 +248,7 @@ export class Indexer {
     }
   }
 
-  private buildPayload(id: string, e: PaymentEvent, merchantId: string, feeBps: number, orderNonce: bigint): WebhookPayload {
+  private buildPayload(id: string, e: PaymentEvent, merchantId: string, feeBps: number, orderNonce: bigint, reference?: string): WebhookPayload {
     // Mirror the contract's split exactly (PayWithQuai: fee = amount * feeBps / BPS_DENOMINATOR,
     // BPS_DENOMINATOR = 10000, integer division). The merchant nets the remainder.
     const fee = (e.amount * BigInt(feeBps)) / BPS_DENOMINATOR;
@@ -266,6 +272,7 @@ export class Indexer {
         blockNumber: e.blockNumber,
         timestamp: e.eventTimestamp,
         nonce: Number(orderNonce),
+        ...(reference !== undefined ? { reference } : {}),
       },
     };
   }

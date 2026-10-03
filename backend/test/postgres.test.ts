@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import type { Merchant, WebhookDelivery, PaymentLink, LinkClaim } from '../src/types.js';
 import { PostgresStore } from '../src/store/postgres.js';
+import { generateApiKey } from '../src/util/apikey.js';
 
 /**
  * Behavioral parity suite for {@link PostgresStore} — the same scenarios the JsonStore suite
@@ -88,7 +89,7 @@ describePg('PostgresStore', () => {
     // Unlike the JsonStore suite (fresh temp file per test), tests here share one database —
     // truncate so no test can collide with fixtures left behind by a previous test.
     await store.pool.query(
-      `TRUNCATE cursors, merchants, deliveries, sessions, nonces, links, claims CASCADE`,
+      `TRUNCATE cursors, merchants, deliveries, sessions, nonces, links, claims, api_keys CASCADE`,
     );
   });
 
@@ -267,5 +268,47 @@ describePg('PostgresStore', () => {
       (await s2.getDeliveryByOrder('0x00000000000000000000000000000000000000a1', '0x' + '11'.repeat(32)))?.id,
     ).toBe('x:0');
     await s2.close();
+  });
+
+  // Regression: createMerchantApiKey writes ONLY the hash columns (key_hash/key_ref). It used to
+  // be untested against Postgres, so a fresh database — where the api_keys DDL still declared
+  // `key TEXT PRIMARY KEY` — rejected every insert with "null value in column key", breaking
+  // POST /v1/me/apikeys, which is exactly how a merchant connects their Shopify store. These
+  // assertions run against the real schema so that regression cannot reappear.
+  it('issues an API key against the real schema (legacy `key` column stays nullable)', async () => {
+    const addr = '0x00000000000000000000000000000000000000a1';
+    await store.upsertMerchant(merchant({ address: addr }));
+    const { key } = generateApiKey();
+
+    const { keyRef } = await store.createMerchantApiKey({ key, merchantAddress: addr, label: 'shopify', createdAt: 1 });
+    expect(keyRef).toMatch(/^qmk_[0-9a-f]{8}$/);
+    expect((await store.getMerchantByApiKey(key))?.address).toBe(addr);
+  });
+
+  it('never stores the plaintext API key and lists only metadata', async () => {
+    const addr = '0x00000000000000000000000000000000000000a1';
+    await store.upsertMerchant(merchant({ address: addr }));
+    const { key } = generateApiKey();
+    await store.createMerchantApiKey({ key, merchantAddress: addr, label: 'shopify', createdAt: 1 });
+
+    const raw = await store.pool.query('SELECT key, key_hash FROM api_keys');
+    expect(raw.rows).toHaveLength(1);
+    expect(raw.rows[0].key).toBeNull();
+    expect(raw.rows[0].key_hash).not.toContain(key);
+
+    const listed = await store.listMerchantApiKeys(addr);
+    expect(listed).toHaveLength(1);
+    expect(JSON.stringify(listed)).not.toContain(key);
+  });
+
+  it('revokes an API key by its non-secret ref', async () => {
+    const addr = '0x00000000000000000000000000000000000000a1';
+    await store.upsertMerchant(merchant({ address: addr }));
+    const { key } = generateApiKey();
+    const { keyRef } = await store.createMerchantApiKey({ key, merchantAddress: addr, label: 'shopify', createdAt: 1 });
+
+    await store.revokeMerchantApiKeyByRef(keyRef);
+    expect(await store.getMerchantByApiKey(key)).toBeUndefined();
+    expect(await store.listMerchantApiKeys(addr)).toHaveLength(0);
   });
 });

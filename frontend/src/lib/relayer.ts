@@ -10,6 +10,7 @@ import { currencyDecimals, currencySymbol } from "@/lib/currencies";
 import { getChainById, getDefaultChain, type ChainInfo, type ChainKind } from "@/lib/chains";
 import { getActiveWallet, getWalletChainId, subscribeToWalletChanges } from "@/lib/wallets";
 import { getSessionToken, isLoggedIn, logout } from "@/lib/auth";
+import { qitsToQi } from "@/lib/qi";
 
 export interface DeliveryData {
   merchant: string;
@@ -24,6 +25,15 @@ export interface DeliveryData {
   txHash: string;
   blockNumber: number;
   timestamp: number;
+  /** Ledger discriminator. Absent on pre-Qi payloads ("quai"/"token"). */
+  asset?: "quai" | "token" | "qi";
+  /** Present only when asset === "qi". Full UTXO settlement context. */
+  qi?: {
+    address: string;
+    qits: string;
+    receivedQits: string;
+    txHashes: string[];
+  };
 }
 
 /** Optional payer context the payment pages report to the backend (absent → null). */
@@ -270,7 +280,14 @@ export function formatTokenAmount(value: bigint, decimals: number, kind: ChainKi
  *  that knows "native uses the chain's own nativeCurrency; anything else goes through the
  *  chain-indexed currencies registry", so the two never drift apart. */
 function formatChainAmount(net: string | bigint, token: string, chain: ChainInfo): string {
-  if (token.toLowerCase() === ZERO_ADDRESS) {
+  const t = token.toLowerCase();
+  // Qi settles with the "qi" token sentinel and qits amounts (1000 qits = 1 Qi). It is a
+  // Quai-only UTXO rail, so it has no entry in any chain's ERC-20 registry and must be
+  // handled before the currency lookups below (which would otherwise label it as some token).
+  if (t === "qi") {
+    return chain.kind === "quai" ? `${qitsToQi(String(net))} Qi` : `${String(net)} qi`;
+  }
+  if (t === ZERO_ADDRESS) {
     const formatted = formatTokenAmount(BigInt(net), chain.nativeCurrency.decimals, chain.kind);
     return `${formatted} ${chain.nativeCurrency.symbol}`;
   }
@@ -328,4 +345,73 @@ export function deliveryExplorerUrl(chainId: number, txHash: string): string | n
   const chain = getChainById(chainId);
   if (!chain?.explorerUrl) return null;
   return `${chain.explorerUrl}/tx/${txHash}`;
+}
+/** One Qi order as seen by the merchant on /v1/me/qi (see qiReconView in the backend). */
+export interface QiReconOrder {
+  orderId: string;
+  address: string;
+  qits: string;
+  receivedQits: string;
+  settled: boolean;
+  txHashes: string[];
+  createdAt: number;
+  settledAt: number | null;
+  webhook: { status: string; attempts: number } | null;
+  meta: {
+    source: "link" | "checkout" | null;
+    slug: string | null;
+    shopName: string | null;
+  };
+}
+
+export interface QiRecon {
+  orders: QiReconOrder[];
+  summary: {
+    total: number;
+    settled: number;
+    pending: number;
+    qitsRequired: string;
+    qitsReceived: string;
+  };
+}
+
+/** Qi settlement reconciliation for the signed-in merchant. Requires /v1/me/qi (no demo/admin route),
+ *  so it only polls when a merchant session is active and the merchant's backend has Qi enabled. */
+export function useQiRecon(intervalMs = 15000) {
+  const [recon, setRecon] = useState<QiRecon | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      if (!isLoggedIn()) {
+        setRecon(null);
+        setError(null);
+        setLoading(false);
+        return;
+      }
+      const r = await adminGet<QiRecon>("/v1/me/qi");
+      setRecon(r);
+      setError(null);
+    } catch (err) {
+      if (err instanceof HttpError && err.status === 401) {
+        setError("Qi sync requires a logged-in merchant session.");
+      } else {
+        setError(parseError(err));
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const timer = setInterval(() => void refresh(), intervalMs);
+    const initial = setTimeout(() => void refresh(), 0);
+    return () => {
+      clearInterval(timer);
+      clearTimeout(initial);
+    };
+  }, [refresh, intervalMs]);
+
+  return { recon, loading, error, refresh };
 }
