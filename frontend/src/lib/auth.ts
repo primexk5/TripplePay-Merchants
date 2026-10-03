@@ -10,7 +10,7 @@ import {
   chainsSupportedBy,
   type DetectedWallet,
 } from "@/lib/wallets";
-import { listChains } from "@/lib/chains";
+import { listAvailableChains } from "@/lib/chains";
 
 /**
  * Session management for the merchant dashboard.
@@ -122,9 +122,15 @@ export async function loginWithWallet(
   // wallet like MetaMask onto Quai (Cyprus-1): a network it has no quai_* support for, leaving it
   // stuck with "unsupported operation". A wallet that can't serve any configured chain fails
   // here with a clear message instead.
-  const supportedChains = chainsSupportedBy(wallet, listChains());
+  // Only chains that are actually live (contract deployed + backend configured) are valid login
+  // targets. listChains() includes misconfigured/not-yet-launched chains whose chainIds the
+  // backend registry won't recognise — sending one produces a 400 from /v1/auth/challenge.
+  const supportedChains = chainsSupportedBy(wallet, listAvailableChains());
   if (supportedChains.length === 0) {
-    throw new Error(`${wallet.name} can't sign for any chain this app supports.`);
+    throw new Error(
+      `${wallet.name} can't sign for any chain this deployment currently supports. ` +
+        `Make sure your wallet is connected to a supported network.`,
+    );
   }
   const currentHex = await getWalletChainId(wallet.provider);
   const currentChainId = currentHex ? parseInt(currentHex, 16) : NaN;

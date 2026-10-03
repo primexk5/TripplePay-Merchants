@@ -135,6 +135,11 @@ type WalletSelectorProps = {
    *  `expectedAddress`. The wallet is NOT stored as active and the session is untouched — purely
    *  informational, so the caller can offer "sign in as that account" or "cancel". */
   onAddressMismatch?: (wallet: DetectedWallet, address: string) => void;
+  /** When true, skip chain-capability filtering entirely — every detected wallet is enabled and
+   *  `connectWallet` is called with a fallback chain matching the wallet's kind (Quai-native or
+   *  EVM). Use this for flows that only need a valid address (e.g. merchant onboarding), not a
+   *  chain-ready connection. All existing callers pass false (the default). */
+  addressOnly?: boolean;
   /** Adds a "Network" section to the SAME panel, below the wallet list: the current chain plus
    *  every other configured chain, switchable via the wallet's own network-switch prompt
    *  (ensureNetwork) — no separate control, no page reload. Opt-in (default false) so every
@@ -155,6 +160,7 @@ export function WalletSelector({
   connectedLabel,
   expectedAddress,
   onAddressMismatch,
+  addressOnly = false,
   showChainSwitcher = false,
 }: WalletSelectorProps) {
   const [open, setOpen] = useState(false);
@@ -254,8 +260,39 @@ export function WalletSelector({
         // wallet actually supports — no target network to switch to yet (the caller resolves
         // and switches to one afterwards, e.g. loginWithWallet signing for the wallet's current
         // chain).
-        const supportedChains = chainsSupportedBy(wallet, configuredChains);
-        const validationChain = supportedChains[0];
+        //
+        // addressOnly mode: used for flows (e.g. merchant onboarding) that only need a valid
+        // address, not a chain-ready connection. Skip chain-capability filtering — pick any
+        // configured chain matching the wallet's kind, or fall back to a synthetic EVM stub so
+        // even wallets with no matching live chain can still provide an address.
+        let validationChain: ChainInfo | undefined;
+        if (addressOnly) {
+          // Try to find ANY chain (even non-live) matching this wallet's kind so connectWallet
+          // knows which validation path to take (Quai zone check vs EVM checksum).
+          const allC = listChains();
+          validationChain = wallet.supportsQuai
+            ? allC.find((c) => c.kind === "quai")
+            : allC.find((c) => c.kind === "evm");
+          if (!validationChain) {
+            // Absolute fallback: construct a minimal EVM-shaped chain info so connectWallet can
+            // still validate an EVM address — no network switch happens since we return early.
+            validationChain = {
+              chainId: 1,
+              slug: "evm-fallback",
+              name: "EVM",
+              kind: "evm",
+              rpcUrl: "",
+              contractAddress: "0x0000000000000000000000000000000000000000",
+              explorerUrl: undefined,
+              nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+              availability: "live",
+              available: true,
+            };
+          }
+        } else {
+          const supportedC = chainsSupportedBy(wallet, configuredChains);
+          validationChain = supportedC[0];
+        }
         if (!validationChain) {
           throw new Error(`${wallet.name} can't sign for any chain this app supports.`);
         }
@@ -412,15 +449,17 @@ export function WalletSelector({
                   {showChainSwitcher ? "Wallet & network" : "Connect a wallet"}
                 </h3>
                 <p className="mt-1 text-sm text-[#8b93a7]">
-                  {showChainSwitcher
-                    ? "Which wallet you're using, and which network it's on."
-                    : chain === "any"
-                      ? configuredChains.length > 0
-                        ? `Connect any wallet that can sign for ${configuredChains.map((c) => c.name).join(" or ")}.`
-                        : "No chain is currently available in this deployment — contact support."
-                      : chain.kind === "quai"
-                        ? "Only Blip, Pelagus and MetaMask can sign for Quai."
-                        : `Any browser wallet except Blip can sign for ${chain.name}.`}
+                  {addressOnly
+                    ? "Connect any Quai or EVM wallet to use as your settlement address."
+                    : showChainSwitcher
+                      ? "Which wallet you're using, and which network it's on."
+                      : chain === "any"
+                        ? configuredChains.length > 0
+                          ? `Connect any wallet that can sign for ${configuredChains.map((c) => c.name).join(" or ")}.`
+                          : "No chain is currently available in this deployment — contact support."
+                        : chain.kind === "quai"
+                          ? "Only Blip, Pelagus and MetaMask can sign for Quai."
+                          : `Any browser wallet except Blip can sign for ${chain.name}.`}
                 </p>
               </div>
 
@@ -455,15 +494,20 @@ export function WalletSelector({
               )}
 
               {wallets.map((wallet) => {
-                const supportedChains = chain === "any" ? chainsSupportedBy(wallet, configuredChains) : undefined;
-                const supported = chain === "any" ? supportedChains!.length > 0 : walletSupportsChain(wallet, chain);
+                // addressOnly: skip chain capability check — all wallets can provide an address.
+                const supportedChains = !addressOnly && chain === "any" ? chainsSupportedBy(wallet, configuredChains) : undefined;
+                const supported = addressOnly
+                  ? true
+                  : chain === "any"
+                    ? supportedChains!.length > 0
+                    : walletSupportsChain(wallet, chain);
                 // A wallet that looks "incompatible" may really just be blocked by a chain that
                 // isn't live right now (not-yet-launched, or this deployment's own misconfiguration)
                 // rather than an actual capability mismatch — e.g. Pelagus (Quai-only) reporting
                 // "not compatible" purely because Quai's contract address is unset here. Check
                 // against the FULL chain table, not just the live ones, so we can name the real
                 // problem instead of blaming the wallet for it.
-                const blockedByChain = !supported
+                const blockedByChain = !addressOnly && !supported
                   ? (chain === "any" ? allChains : [chain]).find(
                       (c) => c.availability !== "live" && walletSupportsChain(wallet, c),
                     )
@@ -473,6 +517,29 @@ export function WalletSelector({
                   : chain === "any"
                     ? "Not compatible with any configured chain"
                     : `Not compatible with ${chain.name}`;
+                const sublabel = addressOnly
+                  ? wallet.id === active?.id
+                    ? "Previously connected"
+                    : wallet.supportsQuai
+                      ? "Quai wallet — connect to capture your address"
+                      : "EVM wallet — connect to capture your address"
+                  : chain === "any"
+                    ? supported
+                      ? wallet.id === active?.id
+                        ? "Previously connected"
+                        : `Signs for ${supportedChains!.map((c) => c.name).join(", ")}`
+                      : blockedByChain
+                        ? chainUnavailableReason(blockedByChain)
+                        : "Not compatible with any configured chain"
+                    : supported
+                      ? wallet.id === active?.id
+                        ? "Previously connected"
+                        : `${chain.name} ready`
+                      : blockedByChain
+                        ? chainUnavailableReason(blockedByChain)
+                        : chain.kind === "quai"
+                          ? "Not Quai-compatible — install Pelagus or Blip"
+                          : "Not compatible with this chain";
                 return (
                 <button
                   key={wallet.id}
@@ -488,23 +555,7 @@ export function WalletSelector({
                       {wallet.name}
                     </span>
                     <span className="block text-xs text-[#8b93a7]">
-                      {chain === "any"
-                        ? supported
-                          ? wallet.id === active?.id
-                            ? "Previously connected"
-                            : `Signs for ${supportedChains!.map((c) => c.name).join(", ")}`
-                          : blockedByChain
-                            ? chainUnavailableReason(blockedByChain)
-                            : "Not compatible with any configured chain"
-                        : supported
-                          ? wallet.id === active?.id
-                            ? "Previously connected"
-                            : `${chain.name} ready`
-                          : blockedByChain
-                            ? chainUnavailableReason(blockedByChain)
-                            : chain.kind === "quai"
-                              ? "Not Quai-compatible — install Pelagus or Blip"
-                              : "Not compatible with this chain"}
+                      {sublabel}
                     </span>
                   </span>
 

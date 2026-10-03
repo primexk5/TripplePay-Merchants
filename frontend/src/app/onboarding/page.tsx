@@ -343,6 +343,7 @@ export default function OnboardingPage() {
                         }}
                         label="Connect settlement wallet"
                         chain="any"
+                        addressOnly
                       />
                     </div>
                   )}
