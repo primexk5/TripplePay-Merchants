@@ -134,6 +134,23 @@ const EnvSchema = z.object({
   // DATABASE_URL when present; set true explicitly if your URL omits it.
   DATABASE_SSL: boolish(false),
 
+  // Supabase's *direct* host (db.<ref>.supabase.co) publishes only an AAAA record, so it is
+  // unreachable from any IPv4-only runtime — including Render. Use the IPv4 pooler host
+  // (aws-0-<region>.pooler.supabase.com) instead. Prefer the SESSION pooler on :5432 over the
+  // transaction pooler on :6543: node-postgres sends parameterized queries over the extended
+  // protocol, which PgBouncer in transaction mode does not support.
+  //
+  // A session-pooler connection occupies one backend for its lifetime, so the pool must stay
+  // small: Supabase's free tier allows only a handful of connections per project. Lower this
+  // (3-5) whenever DATABASE_URL points at Supabase.
+  DATABASE_POOL_MAX: z.coerce.number().int().positive().max(100).default(10),
+
+  // Supabase and Railway both present publicly-trusted certificates for their own hostnames, so
+  // `rejectUnauthorized: true` does work against them. It stays off by default because some
+  // managed-Postgres proxies present chains node can't verify, and turning this on must be a
+  // deliberate, tested step rather than a silent production boot failure.
+  DATABASE_SSL_REJECT_UNAUTHORIZED: boolish(false),
+
   // --- e-commerce gateway (fiat-quoted prefilled orders for shop plugins) ---
   // Live QUAI↔fiat rate feed used by POST /v1/gateway/orders. Points at a CoinGecko-style
   // `simple/price` JSON (ids=quai-network, vs_currencies=usd,ngn). When unset (or on fetch

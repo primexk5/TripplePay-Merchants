@@ -33,7 +33,11 @@ export class PostgresStore implements Store {
    *  the real default chain's chainId (see index.ts). */
   constructor(
     connectionString: string,
-    options: { ssl?: boolean } = {},
+    options: {
+      ssl?: boolean;
+      maxConnections?: number;
+      rejectUnauthorized?: boolean;
+    } = {},
     private readonly defaultChainId: number = 9,
     apiKeyPepper: string = '',
   ) {
@@ -45,8 +49,13 @@ export class PostgresStore implements Store {
     const ssl = options.ssl ?? (sslMode !== null && sslMode !== 'disable');
     this.pool = new Pool({
       connectionString,
-      max: 10,
-      ssl: ssl ? { rejectUnauthorized: false } : undefined,
+      max: options.maxConnections ?? 10,
+      ssl: ssl ? { rejectUnauthorized: options.rejectUnauthorized ?? false } : undefined,
+      // Without this, an unreachable database (Supabase's direct host is IPv6-only, so an
+      // IPv4-only host like Render resolves nothing and hangs) leaves the Pool retrying forever
+      // and the process never reaches `listen`. Failing fast turns that into a boot error the
+      // deploy log actually names, instead of a port-scan timeout with no cause.
+      connectionTimeoutMillis: 10_000,
     });
   }
 
@@ -234,6 +243,15 @@ export class PostgresStore implements Store {
     await this.pool.query('UPDATE order_meta SET chain_id = $1 WHERE chain_id IS NULL', [this.defaultChainId]);
     await this.pool.query('CREATE INDEX IF NOT EXISTS links_chain ON links (chain_id)');
     await this.pool.query('CREATE INDEX IF NOT EXISTS order_meta_chain ON order_meta (chain_id)');
+
+    // Ownership moved from the merchant's address to their stable merchant_id, but the indexes
+    // left behind still lead with merchant_address — so listLinksForMerchant
+    // (`WHERE merchant_id = $1 ORDER BY created_at DESC`) had no usable index and seq-scanned
+    // `links` on every dashboard load. `links_merchant` is kept: address-keyed lookups still
+    // use it, and dropping an index a live deployment depends on is not this migration's call.
+    await this.pool.query(
+      'CREATE INDEX IF NOT EXISTS links_merchant_id ON links (merchant_id, created_at DESC)',
+    );
   }
 
   // --- indexer cursor ---

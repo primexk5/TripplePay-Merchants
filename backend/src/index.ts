@@ -49,7 +49,11 @@ async function main(): Promise<void> {
     ? (() => {
         const pg = new PostgresStore(
           cfg.DATABASE_URL,
-          { ssl: cfg.DATABASE_SSL },
+          {
+            ssl: cfg.DATABASE_SSL,
+            maxConnections: cfg.DATABASE_POOL_MAX,
+            rejectUnauthorized: cfg.DATABASE_SSL_REJECT_UNAUTHORIZED,
+          },
           registry.default.config.chainId,
           cfg.API_KEY_PEPPER,
         );
