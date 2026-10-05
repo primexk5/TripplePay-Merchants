@@ -167,19 +167,25 @@ const QUAI_MAINNET: ChainInfoInput = {
 // (Etherscan-family explorer), which implies an ETH-denominated gas token — no canonical
 // name/symbol for it is published anywhere in this repo as of writing. Verify with the team
 // before this chain goes past testnet; override via NEXT_PUBLIC_CHAINS if it's wrong.
-// launched omitted (defaults true) — this chain has a hardcoded real fallback address below, so
-// it's always live regardless; the env var only needs to be set to OVERRIDE it.
+// Opt-in, like every other chain here: no hardcoded fallback address. Offering a chain the
+// relayer has not enabled makes the dashboard offer it and then fail every write with
+// `unknown or disabled chain "46630"`, so an unconfigured deployment must not advertise it.
+const robinhoodTestnetAddress = process.env.NEXT_PUBLIC_ROBINHOOD_TESTNET_PAYWITHQUAI_ADDRESS;
 const ROBINHOOD_TESTNET: ChainInfoInput = {
   chainId: 46630,
   slug: "robinhood-testnet",
   name: "Robinhood Chain (testnet)",
   kind: "evm",
   rpcUrl: process.env.NEXT_PUBLIC_ROBINHOOD_TESTNET_RPC_URL ?? "https://rpc.testnet.chain.robinhood.com/rpc",
-  contractAddress:
-    process.env.NEXT_PUBLIC_ROBINHOOD_TESTNET_PAYWITHQUAI_ADDRESS ?? "0xe2C0d033102B7ad963deC4b44B5e1e94bca1385f",
+  contractAddress: robinhoodTestnetAddress ?? ZERO_ADDRESS,
   addressEnvVar: "NEXT_PUBLIC_ROBINHOOD_TESTNET_PAYWITHQUAI_ADDRESS",
   explorerUrl: "https://explorer.testnet.chain.robinhood.com",
   nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+  launched:
+    !!robinhoodTestnetAddress &&
+    robinhoodTestnetAddress !== ZERO_ADDRESS &&
+    robinhoodTestnetAddress !== "undefined" &&
+    robinhoodTestnetAddress !== "false",
 };
 
 // launched: false — a roadmap fact: no PayWithQuai contract has been deployed to Base Sepolia
