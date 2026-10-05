@@ -62,6 +62,26 @@ export interface IndexerHealth {
  * block) is persisted, so a restart resumes exactly where it left off; enqueue is idempotent on
  * (txHash, logIndex), so a replayed block cannot double-deliver.
  */
+/** Scheme/host/path of an RPC URL, safe to log.
+ *
+ *  The zone is the whole point — a wrong zone path is the failure this exists to make
+ *  diagnosable — so the path is kept. Credentials are not: the query string is dropped outright,
+ *  and any path segment long enough to be a key is masked, because some providers (Alchemy-style)
+ *  embed the secret in the path rather than the query. Zone names are short ("cyprus1", "orchard"),
+ *  so masking over 12 characters separates the two cases reliably. */
+function rpcEndpointForLog(url: string): string {
+  try {
+    const u = new URL(url);
+    const path = u.pathname
+      .split('/')
+      .map((seg) => (seg.length > 12 ? '***' : seg))
+      .join('/');
+    return `${u.protocol}//${u.host}${path}`;
+  } catch {
+    return '(unparseable RPC URL)';
+  }
+}
+
 export class Indexer {
   private timer: NodeJS.Timeout | undefined;
   private running = false;
@@ -151,7 +171,14 @@ export class Indexer {
       this.lastError = null;
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
-      logger.error({ chainId: this.cfg.CHAIN_ID, err }, 'indexer tick failed — will retry next interval');
+      // Name the endpoint: the underlying library reports "server response 404 Not Found" with
+      // no indication of WHICH URL was called, so a wrong zone path (https://rpc.quai.network
+      // instead of https://rpc.quai.network/cyprus1) looks identical to an unreachable node.
+      // Scheme/host/path only — never the query string, which carries provider API keys.
+      logger.error(
+        { chainId: this.cfg.CHAIN_ID, rpc: rpcEndpointForLog(this.cfg.RPC_URL), err },
+        'indexer tick failed — will retry next interval',
+      );
     } finally {
       this.running = false;
     }
